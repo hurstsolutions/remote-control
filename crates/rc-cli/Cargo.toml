@@ -1,0 +1,18 @@
+[package]
+name = "rc-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "rc"
+path = "src/main.rs"
+
+[dependencies]
+rc-types = { path = "../rc-types" }
+rc-rdp = { path = "../rc-rdp" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = { workspace = true }
+clap = { version = "4", features = ["derive", "env"] }
+png = "0.17"
