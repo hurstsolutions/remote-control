@@ -273,7 +273,7 @@ async fn drive(common: Common, mut handle: SessionHandle) -> anyhow::Result<()> 
         pump(&mut handle, &mut screen, Duration::from_millis(500)).await?;
     }
     if let Some(text) = &common.set_clipboard {
-        handle.input.send(SessionInput::Clipboard(text.clone()))?;
+        handle.input.send(SessionInput::Clipboard { text: text.clone() })?;
         pump(&mut handle, &mut screen, Duration::from_millis(500)).await?;
     }
     if let Some(text) = &common.r#type {

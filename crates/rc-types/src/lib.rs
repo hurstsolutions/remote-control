@@ -106,7 +106,7 @@ pub enum SessionInput {
     /// Release every key and button the backend believes is held (sent on focus loss).
     ReleaseAll,
     /// The local clipboard now holds this text.
-    Clipboard(String),
+    Clipboard { text: String },
     /// Ask the server to change the desktop size (RDP display control / VNC SetDesktopSize).
     /// Backends ignore it when the server does not support it.
     Resize { width: u16, height: u16 },

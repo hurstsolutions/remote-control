@@ -152,7 +152,7 @@ async fn vnc_auth_handshake_and_raw_update() {
     assert_eq!(read_n(&mut s, 8).await, [4, 1, 0, 0, 0, 0, 0, 0x61]);
     h.input.send(SessionInput::Refresh).unwrap();
     expect_request(&mut s, false, 4, 2).await;
-    h.input.send(SessionInput::Clipboard("hi".into())).unwrap();
+    h.input.send(SessionInput::Clipboard { text: "hi".into() }).unwrap();
     assert_eq!(read_n(&mut s, 10).await, [6, 0, 0, 0, 0, 0, 0, 2, b'h', b'i']);
 
     // Close: the held key is released, then a clean Closed.

@@ -319,7 +319,6 @@ struct InputState {
     wheel: (f32, f32),
 }
 
-#[expect(clippy::too_many_arguments)]
 async fn active(
     framed: Framed,
     connection: ConnectionResult,
@@ -388,7 +387,7 @@ async fn active(
                             }
                         }
                     }
-                    SessionInput::Clipboard(text) => {
+                    SessionInput::Clipboard { text } => {
                         if let Ok(mut local) = local_text.lock() {
                             *local = text;
                         }
@@ -581,7 +580,7 @@ fn frame_event(image: &DecodedImage, rect: &InclusiveRectangle) -> Option<Sessio
         let start = usize::from(row) * stride + usize::from(rect.left) * 4;
         rgba.extend_from_slice(data.get(start..start + row_bytes)?);
     }
-    for pixel in rgba.chunks_exact_mut(4) {
+    for pixel in rgba.as_chunks_mut::<4>().0 {
         pixel[3] = 255;
     }
     Some(SessionEvent::Frame {
@@ -656,7 +655,7 @@ fn translate_input(state: &mut InputState, message: SessionInput) -> Vec<FastPat
             }
         }
         SessionInput::ReleaseAll => return state.db.release_all().into_vec(),
-        SessionInput::Clipboard(_) | SessionInput::Resize { .. } | SessionInput::Refresh | SessionInput::Close => {}
+        SessionInput::Clipboard { .. } | SessionInput::Resize { .. } | SessionInput::Refresh | SessionInput::Close => {}
     }
     state.db.apply(ops).into_vec()
 }

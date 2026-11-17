@@ -1,0 +1,29 @@
+[package]
+name = "remote-control"
+version.workspace = true
+edition.workspace = true
+description = "Remote control of Windows (RDP) and Mac (Screen Sharing) machines"
+
+[lib]
+name = "remote_control_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+rc-types = { path = "../../crates/rc-types" }
+rc-rdp = { path = "../../crates/rc-rdp" }
+rc-vnc = { path = "../../crates/rc-vnc" }
+rc-tunnel = { path = "../../crates/rc-tunnel" }
+tauri = { version = "2", features = [] }
+tauri-plugin-clipboard-manager = "2"
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { workspace = true }
+serde_json = "1"
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
+tauri-plugin-opener = "2"

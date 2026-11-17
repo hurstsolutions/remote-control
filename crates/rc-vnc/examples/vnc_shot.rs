@@ -242,7 +242,7 @@ async fn async_main(host: String, port: u16, config: VncConfig, actions: Vec<Str
                 drop(s);
                 send(SessionInput::Wheel { dx: 0.0, dy: arg.parse().expect("wheel:DY"), x, y });
             }
-            "clip" => send(SessionInput::Clipboard(arg.to_string())),
+            "clip" => send(SessionInput::Clipboard { text: arg.to_string() }),
             "resize" => {
                 let (width, height) = xy(arg);
                 send(SessionInput::Resize { width, height });

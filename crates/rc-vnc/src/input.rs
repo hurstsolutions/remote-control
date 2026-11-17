@@ -219,7 +219,7 @@ impl InputState {
                 }
             }
             SessionInput::ReleaseAll => self.release_all(buf),
-            SessionInput::Clipboard(text) => {
+            SessionInput::Clipboard { text } => {
                 debug!(chars = text.chars().count(), "sending clipboard to the server");
                 client_cut_text(buf, &text);
             }
@@ -335,7 +335,7 @@ mod tests {
     fn clipboard_is_latin1() {
         let sh = shared(10, 10);
         let mut st = InputState::new(false);
-        let out = feed(&mut st, &sh, SessionInput::Clipboard("né€!".into()));
+        let out = feed(&mut st, &sh, SessionInput::Clipboard { text: "né€!".into() });
         assert_eq!(out, [6, 0, 0, 0, 0, 0, 0, 4, b'n', 0xe9, b'?', b'!']);
     }
 
@@ -345,7 +345,7 @@ mod tests {
         let mut st = InputState::new(true);
         assert!(feed(&mut st, &sh, SessionInput::PointerMove { x: 1, y: 1 }).is_empty());
         assert!(feed(&mut st, &sh, key("KeyA", "a", true)).is_empty());
-        assert!(feed(&mut st, &sh, SessionInput::Clipboard("x".into())).is_empty());
+        assert!(feed(&mut st, &sh, SessionInput::Clipboard { text: "x".into() }).is_empty());
         assert!(feed(&mut st, &sh, SessionInput::Wheel { dx: 0.0, dy: 3.0, x: 0, y: 0 }).is_empty());
         assert_eq!(feed(&mut st, &sh, SessionInput::Refresh), [3, 0, 0, 0, 0, 0, 2, 128, 1, 224]);
         assert!(st.handle(SessionInput::Close, &sh, &mut Vec::new()));
