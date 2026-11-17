@@ -19,6 +19,10 @@
 //! any integer (a raw encoding number), and `nopseudo` (do not add the default pseudo-encodings
 //! Cursor / DesktopSize / ExtendedDesktopSize / LastRect).
 
+// `as_chunks` needs a recent toolchain; `chunks_exact` keeps the crate building on older ones.
+#![allow(unknown_lints)]
+#![allow(clippy::chunks_exact_to_as_chunks)]
+
 mod auth;
 mod decode;
 mod error;

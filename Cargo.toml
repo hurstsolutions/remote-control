@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/rc-types", "crates/rc-rdp", "crates/rc-vnc", "crates/rc-cli"]
+members = ["crates/rc-types", "crates/rc-rdp", "crates/rc-vnc", "crates/rc-cli", "crates/rc-tunnel"]
 
 [workspace.package]
 version = "0.1.0"

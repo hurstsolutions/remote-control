@@ -128,7 +128,7 @@ impl InputState {
         self.y = y.min(s.height.saturating_sub(1));
     }
 
-    fn wheel_axis(buf: &mut Vec<u8>, acc: &mut f32, delta: f32, pos: u8, neg: u8, held: u8, x: u16, y: u16) {
+    fn wheel_axis(buf: &mut Vec<u8>, acc: &mut f32, delta: f32, (pos, neg): (u8, u8), (held, x, y): (u8, u16, u16)) {
         if !delta.is_finite() {
             return;
         }
@@ -196,9 +196,9 @@ impl InputState {
             }
             SessionInput::Wheel { dx, dy, x, y } => {
                 self.set_pos(x, y, shared);
-                let (held, x, y) = (self.buttons, self.x, self.y);
-                Self::wheel_axis(buf, &mut self.wheel_y, dy, WHEEL_UP, WHEEL_DOWN, held, x, y);
-                Self::wheel_axis(buf, &mut self.wheel_x, dx, WHEEL_RIGHT, WHEEL_LEFT, held, x, y);
+                let at = (self.buttons, self.x, self.y);
+                Self::wheel_axis(buf, &mut self.wheel_y, dy, (WHEEL_UP, WHEEL_DOWN), at);
+                Self::wheel_axis(buf, &mut self.wheel_x, dx, (WHEEL_RIGHT, WHEEL_LEFT), at);
             }
             SessionInput::Key { code, key, down } => {
                 // Identify the physical key by `code`; fall back to `key` if the front end has none.

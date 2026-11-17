@@ -65,6 +65,22 @@ enum Command {
         #[arg(long)]
         pin: Option<String>,
     },
+    /// Mac Screen Sharing (VNC), through an SSH tunnel unless --no-ssh is given.
+    Vnc {
+        #[command(flatten)]
+        common: Common,
+        /// Screen Sharing port on the Mac.
+        #[arg(long, default_value_t = 5900)]
+        port: u16,
+        /// Connect straight to the VNC port, unencrypted (for non-Mac VNC servers on a trusted LAN).
+        #[arg(long)]
+        no_ssh: bool,
+        #[arg(long, default_value_t = 22)]
+        ssh_port: u16,
+        /// Expected SSH host key SHA-256 (hex).
+        #[arg(long)]
+        pin: Option<String>,
+    },
 }
 
 fn parse_size(s: &str) -> Result<(u16, u16), String> {
@@ -104,6 +120,41 @@ async fn main() -> anyhow::Result<()> {
                 clipboard: true,
             };
             rc_rdp::spawn(config, io)?;
+            common
+        }
+        Command::Vnc { common, port, no_ssh, ssh_port, pin } => {
+            let config = rc_vnc::VncConfig {
+                username: Some(common.user.clone()).filter(|u| !u.is_empty()),
+                password: Some(common.password.clone()).filter(|p| !p.is_empty()),
+                shared: true,
+                view_only: false,
+            };
+            if no_ssh {
+                let host = common.host.clone();
+                tokio::spawn(async move { rc_vnc::connect_and_run(&host, port, config, io).await });
+            } else {
+                let tunnel = rc_tunnel::open(rc_tunnel::TunnelConfig {
+                    ssh_host: common.host.clone(),
+                    ssh_port,
+                    username: common.user.clone(),
+                    password: common.password.clone(),
+                    target_host: "127.0.0.1".to_owned(),
+                    target_port: port,
+                    pinned_host_key_sha256: pin,
+                })
+                .await;
+                match tunnel {
+                    Ok(tunnel) => {
+                        println!("ssh host key sha256: {}", tunnel.host_key_sha256);
+                        tokio::spawn(async move {
+                            let guard = tunnel.guard;
+                            rc_vnc::run(tunnel.stream, config, io).await;
+                            guard.close().await;
+                        });
+                    }
+                    Err(error) => bail!("tunnel failed [{:?}]: {}", error.kind, error.detail),
+                }
+            }
             common
         }
     };

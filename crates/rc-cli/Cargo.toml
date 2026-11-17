@@ -10,6 +10,8 @@ path = "src/main.rs"
 [dependencies]
 rc-types = { path = "../rc-types" }
 rc-rdp = { path = "../rc-rdp" }
+rc-vnc = { path = "../rc-vnc" }
+rc-tunnel = { path = "../rc-tunnel" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

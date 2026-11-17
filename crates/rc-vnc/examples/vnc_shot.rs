@@ -18,6 +18,9 @@
 //! Events other than frames are printed to stdout as they arrive. Set `RUST_LOG=debug` for the
 //! protocol log (stderr).
 
+#![allow(unknown_lints)]
+#![allow(clippy::chunks_exact_to_as_chunks)]
+
 use rc_types::{session_channels, MouseButton, SessionEvent, SessionInput};
 use rc_vnc::VncConfig;
 use std::sync::{Arc, Mutex};
@@ -123,6 +126,7 @@ async fn async_main(host: String, port: u16, config: VncConfig, actions: Vec<Str
                 let mut s = screen.lock().unwrap();
                 match ev {
                     SessionEvent::Status(m) => println!("status: {m}"),
+                    SessionEvent::ServerIdentity { sha256 } => println!("server identity: {sha256}"),
                     SessionEvent::Connected { width, height, name } => {
                         println!("connected: {width}x{height} {name:?}");
                         s.reset(width as usize, height as usize);
