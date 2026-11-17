@@ -8,7 +8,7 @@ on:
         description: "Which platforms to build"
         type: choice
         default: macos
-        options: [macos, macos+linux, all]
+        options: [macos, windows, linux, macos+linux, all]
   push:
     tags: ["v*"]
 
@@ -41,7 +41,7 @@ jobs:
         run: |
           sel="${{ github.event.inputs.platforms || 'all' }}"
           case "$sel:${{ matrix.name }}" in
-            all:*|macos:macos|macos+linux:macos|macos+linux:linux) echo "run=true" >> "$GITHUB_OUTPUT" ;;
+            all:*|macos:macos|windows:windows|linux:linux|macos+linux:macos|macos+linux:linux) echo "run=true" >> "$GITHUB_OUTPUT" ;;
             *) echo "run=false" >> "$GITHUB_OUTPUT" ;;
           esac
       - uses: actions/checkout@v4
