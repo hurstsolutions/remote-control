@@ -24,7 +24,8 @@ describe("describeError", () => {
     expect(hints).toContain("System Settings > General > Sharing > Remote Login");
     expect(hints).toContain("Reconnect");
     expect(hints).toContain("Connect without SSH");
-    expect(hints).toContain("unencrypted");
+    expect(hints).toContain("isn't encrypted");
+    expect(hints).toContain("capture your Mac password");
   });
 
   it("explains a refused sign-in", () => {
