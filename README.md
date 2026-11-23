@@ -27,3 +27,29 @@ RC_PASSWORD='...' ./target/debug/rc rdp HOST -u USER --screenshot shot.png
 
 Actions > Release > Run workflow builds installable apps (macOS universal `.dmg` by default) and
 publishes them as a pre-release. Builds are unsigned.
+
+### Verifying downloads
+
+Each release has a `SHA256SUMS.txt` listing the SHA-256 of every file in it. Download it next to
+the installer and compare.
+
+macOS:
+
+```sh
+shasum -a 256 -c SHA256SUMS.txt --ignore-missing
+```
+
+Linux:
+
+```sh
+sha256sum -c SHA256SUMS.txt --ignore-missing
+```
+
+Windows (PowerShell): print the hash and compare it with the installer's line in `SHA256SUMS.txt`.
+
+```powershell
+(Get-FileHash .\RemoteControl_0.1.0_x64-setup.exe -Algorithm SHA256).Hash.ToLower()
+Select-String RemoteControl_0.1.0_x64-setup.exe SHA256SUMS.txt
+```
+
+A match only shows the file arrived intact from the release; the builds are still unsigned.

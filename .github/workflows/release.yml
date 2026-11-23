@@ -1,5 +1,8 @@
 # Builds installable apps. Runs only when asked (Actions > Release > Run workflow) or on a
 # version tag, because macOS runner minutes are billed at 10x on private repositories.
+#
+# Build jobs only read the repo and upload their installers as workflow artifacts. The publish
+# job is the only one that can write: it checksums the installers and creates the release.
 name: Release
 on:
   workflow_dispatch:
@@ -13,7 +16,7 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -34,18 +37,24 @@ jobs:
             args: ""
             rust_targets: ""
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     steps:
       - name: Decide whether this platform is wanted
         id: want
         shell: bash
+        env:
+          SELECTED: ${{ github.event.inputs.platforms || 'all' }}
+          PLATFORM: ${{ matrix.name }}
         run: |
-          sel="${{ github.event.inputs.platforms || 'all' }}"
-          case "$sel:${{ matrix.name }}" in
+          case "$SELECTED:$PLATFORM" in
             all:*|macos:macos|windows:windows|linux:linux|macos+linux:macos|macos+linux:linux) echo "run=true" >> "$GITHUB_OUTPUT" ;;
             *) echo "run=false" >> "$GITHUB_OUTPUT" ;;
           esac
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: steps.want.outputs.run == 'true'
+        with:
+          persist-credentials: false
       - name: Linux packages
         if: steps.want.outputs.run == 'true' && matrix.name == 'linux'
         run: |
@@ -53,16 +62,17 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev pkg-config
       - name: NASM (Windows crypto build)
         if: steps.want.outputs.run == 'true' && matrix.name == 'windows'
-        uses: ilammy/setup-nasm@v1
-      - uses: dtolnay/rust-toolchain@stable
+        uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1.5.2
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable branch
         if: steps.want.outputs.run == 'true'
         with:
+          toolchain: stable
           targets: ${{ matrix.rust_targets }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         if: steps.want.outputs.run == 'true'
         with:
           key: release-${{ matrix.name }}
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         if: steps.want.outputs.run == 'true'
         with:
           node-version: 22
@@ -71,17 +81,75 @@ jobs:
       - name: Install front end dependencies
         if: steps.want.outputs.run == 'true'
         working-directory: app
-        run: npm ci
-      - name: Build and publish
+        run: npm ci --ignore-scripts
+      - name: Build
         if: steps.want.outputs.run == 'true'
-        uses: tauri-apps/tauri-action@v0
+        working-directory: app
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_ARGS: ${{ matrix.args }}
+        # Everything after `--` goes to cargo; --locked fails the build if Cargo.lock is stale.
+        # TAURI_ARGS is left unquoted on purpose so "--target X" splits into two words.
+        run: |
+          # shellcheck disable=SC2086
+          npx --no-install tauri build $TAURI_ARGS -- --locked
+      - name: Collect installers
+        if: steps.want.outputs.run == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          find target -type f -path '*/release/bundle/*' \
+            \( -name '*.dmg' -o -name '*.exe' -o -name '*.msi' -o -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \) \
+            -exec cp {} out/ \;
+          # The zipped .app that tauri-action used to attach on macOS.
+          for app in target/*/release/bundle/macos/*.app; do
+            [ -d "$app" ] || continue
+            tar -czf "out/$(basename "$app" .app)_universal.app.tar.gz" -C "$(dirname "$app")" "$(basename "$app")"
+          done
+          ls -l out
+      - name: Upload installers
+        if: steps.want.outputs.run == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          projectPath: app
-          args: ${{ matrix.args }}
-          tagName: ${{ github.ref_type == 'tag' && github.ref_name || format('build-{0}', github.run_number) }}
-          releaseName: ${{ github.ref_type == 'tag' && github.ref_name || format('Test build {0}', github.run_number) }}
-          releaseBody: "Unsigned test build. See the Asana task for install steps."
-          releaseDraft: false
-          prerelease: true
+          name: bundles-${{ matrix.name }}
+          path: out/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download installers
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: bundles-*
+          merge-multiple: true
+          path: out
+      - name: Checksums
+        working-directory: out
+        run: |
+          set -euo pipefail
+          sha256sum -- * > ../SHA256SUMS.txt
+          mv ../SHA256SUMS.txt .
+          cat SHA256SUMS.txt
+      - name: Create pre-release
+        working-directory: out
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || format('build-{0}', github.run_number) }}
+          TITLE: ${{ github.ref_type == 'tag' && github.ref_name || format('Test build {0}', github.run_number) }}
+        run: |
+          set -euo pipefail
+          notes="Unsigned test build. See the Asana task for install steps.
+
+          SHA256SUMS.txt lists the SHA-256 checksum of every file in this release; see \"Verifying downloads\" in the README."
+          gh release create "$TAG" ./* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$TITLE" \
+            --notes "$notes" \
+            --prerelease

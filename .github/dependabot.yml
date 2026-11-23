@@ -1,0 +1,31 @@
+version: 2
+updates:
+  # Keeps the SHA-pinned actions current; Dependabot rewrites the SHA and the version comment.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # Rust workspace (root Cargo.lock). One grouped PR a week for minor and patch updates;
+  # major updates still come as separate PRs.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    groups:
+      cargo-minor:
+        update-types: [minor, patch]
+
+  # Front end (app/package-lock.json).
+  - package-ecosystem: npm
+    directory: /app
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    groups:
+      npm-minor:
+        update-types: [minor, patch]
