@@ -1,0 +1,67 @@
+# cargo-audit configuration. Every ignore below names the advisory, why it does not apply to this
+# client, and what lifts it. Re-check them whenever IronRDP or russh is upgraded.
+#
+# Why russh is held at 0.56 (rc-tunnel): every later release pins RustCrypto pre-releases that clash
+# with the exact pins of picky 7.0.0-rc.25, which ironrdp-connector 0.10 pins (`=7.0.0-rc.25`):
+#   0.57 to 0.59  rand_core =0.10.0-rc-3      vs picky's rand_core ^0.10
+#   0.60.0, 0.60.1 resolve, but fail to compile: pkcs5 is forced to 0.8.0 stable (ed25519 3 and
+#                 ecdsa 0.17.0-rc.22 need stable pkcs8 0.11), and russh 0.60.1 calls a pkcs5 rc API
+#   0.60.2, 0.60.3 aes-gcm =0.11.0-rc.3       vs picky's =0.11.0-rc.4
+#   0.61.x        curve25519-dalek =5.0.0-pre.6 vs picky's =5.0.0-rc.1
+#   0.62.0 to 0.62.2 ecdsa ^0.17 (stable)     vs picky's =0.17.0-rc.22
+#   0.62.3 to 0.65.x curve25519-dalek ^5 (stable) vs picky's =5.0.0-rc.1
+# IronRDP 0.12 (ironrdp-connector 0.12, picky 7.0.0-rc.26) resolves with russh 0.65, but the latest
+# published ironrdp-server (0.13, a dev-dependency of rc-rdp for its loopback tests) still needs
+# ironrdp-connector 0.10. ironrdp-server 0.14 on IronRDP master moves to 0.12: once it is released,
+# upgrade the IronRDP crates in rc-rdp and russh to >= 0.65 together, and drop the russh,
+# russh-cryptovec, libcrux and crypto-bigint entries here.
+
+[advisories]
+ignore = [
+    # russh 0.56: client Handler callbacks run for channels the client never opened (fixed 0.63.1).
+    # rc-tunnel's Handler only implements check_server_key and keeps no per-channel state; the
+    # default callbacks do nothing. The one channel we open carries bytes from that same server,
+    # which rc-vnc already treats as hostile, so injected or early data gives it nothing new.
+    "RUSTSEC-2026-0492",
+    # russh 0.56: KEXINIT name-lists etc. allocated before their size is checked (fixed 0.61.0).
+    # A server-side memory DoS across many connections. Our client makes one connection, and russh
+    # caps a packet at 256 KiB, so a hostile server can cost it a few MB at most.
+    "RUSTSEC-2026-0494",
+    # russh 0.56: unbounded decompressed packet size (fixed 0.61.1). Compression is compiled out
+    # (no `flate2` feature) and rc-tunnel offers only "none", so zlib is never negotiated.
+    "RUSTSEC-2026-0493",
+    # russh 0.56 / russh-cryptovec 0.52: SSH agent frame lengths unbounded (fixed 0.60.3). Only the
+    # agent client and server are affected; rc-tunnel signs in with a password and never uses or
+    # forwards an agent. Remote transport buffers are bounded by the 256 KiB packet cap, and the
+    # unbounded zlib path is compiled out.
+    "RUSTSEC-2026-0154",
+    "RUSTSEC-2026-0153",
+    # russh 0.56: agent server ignores the confirm constraint (fixed 0.65.0). We run no agent server.
+    "RUSTSEC-2026-0495",
+    # russh 0.56: keyboard-interactive response count, server side only (fixed 0.60.1). We are the
+    # client.
+    "RUSTSEC-2026-0496",
+    # libcrux-sha3 0.0.4 (from libcrux-ml-kem 0.0.4, which russh 0.56 pins exactly for the
+    # mlkem768x25519-sha256 key exchange): incremental SHAKE squeeze bugs and an AVX2 SHAKE-256
+    # panic. The advisories state that ML-KEM's own use is not affected.
+    "RUSTSEC-2026-0074",
+    "RUSTSEC-2026-0207",
+    "RUSTSEC-2026-0208",
+    # libcrux-secrets 0.0.4: constant-time select/swap may give a wrong result on aarch64. In ML-KEM
+    # this is the implicit-rejection select on decapsulation. SSH uses a fresh ML-KEM key for every
+    # key exchange and combines it with X25519 (hybrid), so the worst case is a failed handshake,
+    # not a weaker session key.
+    "RUSTSEC-2026-0212",
+    # crypto-bigint 0.5.5 (elliptic-curve 0.13 via russh 0.56): timing variability. On our side
+    # these curves only verify ECDSA host-key signatures, which is public data. ECDH NIST kex is
+    # not in russh's default list, and we never sign with ECDSA (password sign-in).
+    "RUSTSEC-2026-0387",
+    # rsa 0.10.0-rc.18 (picky / sspi / winscard, pinned by IronRDP): Marvin timing attack on RSA
+    # private-key decryption; no fixed release that IronRDP accepts. Marvin needs an oracle that
+    # decrypts attacker-chosen ciphertexts with a private key we hold. The client holds no RSA
+    # private key: rc-rdp signs in with Credentials::UsernamePassword (NTLM or password Kerberos,
+    # no smart card / PKINIT), TLS is our own rustls on aws-lc-rs, and CredSSP only uses the
+    # server's public key. RSA here only verifies public signatures. The rc-rdp tests' RSA key is
+    # aws-lc-rs, not this crate.
+    "RUSTSEC-2023-0071",
+]
