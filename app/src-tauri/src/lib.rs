@@ -1,5 +1,6 @@
 //! Tauri side of RemoteControl. The contract with the web UI is `app/src/ipc.ts`.
 
+mod discover;
 mod logging;
 mod private_fs;
 mod secrets;
@@ -28,6 +29,8 @@ const MAX_BATCH_BYTES: usize = 4 * 1024 * 1024;
 struct AppState {
     store: Mutex<Store>,
     sessions: Mutex<HashMap<String, LiveSession>>,
+    subnets: Mutex<discover::SubnetStore>,
+    scan: Mutex<Option<discover::RunningScan>>,
     log_path: PathBuf,
 }
 
@@ -641,6 +644,84 @@ fn disconnect(state: State<'_, AppState>, session_id: String) {
     }
 }
 
+// ── Find computers ───────────────────────────────────────────────────────────
+
+#[tauri::command]
+fn list_subnets(state: State<'_, AppState>) -> Vec<discover::Subnet> {
+    lock(&state.subnets).list()
+}
+
+#[tauri::command]
+fn save_subnets(state: State<'_, AppState>, subnets: Vec<discover::Subnet>) -> Result<Vec<discover::Subnet>, UiError> {
+    lock(&state.subnets).replace(subnets).map_err(UiError::other)
+}
+
+#[derive(Debug, Deserialize)]
+struct ScanArgs {
+    /// Ids of saved subnets. Raw ranges are never taken from the UI.
+    subnet_ids: Vec<String>,
+}
+
+/// Start scanning the chosen saved subnets. Resolves with a scan id; progress, found machines and
+/// a final "finished" event arrive on the channel.
+#[tauri::command]
+fn start_scan(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    args: ScanArgs,
+    events: Channel<InvokeResponseBody>,
+) -> Result<String, UiError> {
+    if args.subnet_ids.len() > discover::MAX_SUBNETS {
+        return Err(UiError::other("Too many subnets chosen."));
+    }
+    let saved = lock(&state.subnets).list();
+    let plan = discover::scan_plan(&saved, &args.subnet_ids).map_err(UiError::other)?;
+    let targets = rc_discover::targets(&plan).map_err(UiError::other)?;
+    let mut running = lock(&state.scan);
+    if running.is_some() {
+        return Err(UiError::other("A scan is already running. Cancel it or wait for it to finish."));
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    let cancel = rc_discover::CancelToken::default();
+    *running = Some(discover::RunningScan { id: id.clone(), cancel: cancel.clone() });
+    drop(running);
+    let subnets: Vec<String> = plan.iter().map(ToString::to_string).collect();
+    info!(scan = %id, ?subnets, addresses = targets.len(), "scan requested");
+
+    let (tx, mut rx) = mpsc::channel(256);
+    tauri::async_runtime::spawn(rc_discover::scan(targets, rc_discover::ScanOptions::default(), cancel.clone(), tx));
+    let scan_id = id.clone();
+    tauri::async_runtime::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            let json = match serde_json::to_string(&event) {
+                Ok(json) => json,
+                Err(e) => {
+                    error!(error = %e, "cannot encode a scan event");
+                    continue;
+                }
+            };
+            if events.send(InvokeResponseBody::Json(json)).is_err() {
+                // The window went away: no one is watching, so stop.
+                cancel.cancel();
+            }
+        }
+        let state = app.state::<AppState>();
+        let mut running = lock(&state.scan);
+        if running.as_ref().is_some_and(|s| s.id == scan_id) {
+            *running = None;
+        }
+    });
+    Ok(id)
+}
+
+#[tauri::command]
+fn cancel_scan(state: State<'_, AppState>, scan_id: String) {
+    if let Some(scan) = lock(&state.scan).as_ref().filter(|s| s.id == scan_id) {
+        info!(scan = %scan_id, "scan cancelled");
+        scan.cancel.cancel();
+    }
+}
+
 // ── Diagnostics ──────────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -689,6 +770,8 @@ pub fn run() {
             app.manage(AppState {
                 store: Mutex::new(Store::load(config_dir.join("connections.json"))),
                 sessions: Mutex::new(HashMap::new()),
+                subnets: Mutex::new(discover::SubnetStore::load(config_dir.join("subnets.json"))),
+                scan: Mutex::new(None),
                 log_path,
             });
             Ok(())
@@ -702,6 +785,10 @@ pub fn run() {
             connect,
             send_input,
             disconnect,
+            list_subnets,
+            save_subnets,
+            start_scan,
+            cancel_scan,
             app_info,
             log_text,
             reveal_log,

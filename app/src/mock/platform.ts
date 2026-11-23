@@ -8,9 +8,13 @@ import type {
   ErrorKind,
   SessionError,
   SessionEvent,
+  FoundHost,
+  ScanEvent,
   SessionInput,
+  Subnet,
 } from "../ipc";
 import type { Api, Platform } from "../platform";
+import { parseCidr } from "../views/find-logic";
 
 const FAILING_ID = "mock-fails";
 /** A Mac with Screen Sharing on but Remote Login off: fails with tunnel_unavailable until the tunnel is off. */
@@ -469,6 +473,123 @@ function mockError(kind: ErrorKind, host: string): SessionError {
 
 const delay = <T>(value: T, ms = 60): Promise<T> => new Promise((resolve) => window.setTimeout(() => resolve(value), ms));
 
+// ---- find computers -------------------------------------------------------------------------
+
+let subnets: Subnet[] = [
+  { id: "mock-subnet-office", cidr: "10.0.0.0/24", label: "Office VLAN (sample)", allow_public: false },
+  { id: "mock-subnet-lab", cidr: "10.0.1.0/24", label: "Lab (sample)", allow_public: false },
+];
+let nextSubnet = 1;
+let scanTimer = 0;
+let activeScan: { id: string; cancel: () => void } | null = null;
+
+function blankHost(ip: string): FoundHost {
+  return {
+    ip,
+    rdp: null,
+    vnc: null,
+    ssh: null,
+    name: null,
+    names: { rdp_certificate: null, mdns_name: null, mdns_host: null, netbios: null, dns: null },
+    kind: "unknown",
+    rdp_certificate_sha256: null,
+    rfb_version: null,
+    ssh_banner: null,
+    model: null,
+  };
+}
+
+/** Fake machines at these host numbers of every scanned subnet. */
+function fakeHost(base: string, offset: number): FoundHost | null {
+  const prefix = base.split(".").slice(0, 3).join(".");
+  const ip = `${prefix}.${offset}`;
+  const host = blankHost(ip);
+  switch (offset) {
+    case 10:
+      return { ...host, rdp: 3389, kind: "windows", name: "DESKTOP-SAMPLE1", names: { ...host.names, rdp_certificate: "DESKTOP-SAMPLE1", netbios: "DESKTOP-SAMPLE1" }, rdp_certificate_sha256: "3f".repeat(32) };
+    case 23:
+      return { ...host, vnc: 5900, ssh: 22, kind: "mac", name: "Design Mac (sample)", names: { ...host.names, mdns_name: "Design Mac (sample)", mdns_host: "design-mac.local" }, rfb_version: "003.889", ssh_banner: "SSH-2.0-OpenSSH_9.8", model: "Mac14,3" };
+    case 42:
+      // Matches the saved "Mac with Remote Login off" and "PC with a new certificate" samples.
+      return { ...host, rdp: 3389, vnc: 5900, kind: "mac", name: "dual-boot.example.internal", names: { ...host.names, dns: "dual-boot.example.internal" }, rfb_version: "003.889" };
+    case 57:
+      return { ...host, ssh: 22, name: "build-server.example.internal", names: { ...host.names, dns: "build-server.example.internal" }, ssh_banner: "SSH-2.0-OpenSSH_9.6p1 Ubuntu" };
+    case 88:
+      // A hostile name: must show as plain text.
+      return { ...host, rdp: 3389, kind: "windows", name: '<img src=x onerror="window.__xss=1">', names: { ...host.names, rdp_certificate: '<img src=x onerror="window.__xss=1">' }, rdp_certificate_sha256: "9a".repeat(32) };
+    case 120:
+      return { ...host, vnc: 5900, name: null, rfb_version: "003.008" };
+    default:
+      return null;
+  }
+}
+
+function mockSaveSubnets(list: Subnet[]): Subnet[] {
+  const out: Subnet[] = [];
+  for (const subnet of list) {
+    const parsed = parseCidr(subnet.cidr);
+    if (!parsed.ok) throw { kind: "other", detail: `${subnet.cidr}: ${parsed.error}` } satisfies SessionError;
+    if (out.some((s) => s.cidr === parsed.value.cidr)) throw { kind: "other", detail: `${parsed.value.cidr} is in the list twice.` } satisfies SessionError;
+    out.push({
+      id: subnet.id || `mock-subnet-${nextSubnet++}`,
+      cidr: parsed.value.cidr,
+      label: subnet.label.trim().slice(0, 80),
+      allow_public: subnet.allow_public && !parsed.value.isPrivate,
+    });
+  }
+  return out;
+}
+
+function mockStartScan(ids: string[], onEvent: (event: ScanEvent) => void): string {
+  if (activeScan) throw { kind: "other", detail: "A scan is already running. Cancel it or wait for it to finish." } satisfies SessionError;
+  if (ids.length === 0) throw { kind: "other", detail: "Choose at least one subnet to scan." } satisfies SessionError;
+  const chosen = ids.map((id) => subnets.find((s) => s.id === id));
+  if (chosen.some((s) => !s)) throw { kind: "other", detail: "A chosen subnet is no longer in the list. Reload and try again." } satisfies SessionError;
+  const plan = chosen as Subnet[];
+  for (const s of plan) {
+    const parsed = parseCidr(s.cidr);
+    if (parsed.ok && !parsed.value.isPrivate && !s.allow_public) {
+      throw { kind: "other", detail: `${s.cidr} is a public address range. Edit it and confirm it is your own network before scanning it.` } satisfies SessionError;
+    }
+  }
+  const total = plan.reduce((sum, s) => {
+    const parsed = parseCidr(s.cidr);
+    return sum + (parsed.ok ? parsed.value.hostCount : 0);
+  }, 0);
+  const found: FoundHost[] = [];
+  for (const s of plan) {
+    for (const offset of [10, 23, 42, 57, 88, 120]) {
+      const host = fakeHost(s.cidr, offset);
+      if (host) found.push(host);
+    }
+  }
+  const id = `mock-scan-${nextId++}`;
+  const steps = 20;
+  let step = 0;
+  let reported = 0;
+  const finish = (cancelled: boolean) => {
+    window.clearInterval(scanTimer);
+    activeScan = null;
+    const done = cancelled ? Math.round((total * step) / steps) : total;
+    note(`scan ${id} ${cancelled ? "cancelled" : "finished"}`);
+    onEvent({ type: "progress", done, total, found: reported });
+    onEvent({ type: "finished", cancelled, done, total, found: reported });
+  };
+  scanTimer = window.setInterval(() => {
+    step++;
+    const due = Math.floor((found.length * step) / steps);
+    while (reported < due) {
+      const host = found[reported++];
+      if (host) onEvent({ type: "host", host });
+    }
+    onEvent({ type: "progress", done: Math.round((total * step) / steps), total, found: reported });
+    if (step >= steps) finish(false);
+  }, 120);
+  activeScan = { id, cancel: () => finish(true) };
+  note(`scan ${id}: ${plan.map((s) => s.cidr).join(", ")}`);
+  return id;
+}
+
 const mockApi: Api = {
   listConnections: () => delay(connections.map((c) => ({ ...c }))),
   saveConnection: (connection: Connection) => {
@@ -570,6 +691,20 @@ const mockApi: Api = {
     sessions.get(sessionId)?.stop();
     note(`disconnect ${sessionId}`);
     return Promise.resolve();
+  },
+  listSubnets: () => delay(subnets.map((s) => ({ ...s }))),
+  saveSubnets: async (list: Subnet[]) => {
+    await delay(null);
+    subnets = mockSaveSubnets(list);
+    return subnets.map((s) => ({ ...s }));
+  },
+  startScan: async (subnetIds: string[], onEvent: (event: ScanEvent) => void) => {
+    await delay(null);
+    return mockStartScan(subnetIds, onEvent);
+  },
+  cancelScan: (scanId: string) => {
+    if (activeScan?.id === scanId) activeScan.cancel();
+    return delay(undefined);
   },
   appInfo: () =>
     delay<AppInfo>({ version: "0.1.0-mock", os: "browser", arch: "mock", log_path: "/mock/RemoteControl.log" }),

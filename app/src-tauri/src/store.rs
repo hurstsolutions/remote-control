@@ -1,7 +1,5 @@
 //! Saved connections, kept as JSON in the app's config directory. No secrets live here.
 
-use std::fs::OpenOptions;
-use std::io::Write as _;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -120,15 +118,7 @@ impl Store {
 
     fn save(&self) -> Result<(), String> {
         let json = serde_json::to_vec_pretty(&self.connections).map_err(|e| e.to_string())?;
-        if let Some(dir) = self.path.parent() {
-            private_fs::create_dir(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-        }
-        // Write then rename so a crash never leaves a half-written file.
-        let tmp = self.path.with_extension("json.tmp");
-        private_fs::open(OpenOptions::new().write(true).create(true).truncate(true), &tmp)
-            .and_then(|mut file| file.write_all(&json).and_then(|()| file.sync_all()))
-            .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
-        std::fs::rename(&tmp, &self.path).map_err(|e| format!("cannot replace {}: {e}", self.path.display()))
+        private_fs::write_atomic(&self.path, &json)
     }
 }
 

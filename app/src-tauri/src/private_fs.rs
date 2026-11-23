@@ -35,6 +35,22 @@ pub fn open(options: &mut OpenOptions, path: &Path) -> io::Result<File> {
     options.open(path)
 }
 
+/// Replace `path` with `bytes`, private to this user: write a temporary file next to it, sync it,
+/// then rename it over the old one so a crash never leaves a half-written file.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write as _;
+    if let Some(dir) = path.parent() {
+        create_dir(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    }
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
+    open(OpenOptions::new().write(true).create(true).truncate(true), &tmp)
+        .and_then(|mut file| file.write_all(bytes).and_then(|()| file.sync_all()))
+        .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("cannot replace {}: {e}", path.display()))
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

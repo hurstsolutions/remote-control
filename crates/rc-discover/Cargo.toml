@@ -1,0 +1,22 @@
+[package]
+name = "rc-discover"
+version.workspace = true
+edition.workspace = true
+description = "Find RDP / Screen Sharing / SSH machines on configured subnets"
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+tokio-rustls = "0.26"
+x509-cert = { version = "0.2", features = ["std"] }
+sha2 = "0.10"
+dns-lookup = "2"
+
+[dev-dependencies]
+anyhow.workspace = true
+serde_json = "1"
+async-trait = "0.1.92"
+ironrdp-server = { version = "0.13", default-features = false, features = ["helper"] }
+rcgen = "0.14.10"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
