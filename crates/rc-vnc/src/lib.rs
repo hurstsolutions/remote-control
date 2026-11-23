@@ -8,8 +8,8 @@
 //!   used only for encrypted sessions, preferred over 30).
 //! * Apple Screen Sharing's encrypted session (AES-128-CBC record layer with SHA-1 integrity),
 //!   selected by [`EncryptionPolicy`] in [`VncOptions`]. Just before `Connected` the session
-//!   emits `SessionEvent::Status(text)` where `text` is [`VncSecurity::status_text`] of the
-//!   session's protection; [`VncSecurity::from_status`] maps it back.
+//!   emits one `SessionEvent::Security` describing VNC's own protection
+//!   ([`VncSecurity::to_event`]); [`VncSecurity::from_event`] maps it back.
 //! * Encodings: Raw, CopyRect, RRE, Hextile, Zlib, ZRLE, Tight (including JPEG); pseudo-encodings
 //!   Cursor, DesktopSize, ExtendedDesktopSize, LastRect.
 //!
@@ -134,8 +134,8 @@ impl VncOptions {
     }
 }
 
-/// How the VNC protocol itself protects a session. Reported once, as a `SessionEvent::Status`
-/// with [`VncSecurity::status_text`], just before `Connected`.
+/// How the VNC protocol itself protects a session. Reported once, as a `SessionEvent::Security`
+/// ([`VncSecurity::to_event`]), just before `Connected`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VncSecurity {
     /// No VNC-level encryption (the session may still run inside an SSH tunnel).
@@ -150,31 +150,55 @@ pub enum VncSecurity {
     EncryptedVerified,
 }
 
-/// [`VncSecurity::Unencrypted`] status text.
-pub const STATUS_UNENCRYPTED: &str = "Session not encrypted by VNC";
-/// [`VncSecurity::EncryptedUnverified`] status text.
-pub const STATUS_ENCRYPTED_UNVERIFIED: &str =
-    "Session encrypted (Apple Screen Sharing, AES-128); the Mac's identity is not verified";
-/// [`VncSecurity::EncryptedVerified`] status text.
-pub const STATUS_ENCRYPTED_VERIFIED: &str =
-    "Session encrypted (Apple Screen Sharing, AES-128); the Mac's identity is verified (SRP)";
+/// [`VncSecurity::Unencrypted`] method name in `SessionEvent::Security`.
+pub const METHOD_UNENCRYPTED: &str = "VNC, unencrypted";
+/// [`VncSecurity::EncryptedUnverified`] method name.
+pub const METHOD_ENCRYPTED_UNVERIFIED: &str = "Apple Screen Sharing encryption";
+/// [`VncSecurity::EncryptedVerified`] method name.
+pub const METHOD_ENCRYPTED_VERIFIED: &str = "Apple Screen Sharing encryption, SRP sign-in";
 
 impl VncSecurity {
+    const ALL: [VncSecurity; 3] =
+        [VncSecurity::Unencrypted, VncSecurity::EncryptedUnverified, VncSecurity::EncryptedVerified];
+
+    /// A sentence for the log.
     pub fn status_text(self) -> &'static str {
         match self {
-            VncSecurity::Unencrypted => STATUS_UNENCRYPTED,
-            VncSecurity::EncryptedUnverified => STATUS_ENCRYPTED_UNVERIFIED,
-            VncSecurity::EncryptedVerified => STATUS_ENCRYPTED_VERIFIED,
+            VncSecurity::Unencrypted => "Session not encrypted by VNC",
+            VncSecurity::EncryptedUnverified => {
+                "Session encrypted (Apple Screen Sharing, AES-128); the Mac's identity is not verified"
+            }
+            VncSecurity::EncryptedVerified => {
+                "Session encrypted (Apple Screen Sharing, AES-128); the Mac's identity is verified (SRP)"
+            }
         }
     }
-    /// The security level a status text announces, if it is one of these.
-    pub fn from_status(text: &str) -> Option<Self> {
-        [VncSecurity::Unencrypted, VncSecurity::EncryptedUnverified, VncSecurity::EncryptedVerified]
-            .into_iter()
-            .find(|s| s.status_text() == text)
+    /// The `method` of this level's `SessionEvent::Security`.
+    pub fn method(self) -> &'static str {
+        match self {
+            VncSecurity::Unencrypted => METHOD_UNENCRYPTED,
+            VncSecurity::EncryptedUnverified => METHOD_ENCRYPTED_UNVERIFIED,
+            VncSecurity::EncryptedVerified => METHOD_ENCRYPTED_VERIFIED,
+        }
     }
     pub fn is_encrypted(self) -> bool {
         self != VncSecurity::Unencrypted
+    }
+    pub fn is_verified(self) -> bool {
+        self == VncSecurity::EncryptedVerified
+    }
+    /// The event the session sends for this level.
+    pub fn to_event(self) -> SessionEvent {
+        SessionEvent::security(self.is_encrypted(), self.is_verified(), self.method())
+    }
+    /// The level a `SessionEvent::Security` from this crate announces, if it is one.
+    pub fn from_event(event: &SessionEvent) -> Option<Self> {
+        match event {
+            SessionEvent::Security { encrypted, server_verified, method } => Self::ALL.into_iter().find(|s| {
+                s.method() == method && s.is_encrypted() == *encrypted && s.is_verified() == *server_verified
+            }),
+            _ => None,
+        }
     }
 }
 

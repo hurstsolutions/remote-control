@@ -164,6 +164,8 @@ fn config(port: u16, password: &str, nla: bool) -> RdpConfig {
 struct Seen {
     connected: Option<(u16, u16)>,
     identity: Option<String>,
+    /// (encrypted, server_verified, method) of every Security event.
+    security: Vec<(bool, bool, String)>,
     screen: Vec<u8>,
     frames: usize,
     closed: Option<Option<SessionError>>,
@@ -189,6 +191,10 @@ async fn collect(handle: &mut SessionHandle, seen: &mut Seen, timeout: Duration,
                 seen.screen = vec![0; usize::from(width) * usize::from(height) * 4];
             }
             SessionEvent::ServerIdentity { sha256 } => seen.identity = Some(sha256),
+            SessionEvent::Security { encrypted, server_verified, method } => {
+                assert!(seen.connected.is_none(), "security is reported before Connected");
+                seen.security.push((encrypted, server_verified, method));
+            }
             SessionEvent::Frame { x, y, w, h, rgba } => {
                 assert_eq!(rgba.len(), usize::from(w) * usize::from(h) * 4, "frame size must match its rectangle");
                 seen.frames += 1;
@@ -231,6 +237,8 @@ async fn tls_login_paints_correct_colours_and_sends_input() {
     let (mut handle, mut seen) = connect_and_paint(&server, false).await;
 
     assert_eq!(seen.identity.as_ref().map(String::len), Some(64), "certificate fingerprint reported");
+    // First use: encrypted, but nothing pinned to check the certificate against.
+    assert_eq!(seen.security, [(true, false, "TLS".to_owned())]);
     assert_colour(seen.pixel(10, 10), [255, 0, 0, 255], "left half must be red (RGBA)");
     assert_colour(seen.pixel(WIDTH - 10, 10), [0, 0, 255, 255], "right half must be blue (RGBA)");
 
@@ -275,6 +283,7 @@ async fn nla_login_succeeds_with_the_right_password() {
     let server = start_server(true);
     let (_handle, seen) = connect_and_paint(&server, true).await;
     assert_colour(seen.pixel(10, 10), [255, 0, 0, 255], "left half");
+    assert_eq!(seen.security, [(true, false, "TLS + NLA".to_owned())]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -308,6 +317,7 @@ async fn changed_certificate_is_rejected_before_sign_in() {
     assert_ne!(identity.received_sha256, identity.expected_sha256);
     // The new identity is not reported as if it had been accepted.
     assert!(seen.identity.is_none(), "a rejected certificate must not be reported as the server identity");
+    assert!(seen.security.is_empty(), "no security is claimed for a rejected certificate");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -324,6 +334,8 @@ async fn pinned_certificate_that_matches_is_accepted() {
     let mut seen = Seen::default();
     collect(&mut handle, &mut seen, Duration::from_secs(20), painted).await;
     assert!(painted(&seen), "closed: {:?}", seen.closed);
+    // The pin matched: the server is verified.
+    assert_eq!(seen.security, [(true, true, "TLS".to_owned())]);
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -1,7 +1,7 @@
 // One session tab: the connect flow, the toolbar, the remote screen and the failure panels.
 import { confirmDialog, isDialogOpen, openDialog } from "../dialog";
 import { button, h } from "../dom";
-import { describeError, messageOf, toSessionError } from "../errors";
+import { DIRECT_MAC_SUMMARY, describeError, messageOf, toSessionError, vncSecurityProblem } from "../errors";
 import { formatFingerprint, identityCheckSteps, identityKindOf } from "../fingerprint";
 import type { ChannelMessage, Connection, IdentityKind, IdentityMismatch, SessionError, SessionEvent, SessionInput } from "../ipc";
 import { copyLogButton } from "../logs";
@@ -10,6 +10,7 @@ import { ClipboardSync } from "../remote/clipboard";
 import { remoteSizeForViewport, type DisplayMode } from "../remote/geometry";
 import { InputController } from "../remote/input";
 import { RemoteScreen } from "../remote/screen";
+import { lockState, type LockLevel, type SecurityLayer } from "../security";
 import { hostLabel, pinnedIdentityAfterEdit, type ConnectionStore } from "../state";
 import { askPassword } from "./password";
 
@@ -58,6 +59,38 @@ function identityName(kind: IdentityKind): string {
   return kind === "tls_certificate" ? "certificate" : "SSH host key";
 }
 
+const SVG = "http://www.w3.org/2000/svg";
+
+/** A padlock: closed, closed with a caution mark, or open. */
+function lockIcon(level: LockLevel): SVGSVGElement {
+  const svg = document.createElementNS(SVG, "svg");
+  svg.setAttribute("viewBox", "0 0 16 16");
+  svg.setAttribute("width", "16");
+  svg.setAttribute("height", "16");
+  svg.setAttribute("aria-hidden", "true");
+  svg.classList.add("lock-icon");
+  const path = (d: string, cls: string) => {
+    const p = document.createElementNS(SVG, "path");
+    p.setAttribute("d", d);
+    p.setAttribute("class", cls);
+    svg.append(p);
+  };
+  // Shackle: closed, or swung open to the right.
+  path(level === "none" ? "M5 7V4.5a3 3 0 0 1 5.8-1.1" : "M5 7V5a3 3 0 0 1 6 0v2", "lock-shackle");
+  path("M3.5 7h9a1 1 0 0 1 1 1v5.5a1 1 0 0 1-1 1h-9a1 1 0 0 1-1-1V8a1 1 0 0 1 1-1z", "lock-body");
+  if (level === "unverified") {
+    // A caution badge over the lower right corner.
+    const badge = document.createElementNS(SVG, "circle");
+    badge.setAttribute("cx", "12.5");
+    badge.setAttribute("cy", "12");
+    badge.setAttribute("r", "3.6");
+    badge.setAttribute("class", "lock-badge");
+    svg.append(badge);
+    path("M12.5 10.2v2.1M12.5 13.9v.05", "lock-mark");
+  }
+  return svg;
+}
+
 const RESIZE_DEBOUNCE_MS = 400;
 const FALLBACK_SIZE = { width: 1280, height: 800 };
 const AUTH_NOTE = "The username or password was not accepted. Enter the password again.";
@@ -83,8 +116,11 @@ export class SessionView {
   private readonly disconnectButton: HTMLButtonElement;
   private readonly cadButton: HTMLButtonElement | null;
   private readonly hint: HTMLElement;
-  private readonly identityButton: HTMLButtonElement;
+  /** The lock: how the session is protected; opens the details (and the server identity). */
+  private readonly securityButton: HTMLButtonElement;
   private readonly notice: HTMLElement;
+  /** The "security" events of the current attempt. */
+  private security: SecurityLayer[] = [];
   /** The identity the server proved in the current attempt, and whether it was not pinned yet. */
   private seenIdentity: { sha256: string; isNew: boolean } | null = null;
   /** The identity being trusted by the current attempt, kept for a password retry. */
@@ -139,16 +175,16 @@ export class SessionView {
     this.actualButton = tool("Actual size", () => this.setMode("actual"), "Show the remote screen pixel for pixel");
     this.fullscreenButton = tool("Full screen", () => host.toggleFullscreen());
     this.disconnectButton = button("Disconnect", () => this.disconnect());
-    this.identityButton = button("Identity", () => void this.showIdentity(), { kind: "quiet" });
-    this.identityButton.classList.add("toolbar-identity");
-    this.identityButton.hidden = true;
+    this.securityButton = button("", () => void this.showSecurity(), { kind: "quiet" });
+    this.securityButton.classList.add("toolbar-security");
+    this.securityButton.hidden = true;
 
     const toolbar = h(
       "div",
       { class: "toolbar", attrs: { role: "toolbar", "aria-label": "Session" } },
       this.title,
       this.subtitle,
-      this.identityButton,
+      this.securityButton,
       h("span", { class: "spacer" }),
       this.cadButton,
       h("div", { class: "segmented", attrs: { role: "group", "aria-label": "Display size" } }, this.fitButton, this.actualButton),
@@ -232,7 +268,8 @@ export class SessionView {
     this.clipboard.reset();
     this.seenIdentity = null;
     this.currentTrust = options.trust;
-    this.identityButton.hidden = true;
+    this.security = [];
+    this.securityButton.hidden = true;
     this.notice.hidden = true;
     this.screen.setCursor({ kind: "default" });
     this.setState("connecting");
@@ -321,6 +358,9 @@ export class SessionView {
         this.seenIdentity = { sha256: event.sha256, isNew: pinned === null || pinned.toLowerCase() !== event.sha256.toLowerCase() };
         break;
       }
+      case "security":
+        this.security.push({ encrypted: event.encrypted, server_verified: event.server_verified, method: event.method });
+        break;
       case "notice":
         this.notice.replaceChildren(
           h("span", { class: "selectable", text: event.text }),
@@ -337,7 +377,7 @@ export class SessionView {
         this.overlay.hidden = true;
         this.element.title = "";
         this.subtitle.textContent = event.name ? `${hostLabel(this.connection)} - ${event.name}` : hostLabel(this.connection);
-        this.updateIdentityButton();
+        this.updateSecurityButton();
         // The backend saved the identity on sign-in; refresh so a later edit keeps the pin.
         void this.host.store.reload();
         if (this.host.isActive(this)) {
@@ -417,22 +457,26 @@ export class SessionView {
     await this.promptPassword(identity.received_sha256, TRUST_NOTE, false);
   }
 
-  /** The toolbar's Identity button: the fingerprint of the machine in this session. */
-  private async showIdentity(): Promise<void> {
+  /** The lock's details: how the session is protected, and the identity of the machine. */
+  private async showSecurity(): Promise<void> {
+    const lock = lockState(this.security);
+    if (!lock) return;
+    const body = h("div", { class: "form" });
+    body.append(
+      h("div", { class: "identity-label", text: "Protection" }),
+      h("p", { class: "dialog-text selectable", text: lock.method }),
+      ...lock.paragraphs.map((text) => h("p", { class: "dialog-text", text })),
+    );
     const seen = this.seenIdentity;
     const kind = identityKindOf(this.connection);
-    if (!seen || !kind) return;
-    const intro = seen.isNew
-      ? `This is the first time this app has seen ${this.connection.host}, so it saved its ${identityName(kind)}. If it ever changes you will be warned before your password is sent. To be sure you reached the right computer, compare it with the one shown there.`
-      : `${this.connection.host} presented the same ${identityName(kind)} as before.`;
-    await openDialog<boolean>({
-      title: `Identity of ${this.connection.name}`,
-      body: h(
-        "div",
-        { class: "form" },
-        h("p", { class: "dialog-text", text: intro }),
+    if (seen && kind) {
+      body.append(
         identityDetails(kind, [{ label: kind === "tls_certificate" ? "Certificate (SHA-256)" : "SSH host key (SHA-256)", sha256: seen.sha256 }]),
-      ),
+      );
+    }
+    await openDialog<boolean>({
+      title: lock.headline,
+      body,
       submitLabel: "Close",
       cancelLabel: "Cancel",
       onSubmit: () => true,
@@ -440,13 +484,17 @@ export class SessionView {
     this.focusScreen();
   }
 
-  private updateIdentityButton(): void {
+  private updateSecurityButton(): void {
+    const lock = lockState(this.security);
+    this.securityButton.hidden = !lock || this.state !== "connected";
+    if (!lock) return;
+    this.securityButton.replaceChildren(lockIcon(lock.level), h("span", { text: lock.label }));
+    this.securityButton.dataset["level"] = lock.level;
     const seen = this.seenIdentity;
     const kind = identityKindOf(this.connection);
-    this.identityButton.hidden = !seen || !kind || this.state !== "connected";
-    if (!seen || !kind) return;
-    this.identityButton.textContent = seen.isNew ? "New identity saved" : "Identity";
-    this.identityButton.title = `${identityName(kind)}: ${formatFingerprint(kind, seen.sha256)}`;
+    const fingerprint = seen && kind ? `\n${identityName(kind)}: ${formatFingerprint(kind, seen.sha256)}` : "";
+    this.securityButton.title = `${lock.tooltip}${fingerprint}`;
+    this.securityButton.setAttribute("aria-label", `${lock.headline}. Show details`);
   }
 
   /**
@@ -457,13 +505,18 @@ export class SessionView {
     const attempt = this.attempt;
     const confirmed = await confirmDialog({
       title: "Connect without SSH?",
-      message:
-        "Without SSH, the screen and everything you type travel over the network unencrypted, and someone who can intercept the connection could capture your Mac password. Only do this on a network you fully trust. This connection will stay set to connect without SSH; you can turn the SSH tunnel back on in its settings.",
+      message: `${DIRECT_MAC_SUMMARY} This connection will stay set to connect without SSH; you can turn the SSH tunnel back on in its settings.`,
       confirmLabel: "Connect without SSH",
     });
     if (!confirmed || attempt !== this.attempt || this.destroyed) return;
+    await this.switchTunnel(false);
+  }
+
+  /** Save the connection with the SSH tunnel on or off, then connect again in this tab. */
+  private async switchTunnel(on: boolean): Promise<void> {
+    const attempt = this.attempt;
     const current = this.host.store.get(this.connection.id) ?? this.connection;
-    const draft = { ...current, ssh_tunnel: false };
+    const draft = { ...current, ssh_tunnel: on };
     draft.pinned_identity = pinnedIdentityAfterEdit(current, draft);
     try {
       await this.host.platform.api.saveConnection(draft);
@@ -472,7 +525,9 @@ export class SessionView {
       if (attempt !== this.attempt || this.destroyed) return;
       this.showPanel({
         headline: "Couldn't change the connection",
-        hints: ["The connection could not be switched to connect without SSH. Try again, or change it in the connection settings."],
+        hints: [
+          `The connection could not be switched to ${on ? "use the SSH tunnel" : "connect without SSH"}. Try again, or change it in the connection settings.`,
+        ],
         detail: messageOf(error),
         buttons: [this.okButton("primary"), button("Reconnect", () => this.reconnect())],
         error: true,
@@ -597,6 +652,20 @@ export class SessionView {
         button("Connect without SSH", () => void this.connectWithoutSsh(), {
           title: "Use Screen Sharing directly, without the encrypted SSH tunnel",
         }),
+        copyLog,
+      ];
+    } else if (
+      error.kind === "security" &&
+      this.connection.protocol === "vnc" &&
+      !this.connection.ssh_tunnel &&
+      vncSecurityProblem(error.detail) !== null
+    ) {
+      buttons = [
+        ok,
+        button("Use SSH tunnel", () => void this.switchTunnel(true), {
+          title: "Connect through SSH (the Mac's Remote Login) from now on",
+        }),
+        reconnect,
         copyLog,
       ];
     } else {

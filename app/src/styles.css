@@ -11,6 +11,8 @@
   --danger: #c0352b;
   --warn-bg: #fdf3d7;
   --warn-text: #5c4400;
+  --ok: #1d7a3a;
+  --caution: #b26b00;
   --error-bg: #fbe5e2;
   --error-text: #7a1c14;
   --stage: #17171a;
@@ -37,6 +39,8 @@
     --danger: #ef6b60;
     --warn-bg: #3d3416;
     --warn-text: #f1dfa5;
+    --ok: #5cc27e;
+    --caution: #f0b440;
     --error-bg: #46211d;
     --error-text: #f6c6c0;
   }
@@ -832,9 +836,40 @@ body.fullscreen .session-top:focus-within {
   opacity: 0.85;
 }
 
-.toolbar-identity {
+.toolbar-security {
   flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   font-size: 12px;
+}
+
+.lock-icon path {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.toolbar-security[data-level="verified"] {
+  color: var(--ok);
+}
+
+.lock-icon .lock-badge {
+  fill: var(--caution);
+  stroke: var(--bg);
+  stroke-width: 1;
+}
+
+.lock-icon .lock-mark {
+  stroke: #ffffff;
+  stroke-width: 1.4;
+}
+
+.toolbar-security[data-level="none"] {
+  color: var(--danger);
+  font-weight: 600;
 }
 
 .session-notice {

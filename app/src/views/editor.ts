@@ -1,7 +1,7 @@
 // The dialog for adding or editing a saved connection.
 import { openDialog } from "../dialog";
 import { button, h } from "../dom";
-import { messageOf } from "../errors";
+import { DIRECT_MAC_SUMMARY, messageOf } from "../errors";
 import type { Connection, Protocol, SavedConnection } from "../ipc";
 import type { Platform } from "../platform";
 import { DEFAULT_PORT, DEFAULT_SSH_PORT, blankConnection, passwordClearedByEdit, pinnedIdentityAfterEdit } from "../state";
@@ -183,7 +183,7 @@ export async function openEditor(platform: Platform, existing: Connection | null
     tunnelNote.classList.toggle("notice-warn", !tunnel.input.checked);
     tunnelNote.textContent = tunnel.input.checked
       ? "On the Mac, turn on both Screen Sharing and Remote Login (System Settings > General > Sharing). The screen and your password travel inside the encrypted SSH connection."
-      : "This session isn't encrypted. Anyone on the network can see the screen and everything you type, and someone who can intercept the connection can also capture your Mac password. Only do this on a network you fully trust. On the Mac, turn on Screen Sharing (System Settings > General > Sharing).";
+      : `${DIRECT_MAC_SUMMARY} On the Mac, turn on Screen Sharing (System Settings > General > Sharing).`;
   };
   type.addEventListener("change", () => {
     if (!portEdited) port.input.value = String(DEFAULT_PORT[protocol()]);

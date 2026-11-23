@@ -238,6 +238,7 @@ async fn connect(
     let _ = events
         .send(SessionEvent::ServerIdentity { sha256: fingerprint })
         .await;
+    let _ = events.send(security_event(config)).await;
 
     let upgraded = ironrdp_tokio::mark_as_upgraded(should_upgrade, &mut connector);
     let boxed: Box<dyn Stream> = Box::new(tls);
@@ -257,6 +258,14 @@ async fn connect(
     .map_err(|e| connector_error("sign-in", &e))?;
 
     Ok((connection, framed))
+}
+
+/// How the session is protected, reported once the certificate passed the pin check. A pin
+/// that was set has matched by then (a mismatch ends the session), so the server is verified
+/// exactly when there was a pin; on first use it is not.
+fn security_event(config: &RdpConfig) -> SessionEvent {
+    let method = if config.nla { "TLS + NLA" } else { "TLS" };
+    SessionEvent::security(true, config.pinned_cert_sha256.is_some(), method)
 }
 
 /// X.224 security negotiation. With NLA on, refuses any answer other than CredSSP (HYBRID /

@@ -235,6 +235,9 @@ async fn pump(handle: &mut SessionHandle, screen: &mut Screen, duration: Duratio
         match event {
             SessionEvent::Status(text) => println!("status: {text}"),
             SessionEvent::ServerIdentity { sha256 } => println!("server identity sha256: {sha256}"),
+            SessionEvent::Security { encrypted, server_verified, method } => {
+                println!("security: {method} (encrypted: {encrypted}, server verified: {server_verified})")
+            }
             SessionEvent::Connected { width, height, name } => {
                 println!("connected: {name} {width}x{height}");
                 screen.resize(width, height);

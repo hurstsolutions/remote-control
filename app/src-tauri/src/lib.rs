@@ -322,6 +322,33 @@ fn connect(
     Ok(session_id)
 }
 
+/// VNC-level encryption for a Mac connection. Direct connections must be encrypted by Apple
+/// Screen Sharing or not happen at all. Inside the SSH tunnel VNC adds nothing: SSH already
+/// encrypts and authenticates the session, and Apple's encryption on top would only risk
+/// incompatibilities.
+fn vnc_options(ssh_tunnel: bool, srp: bool) -> rc_vnc::VncOptions {
+    let encryption = if ssh_tunnel {
+        rc_vnc::EncryptionPolicy::Off
+    } else {
+        rc_vnc::EncryptionPolicy::Required
+    };
+    rc_vnc::VncOptions::default().with_encryption(encryption).with_srp(srp)
+}
+
+/// Troubleshooting knob: `RC_VNC_SRP=off` (or `0`, `false`, `no`) makes direct Mac connections
+/// sign in with Apple's older method (encrypted, but the Mac is not verified) instead of SRP.
+const SRP_ENV: &str = "RC_VNC_SRP";
+
+fn srp_enabled(value: Option<&str>) -> bool {
+    !value.is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no"))
+}
+
+/// The tunnel's layer of protection. The host key was checked against the pin (a mismatch ends
+/// the session before this), so the Mac is verified exactly when there was a pin.
+fn tunnel_security(pinned: Option<&str>) -> SessionEvent {
+    SessionEvent::security(true, pinned.is_some(), "SSH tunnel")
+}
+
 /// VNC, through an SSH tunnel to the Mac unless the connection opts out.
 async fn run_vnc(connection: Connection, password: String, pinned: Option<String>, io: SessionIo) {
     let config = rc_vnc::VncConfig {
@@ -330,9 +357,14 @@ async fn run_vnc(connection: Connection, password: String, pinned: Option<String
         shared: true,
         view_only: false,
     };
+    let srp = srp_enabled(std::env::var(SRP_ENV).ok().as_deref());
+    if !srp {
+        warn!("{SRP_ENV} turns SRP off: a direct connection will be encrypted, but the Mac will not be verified");
+    }
+    let options = vnc_options(connection.ssh_tunnel, srp);
     if !connection.ssh_tunnel {
-        warn!("VNC without an SSH tunnel: the session is not encrypted");
-        rc_vnc::connect_and_run(&connection.host, connection.port, config, io).await;
+        info!(encryption = ?options.encryption, srp, "VNC without an SSH tunnel: Apple Screen Sharing encryption is required");
+        rc_vnc::connect_and_run_with_options(&connection.host, connection.port, config, options, io).await;
         return;
     }
 
@@ -350,7 +382,7 @@ async fn run_vnc(connection: Connection, password: String, pinned: Option<String
         password: password.into(),
         target_host: "127.0.0.1".to_owned(),
         target_port: connection.port,
-        pinned_host_key_sha256: pinned,
+        pinned_host_key_sha256: pinned.clone(),
     })
     .await;
     match tunnel {
@@ -361,8 +393,9 @@ async fn run_vnc(connection: Connection, password: String, pinned: Option<String
                     sha256: tunnel.host_key_sha256.clone(),
                 })
                 .await;
+            let _ = io.events.send(tunnel_security(pinned.as_deref())).await;
             let guard = tunnel.guard;
-            rc_vnc::run(tunnel.stream, config, io).await;
+            rc_vnc::run_with_options(tunnel.stream, config, options, io).await;
             guard.close().await;
         }
         Err(error) => {
@@ -556,6 +589,9 @@ fn to_json(event: SessionEvent) -> Option<serde_json::Value> {
     Some(match event {
         SessionEvent::Status(text) => json!({ "type": "status", "text": text }),
         SessionEvent::ServerIdentity { sha256 } => json!({ "type": "identity", "sha256": sha256 }),
+        SessionEvent::Security { encrypted, server_verified, method } => json!({
+            "type": "security", "encrypted": encrypted, "server_verified": server_verified, "method": method,
+        }),
         SessionEvent::Connected { width, height, name } => {
             json!({ "type": "connected", "width": width, "height": height, "name": name })
         }
@@ -701,6 +737,53 @@ mod tests {
         assert_eq!(json["kind"], "bitmap");
         assert_eq!(json["rgba_base64"], "/wAA/w==");
         assert!(to_json(SessionEvent::Bell).is_some());
+    }
+
+    #[test]
+    fn security_events_use_the_ui_field_names() {
+        let json = to_json(SessionEvent::security(true, false, "TLS + NLA")).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "type": "security", "encrypted": true, "server_verified": false, "method": "TLS + NLA" })
+        );
+        let json = to_json(rc_vnc::VncSecurity::EncryptedVerified.to_event()).unwrap();
+        assert_eq!(json["encrypted"], true);
+        assert_eq!(json["server_verified"], true);
+    }
+
+    #[test]
+    fn direct_mac_connections_require_encryption_and_tunnelled_ones_leave_it_to_ssh() {
+        let direct = vnc_options(false, true);
+        assert_eq!(direct.encryption, rc_vnc::EncryptionPolicy::Required);
+        assert!(direct.srp);
+        let tunnelled = vnc_options(true, true);
+        assert_eq!(tunnelled.encryption, rc_vnc::EncryptionPolicy::Off);
+        assert!(!vnc_options(false, false).srp);
+        assert_eq!(vnc_options(false, false).encryption, rc_vnc::EncryptionPolicy::Required);
+    }
+
+    #[test]
+    fn srp_is_on_unless_the_knob_turns_it_off() {
+        assert!(srp_enabled(None));
+        assert!(srp_enabled(Some("")));
+        assert!(srp_enabled(Some("on")));
+        for off in ["off", "0", "false", "no", " OFF "] {
+            assert!(!srp_enabled(Some(off)), "{off}");
+        }
+    }
+
+    #[test]
+    fn the_tunnel_is_verified_only_against_a_pin() {
+        let check = |pinned: Option<&str>, verified: bool| match tunnel_security(pinned) {
+            SessionEvent::Security { encrypted, server_verified, method } => {
+                assert!(encrypted);
+                assert_eq!(server_verified, verified);
+                assert_eq!(method, "SSH tunnel");
+            }
+            other => panic!("{other:?}"),
+        };
+        check(None, false);
+        check(Some("ab"), true);
     }
 
     #[test]

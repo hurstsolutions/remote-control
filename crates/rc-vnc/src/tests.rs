@@ -24,11 +24,11 @@ async fn next(h: &mut SessionHandle) -> SessionEvent {
     tokio::time::timeout(T, h.events.recv()).await.expect("timed out waiting for an event").expect("channel closed")
 }
 
-/// Next event that is not a Status.
+/// Next event that is not a Status or Security report.
 async fn next_real(h: &mut SessionHandle) -> SessionEvent {
     loop {
         match next(h).await {
-            SessionEvent::Status(_) => continue,
+            SessionEvent::Status(_) | SessionEvent::Security { .. } => continue,
             ev => return ev,
         }
     }
@@ -284,6 +284,56 @@ async fn rfb_3_3_no_auth() {
     h.input.send(SessionInput::Close).unwrap();
     assert!(expect_closed(&mut h).await.is_none());
     task.await.unwrap();
+}
+
+#[tokio::test]
+async fn unencrypted_session_reports_its_security_once_just_before_connected() {
+    let (mut s, mut h, task) = start(config(None, None));
+    version(&mut s, b"RFB 003.008\n", b"RFB 003.008\n").await;
+    s.write_all(&[1, 1]).await.unwrap();
+    assert_eq!(read_n(&mut s, 1).await, [1]);
+    s.write_all(&[0, 0, 0, 0]).await.unwrap();
+    init_phase(&mut s, 2, 2, "plain").await;
+    let mut before = Vec::new();
+    loop {
+        match next(&mut h).await {
+            SessionEvent::Connected { .. } => break,
+            SessionEvent::Status(_) => {}
+            ev => before.push(ev),
+        }
+    }
+    assert_eq!(before.len(), 1, "{before:?}");
+    match &before[0] {
+        SessionEvent::Security { encrypted, server_verified, method } => {
+            assert!(!encrypted && !server_verified);
+            assert_eq!(method, crate::METHOD_UNENCRYPTED);
+        }
+        ev => panic!("expected a Security event, got {ev:?}"),
+    }
+    assert_eq!(crate::VncSecurity::from_event(&before[0]), Some(crate::VncSecurity::Unencrypted));
+    h.input.send(SessionInput::Close).unwrap();
+    assert!(expect_closed(&mut h).await.is_none());
+    task.await.unwrap();
+}
+
+#[test]
+fn security_levels_round_trip_through_their_events() {
+    use crate::VncSecurity as V;
+    for level in [V::Unencrypted, V::EncryptedUnverified, V::EncryptedVerified] {
+        assert_eq!(V::from_event(&level.to_event()), Some(level));
+    }
+    let SessionEvent::Security { encrypted, server_verified, .. } = V::EncryptedVerified.to_event() else {
+        panic!("not a Security event");
+    };
+    assert!(encrypted && server_verified);
+    let SessionEvent::Security { encrypted, server_verified, .. } = V::EncryptedUnverified.to_event() else {
+        panic!("not a Security event");
+    };
+    assert!(encrypted && !server_verified);
+    // Someone else's layer, or a mismatched claim, is not a VNC level.
+    assert_eq!(V::from_event(&SessionEvent::security(true, true, "SSH tunnel")), None);
+    assert_eq!(V::from_event(&SessionEvent::security(true, true, crate::METHOD_ENCRYPTED_UNVERIFIED)), None);
+    assert_eq!(V::from_event(&SessionEvent::Status("x".into())), None);
 }
 
 #[tokio::test]

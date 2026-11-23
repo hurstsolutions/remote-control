@@ -582,6 +582,7 @@ async fn run_case(sec: Sec, enc: Enc) -> Vec<u8> {
         let ev = tokio::time::timeout(T, handle.events.recv()).await.expect("timed out").expect("channel closed");
         match ev {
             SessionEvent::Status(_) => {}
+            SessionEvent::Security { encrypted, .. } => assert!(!encrypted, "policy Off never encrypts"),
             SessionEvent::Connected { width, height, name } => {
                 assert_eq!((width as usize, height as usize), (W, H));
                 assert_eq!(name, "Mock Mac");
@@ -1031,6 +1032,8 @@ fn opts_srp_off(o: &AppleOpts) -> bool {
 struct AppleRun {
     fb: Vec<u8>,
     statuses: Vec<String>,
+    /// Every VNC security level reported, in order.
+    security: Vec<VncSecurity>,
     received: Vec<Vec<u8>>,
 }
 
@@ -1055,9 +1058,13 @@ async fn run_apple(enc: Enc, opts: AppleOpts, input: Vec<SessionInput>) -> Apple
     let mut fb = vec![0u8; W * H * 4];
     let mut covered = vec![false; W * H];
     let mut statuses = Vec::new();
+    let mut security = Vec::new();
     while covered.iter().any(|c| !c) {
         match tokio::time::timeout(T, handle.events.recv()).await.expect("timed out").expect("channel closed") {
             SessionEvent::Status(s) => statuses.push(s),
+            ev @ SessionEvent::Security { .. } => {
+                security.push(VncSecurity::from_event(&ev).unwrap_or_else(|| panic!("unknown security event {ev:?}")))
+            }
             SessionEvent::Connected { name, .. } => assert_eq!(name, "Mock Mac"),
             SessionEvent::Frame { x, y, w, h, rgba } => {
                 let (x, y, w, h) = (x as usize, y as usize, w as usize, h as usize);
@@ -1086,7 +1093,7 @@ async fn run_apple(enc: Enc, opts: AppleOpts, input: Vec<SessionInput>) -> Apple
     }
     client.await.unwrap();
     let received = server.await.unwrap();
-    AppleRun { fb, statuses, received }
+    AppleRun { fb, statuses, security, received }
 }
 
 #[tokio::test]
@@ -1094,8 +1101,7 @@ async fn apple_encrypted_session_paints() {
     for enc in [Enc::Zrle, Enc::Raw] {
         let run = run_apple(enc, AppleOpts::default(), vec![]).await;
         assert_picture(&run.fb);
-        let sec: Vec<_> = run.statuses.iter().filter_map(|s| VncSecurity::from_status(s)).collect();
-        assert_eq!(sec, [VncSecurity::EncryptedUnverified], "{:?}", run.statuses);
+        assert_eq!(run.security, [VncSecurity::EncryptedUnverified], "{:?}", run.statuses);
         assert!(run.statuses.iter().any(|s| s == "Setting up encryption"));
     }
 }
@@ -1353,8 +1359,7 @@ async fn apple_srp_session_is_encrypted_and_verified() {
     let input = vec![SessionInput::Key { code: "KeyA".into(), key: "a".into(), down: true }];
     let run = run_apple(Enc::Zrle, opts, input).await;
     assert_picture(&run.fb);
-    let sec: Vec<_> = run.statuses.iter().filter_map(|s| VncSecurity::from_status(s)).collect();
-    assert_eq!(sec, [VncSecurity::EncryptedVerified], "{:?}", run.statuses);
+    assert_eq!(run.security, [VncSecurity::EncryptedVerified], "{:?}", run.statuses);
     assert!(run.statuses.iter().any(|s| s.contains("SRP")), "{:?}", run.statuses);
     assert!(run.received.contains(&vec![4, 1, 0, 0, 0, 0, 0, 0x61]));
 }
@@ -1364,8 +1369,7 @@ async fn apple_srp_turned_off_uses_type_30() {
     let opts = AppleOpts { offer_srp: true, expect_srp: false, ..Default::default() };
     let run = run_apple(Enc::Raw, opts, vec![]).await;
     assert_picture(&run.fb);
-    let sec: Vec<_> = run.statuses.iter().filter_map(|s| VncSecurity::from_status(s)).collect();
-    assert_eq!(sec, [VncSecurity::EncryptedUnverified]);
+    assert_eq!(run.security, [VncSecurity::EncryptedUnverified]);
 }
 
 #[tokio::test]

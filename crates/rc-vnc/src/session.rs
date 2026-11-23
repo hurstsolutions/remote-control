@@ -210,7 +210,7 @@ where
     if !encrypted && options.encryption != crate::EncryptionPolicy::Off {
         warn!(policy = ?options.encryption, "the session is not encrypted by VNC (the server or sign-in did not allow it)");
     }
-    emit(events, SessionEvent::Status(security.status_text().into())).await?;
+    emit(events, security.to_event()).await?;
 
     let shared: SharedRef =
         Arc::new(Mutex::new(Shared { width: init.width, height: init.height, ..Default::default() }));

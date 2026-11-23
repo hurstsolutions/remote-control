@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { describeError, messageOf, toSessionError } from "./errors";
+import { DIRECT_MAC_SUMMARY, describeError, messageOf, toSessionError, vncSecurityProblem } from "./errors";
 import type { ErrorKind } from "./ipc";
 
 const windows = { host: "office-pc", protocol: "rdp" as const, ssh_tunnel: true, name: "Office" };
@@ -24,8 +24,57 @@ describe("describeError", () => {
     expect(hints).toContain("System Settings > General > Sharing > Remote Login");
     expect(hints).toContain("Reconnect");
     expect(hints).toContain("Connect without SSH");
-    expect(hints).toContain("isn't encrypted");
-    expect(hints).toContain("capture your Mac password");
+    expect(hints).toContain("still encrypted");
+    expect(hints).toContain("impersonate the Mac");
+    expect(hints).not.toContain("isn't encrypted");
+  });
+
+  it("explains each Mac encryption failure and points to the SSH tunnel", () => {
+    const direct = { ...mac, ssh_tunnel: false };
+    const notEncrypted = describeError(
+      { kind: "security", detail: "the session could not be encrypted: the server announced RFB 3.8, not Apple Screen Sharing" },
+      direct,
+    );
+    expect(notEncrypted.headline).toBe("Couldn't encrypt the session with studio-mac");
+    expect(notEncrypted.hints.join(" ")).toContain("Remote Login");
+    expect(notEncrypted.hints.join(" ")).toContain("Use SSH tunnel");
+
+    const downgrade = describeError(
+      {
+        kind: "security",
+        detail:
+          "the session could not be encrypted: the Mac offers security types [1 (None)] ... Security types None (1) and VNC password (2) are refused while encryption is required: ...",
+      },
+      direct,
+    );
+    expect(downgrade.headline).toBe("studio-mac offered only an unencrypted connection");
+    expect(downgrade.hints.join(" ")).toContain("tampering");
+
+    const account = describeError(
+      { kind: "security", detail: "a macOS username is set for this connection, but the server offers only [2]. Security types None (1) and VNC password (2) are refused when a username is set" },
+      direct,
+    );
+    expect(account.headline).toBe("studio-mac offered only an unencrypted connection");
+
+    const integrity = describeError(
+      { kind: "security", detail: "the encrypted session failed during session: encrypted record 7 (64 bytes) failed its integrity check" },
+      direct,
+    );
+    expect(integrity.headline).toBe("The encrypted connection to studio-mac was broken");
+    expect(integrity.hints.join(" ")).toContain("tampering");
+  });
+
+  it("keeps the generic text for other security failures, and for Windows", () => {
+    expect(vncSecurityProblem("SRP: the server sent invalid group parameters")).toBeNull();
+    const pc = describeError({ kind: "security", detail: "the session could not be encrypted" }, windows);
+    expect(pc.headline).toBe("Couldn't set up a secure connection to office-pc");
+  });
+
+  it("describes direct Mac connections as encrypted, with SSH still the best", () => {
+    expect(DIRECT_MAC_SUMMARY).toContain("won't connect unencrypted");
+    expect(DIRECT_MAC_SUMMARY).toContain("SRP");
+    expect(DIRECT_MAC_SUMMARY).toContain("impersonate the Mac");
+    expect(DIRECT_MAC_SUMMARY).toContain("SSH (Remote Login)");
   });
 
   it("explains a refused sign-in", () => {

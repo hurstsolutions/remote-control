@@ -19,6 +19,18 @@ pub enum SessionEvent {
     /// for RDP). `sha256` is lowercase hex. The front end stores it on first use and passes it back
     /// as the pinned value on later connections.
     ServerIdentity { sha256: String },
+    /// How one layer of the connection is protected, sent before [`SessionEvent::Connected`]. A
+    /// session may report more than one layer (a VNC session inside an SSH tunnel reports the
+    /// tunnel, then VNC's own protection); the best layer is what protects the session.
+    Security {
+        /// The layer encrypts everything it carries.
+        encrypted: bool,
+        /// The server proved who it is: a pinned identity matched, or (Apple SRP) it proved it
+        /// knows the account's password. `false` on first use of a pin.
+        server_verified: bool,
+        /// Short name of the layer for people ("TLS + NLA", "SSH tunnel"...).
+        method: String,
+    },
     /// The session is up. The framebuffer is `width` x `height`; expect [`SessionEvent::Frame`]s next.
     Connected { width: u16, height: u16, name: String },
     /// The remote desktop changed size. Previous pixels are invalid.
@@ -33,6 +45,13 @@ pub enum SessionEvent {
     Bell,
     /// The session ended. `error` is `None` for a clean disconnect.
     Closed { error: Option<SessionError> },
+}
+
+impl SessionEvent {
+    /// A [`SessionEvent::Security`].
+    pub fn security(encrypted: bool, server_verified: bool, method: impl Into<String>) -> Self {
+        SessionEvent::Security { encrypted, server_verified, method: method.into() }
+    }
 }
 
 #[derive(Debug, Clone)]

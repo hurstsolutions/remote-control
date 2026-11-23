@@ -20,6 +20,10 @@ const FAILURES: ErrorKind[] = ["unreachable", "auth_failed", "security", "identi
 const NEW_CERT_ID = "mock-new-cert";
 /** A Mac whose SSH host key changed since it was pinned. */
 const NEW_KEY_ID = "mock-new-key";
+/** A Mac without SSH whose Screen Sharing lacks Apple's SRP sign-in: encrypted, not verified. */
+const OLDER_MAC_ID = "mock-older-mac";
+/** A VNC server that cannot encrypt: fails without the SSH tunnel. */
+const NO_ENCRYPTION_ID = "mock-no-encryption";
 const OLD_IDENTITY = "aa".repeat(32);
 /** What each sample presents now; anything else presents DEFAULT_IDENTITY. */
 const PRESENTED: Record<string, string> = {
@@ -116,10 +120,38 @@ const connections: Connection[] = [
     pinned_identity: OLD_IDENTITY,
     share_clipboard: false,
   },
+  {
+    id: OLDER_MAC_ID,
+    name: "Older Mac without SSH (sample)",
+    protocol: "vnc",
+    host: "10.0.0.44",
+    port: 5900,
+    username: "sam",
+    domain: "",
+    nla: true,
+    ssh_tunnel: false,
+    ssh_port: 22,
+    pinned_identity: null,
+    share_clipboard: true,
+  },
+  {
+    id: NO_ENCRYPTION_ID,
+    name: "VNC server that can't encrypt (sample)",
+    protocol: "vnc",
+    host: "10.0.0.45",
+    port: 5900,
+    username: "sam",
+    domain: "",
+    nla: true,
+    ssh_tunnel: false,
+    ssh_port: 22,
+    pinned_identity: null,
+    share_clipboard: true,
+  },
 ];
 // The Mac samples, the failing sample and the changed-identity samples have a "saved" password;
 // the Windows sample asks.
-const savedPasswords = new Set<string>(["mock-mac", NO_SSH_ID, FAILING_ID, NEW_CERT_ID, NEW_KEY_ID]);
+const savedPasswords = new Set<string>(["mock-mac", NO_SSH_ID, FAILING_ID, NEW_CERT_ID, NEW_KEY_ID, OLDER_MAC_ID, NO_ENCRYPTION_ID]);
 const sessions = new Map<string, MockSession>();
 const log: string[] = [];
 let nextId = 1;
@@ -191,6 +223,8 @@ class MockSession {
     private readonly emit: Emit,
     /** Runs on sign-in, before "connected" is sent (where the real backend saves the pin). */
     private readonly onSignedIn: () => string | null = () => null,
+    /** The "security" events sent before "connected". */
+    private readonly security: SessionEvent[] = [],
   ) {}
 
   private event(event: SessionEvent): void {
@@ -218,6 +252,7 @@ class MockSession {
       if (this.connection.protocol === "rdp" || this.connection.ssh_tunnel) {
         this.event({ type: "identity", sha256: presentedIdentity(this.connection.id) });
       }
+      for (const event of this.security) this.event(event);
       this.event({ type: "status", text: "Signing in..." });
     });
     this.later(1300, () => {
@@ -372,6 +407,22 @@ function crosshairCursor(): SessionEvent {
   return { type: "cursor", kind: "bitmap", width: size, height: size, hot_x: 12, hot_y: 12, rgba_base64: btoa(binary) };
 }
 
+/** What the backend reports for a session that signs in; `pinned` = a pin was checked. */
+function mockSecurity(connection: Connection, pinned: boolean): SessionEvent[] {
+  if (connection.protocol === "rdp") {
+    return [{ type: "security", encrypted: true, server_verified: pinned, method: connection.nla ? "TLS + NLA" : "TLS" }];
+  }
+  if (connection.ssh_tunnel) {
+    return [
+      { type: "security", encrypted: true, server_verified: pinned, method: "SSH tunnel" },
+      { type: "security", encrypted: false, server_verified: false, method: "VNC, unencrypted" },
+    ];
+  }
+  return connection.id === OLDER_MAC_ID
+    ? [{ type: "security", encrypted: true, server_verified: false, method: "Apple Screen Sharing encryption" }]
+    : [{ type: "security", encrypted: true, server_verified: true, method: "Apple Screen Sharing encryption, SRP sign-in" }];
+}
+
 function presentedIdentity(id: string): string {
   return PRESENTED[id] ?? DEFAULT_IDENTITY;
 }
@@ -477,6 +528,13 @@ const mockApi: Api = {
       failureIndex++;
     } else if (args.id === NO_SSH_ID && connection.ssh_tunnel) {
       failure = "tunnel_unavailable";
+    } else if (args.id === NO_ENCRYPTION_ID && !connection.ssh_tunnel) {
+      failure = "security";
+      error = {
+        kind: "security",
+        detail:
+          "the session could not be encrypted: the server announced RFB 3.8, not Apple Screen Sharing (RFB 003.889), and only Apple Screen Sharing can encrypt a VNC session. Refusing to connect without encryption.",
+      };
     } else if (args.password === "wrong") {
       failure = "auth_failed";
     }
@@ -498,7 +556,7 @@ const mockApi: Api = {
       }
       return null;
     };
-    const session = new MockSession(id, connection, onMessage, signedIn);
+    const session = new MockSession(id, connection, onMessage, signedIn, mockSecurity(connection, pinsIdentity && expected !== null));
     sessions.set(id, session);
     if (error) session.fail(error);
     else session.run(failure);

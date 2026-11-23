@@ -21,6 +21,58 @@ const KINDS: readonly ErrorKind[] = [
   "password_required",
 ];
 
+/** What connecting to a Mac without SSH means, for the editor and the "Connect without SSH" confirmation. */
+export const DIRECT_MAC_SUMMARY =
+  "Without SSH, Screen Sharing encrypts the session itself, and the app won't connect unencrypted. Newer Macs that support Apple's SRP sign-in are also verified. With other Macs, someone actively intercepting the connection could impersonate the Mac and capture your password. SSH (Remote Login) is the most thoroughly protected option.";
+/** The risk of an encrypted but unverified Mac session (Apple's older sign-in). */
+export const DIRECT_MAC_RISK =
+  "This Mac's sign-in can't prove it is really your Mac: someone actively intercepting the connection could impersonate it and capture your password.";
+/** How to get full protection for a Mac. */
+export const DIRECT_MAC_FIX =
+  'For full protection, turn on Remote Login on the Mac (System Settings > General > Sharing > Remote Login) and turn on "Secure with SSH tunnel" for this connection.';
+const USE_SSH_HINT =
+  "On the Mac, turn on Remote Login (System Settings > General > Sharing > Remote Login), then click Use SSH tunnel.";
+
+/** Which encryption problem a VNC "security" error is, from rc-vnc's detail text. */
+export type VncSecurityProblem = "downgrade" | "integrity" | "not_encrypted";
+
+export function vncSecurityProblem(detail: string): VncSecurityProblem | null {
+  if (/refused while encryption is required|are refused when a username is set/i.test(detail)) return "downgrade";
+  if (/encrypted session failed|integrity check/i.test(detail)) return "integrity";
+  if (/could not be encrypted/i.test(detail)) return "not_encrypted";
+  return null;
+}
+
+function vncSecurityText(problem: VncSecurityProblem, host: string): ErrorText {
+  switch (problem) {
+    case "not_encrypted":
+      return {
+        headline: `Couldn't encrypt the session with ${host}`,
+        hints: [
+          "Without SSH, this app connects to a Mac only if Screen Sharing encrypts the session, and that could not be set up, so the session was not started.",
+          USE_SSH_HINT,
+          "Check that the address is a Mac with Screen Sharing turned on. Other VNC servers can't encrypt the session.",
+        ],
+      };
+    case "downgrade":
+      return {
+        headline: `${host} offered only an unencrypted connection`,
+        hints: [
+          "The app refused to connect, because the session would not have been encrypted. Either this is not a Mac with Screen Sharing, or someone on the network is tampering with the connection.",
+          USE_SSH_HINT,
+        ],
+      };
+    case "integrity":
+      return {
+        headline: `The encrypted connection to ${host} was broken`,
+        hints: [
+          "Data arrived damaged or altered, so the session was closed to protect it. A network fault can cause this, and so can someone tampering with the connection.",
+          "Reconnect. If it keeps happening, turn on Remote Login on the Mac and use the SSH tunnel.",
+        ],
+      };
+  }
+}
+
 /** The headline and hints to show for an error on a given connection. */
 export function describeError(error: SessionError, target: Target): ErrorText {
   const windows = target.protocol === "rdp";
@@ -45,8 +97,8 @@ export function describeError(error: SessionError, target: Target): ErrorText {
         headline: `Remote Login is off on ${host}`,
         hints: [
           "This app sends Screen Sharing through an encrypted SSH connection to the Mac (Remote Login), and the Mac refused or did not answer it. That usually means Remote Login is turned off.",
-          "To keep the whole session encrypted: on the Mac, turn on Remote Login (System Settings > General > Sharing > Remote Login), then click Reconnect.",
-          "Or click Connect without SSH to use Screen Sharing directly. That isn't encrypted: anyone on the network can see the screen and what you type, and someone intercepting the connection could capture your Mac password.",
+          "For the best protection: on the Mac, turn on Remote Login (System Settings > General > Sharing > Remote Login), then click Reconnect.",
+          "Or click Connect without SSH to use Screen Sharing directly. The session is still encrypted, but unless the Mac supports Apple's newer sign-in, someone actively intercepting the connection could impersonate the Mac and capture your password.",
           "If Remote Login is already on, check that the Mac is awake and on the same network.",
         ],
       };
@@ -69,7 +121,9 @@ export function describeError(error: SessionError, target: Target): ErrorText {
           "Before trusting it, compare the new identity below with the one shown on the computer itself.",
         ],
       };
-    case "security":
+    case "security": {
+      const problem = windows ? null : vncSecurityProblem(error.detail);
+      if (problem) return vncSecurityText(problem, host);
       return {
         headline: `Couldn't set up a secure connection to ${host}`,
         hints: [
@@ -79,6 +133,7 @@ export function describeError(error: SessionError, target: Target): ErrorText {
           "Reconnecting may help if the network was interrupted. If it keeps happening, copy the log and send it along.",
         ],
       };
+    }
     case "unsupported":
       return {
         headline: `${host} needs something this app does not support`,

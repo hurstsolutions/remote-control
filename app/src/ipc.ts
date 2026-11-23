@@ -77,6 +77,12 @@ export interface SessionError {
 export type SessionEvent =
   | { type: "status"; text: string }
   | { type: "identity"; sha256: string }
+  /**
+   * How one layer of the connection is protected, before "connected". A session may send several
+   * (a Mac through SSH: the tunnel, then VNC's own); the best layer protects the session.
+   * `method` is a short label such as "TLS + NLA", "SSH tunnel" or "Apple Screen Sharing encryption".
+   */
+  | { type: "security"; encrypted: boolean; server_verified: boolean; method: string }
   | { type: "connected"; width: number; height: number; name: string }
   | { type: "resized"; width: number; height: number }
   | { type: "cursor"; kind: "default" | "hidden" }
