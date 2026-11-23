@@ -80,6 +80,9 @@ enum Command {
         /// (use off for non-Mac VNC servers on a trusted LAN), off through the SSH tunnel.
         #[arg(long, value_parser = parse_encryption)]
         encryption: Option<rc_vnc::EncryptionPolicy>,
+        /// Do not sign in with SRP (type 36); use type 30 for encrypted sessions.
+        #[arg(long)]
+        no_srp: bool,
         #[arg(long, default_value_t = 22)]
         ssh_port: u16,
         /// Expected SSH host key SHA-256 (hex).
@@ -136,7 +139,7 @@ async fn main() -> anyhow::Result<()> {
             rc_rdp::spawn(config, io)?;
             common
         }
-        Command::Vnc { common, port, no_ssh, ssh_port, pin, encryption } => {
+        Command::Vnc { common, port, no_ssh, ssh_port, pin, encryption, no_srp } => {
             let config = rc_vnc::VncConfig {
                 username: Some(common.user.clone()).filter(|u| !u.is_empty()),
                 password: Some(common.password.clone()).filter(|p| !p.is_empty()),
@@ -145,7 +148,8 @@ async fn main() -> anyhow::Result<()> {
             };
             let default_policy =
                 if no_ssh { rc_vnc::EncryptionPolicy::Required } else { rc_vnc::EncryptionPolicy::Off };
-            let options = rc_vnc::VncOptions::default().with_encryption(encryption.unwrap_or(default_policy));
+            let options =
+                rc_vnc::VncOptions::default().with_encryption(encryption.unwrap_or(default_policy)).with_srp(!no_srp);
             if no_ssh {
                 let host = common.host.clone();
                 tokio::spawn(

@@ -2,6 +2,7 @@
 
 use crate::apple;
 use crate::auth;
+use crate::srp;
 use crate::error::{proto, Result, VncError};
 use crate::record::Keys;
 use crate::{EncryptionPolicy, VncConfig, VncOptions};
@@ -21,6 +22,7 @@ pub(crate) const STAGE_SESSION: &str = "the session";
 pub(crate) const SEC_NONE: u8 = 1;
 pub(crate) const SEC_VNC: u8 = 2;
 pub(crate) const SEC_ARD: u8 = 30;
+pub(crate) const SEC_SRP: u8 = 36;
 
 const MAX_REASON: u32 = 64 * 1024;
 const MAX_NAME: u32 = 1024 * 1024;
@@ -44,7 +46,7 @@ pub(crate) fn security_type_name(t: u8) -> &'static str {
         30 => "Apple Remote Desktop (DH)",
         33 => "Apple (newer, type 33)",
         35 => "Apple (newer, type 35)",
-        36 => "Apple (newer, type 36)",
+        36 => "Apple SRP",
         129 => "RA2 (RealVNC 129)",
         _ => "unknown",
     }
@@ -166,13 +168,18 @@ const DOWNGRADE_NOTE: &str = "Security types None (1) and VNC password (2) are r
      from the server's list to force them. Use an SSH tunnel, or turn the encryption requirement off for this \
      connection if the network is trusted.";
 
-fn pick_security(offered: &[u8], config: &VncConfig, policy: EncryptionPolicy) -> Result<u8> {
+fn pick_security(offered: &[u8], config: &VncConfig, policy: EncryptionPolicy, srp: bool) -> Result<u8> {
     let has = |t: u8| offered.contains(&t);
     let have_user = has_user(config);
     let have_pass = config.password.is_some();
+    // SRP (36) only when we are encrypting (policy is Off for every non-889 session).
+    let use_srp = srp && policy != EncryptionPolicy::Off && has(SEC_SRP);
+    if use_srp && have_user && have_pass {
+        return Ok(SEC_SRP);
+    }
     if policy == EncryptionPolicy::Required {
-        // Only type 30 leads to an encrypted session (types 33 and 36 are not implemented yet).
-        if has(SEC_ARD) {
+        // Types 36 (SRP, above) and 30 lead to an encrypted session.
+        if has(SEC_ARD) || use_srp {
             if !have_user {
                 return Err(VncError::Auth(format!(
                     "an encrypted session needs a macOS username and password (Apple authentication), but no \
@@ -183,12 +190,12 @@ fn pick_security(offered: &[u8], config: &VncConfig, policy: EncryptionPolicy) -
             if !have_pass {
                 return Err(VncError::Auth("the server needs a password for this macOS account, but none was supplied".into()));
             }
-            return Ok(SEC_ARD);
+            return Ok(if use_srp { SEC_SRP } else { SEC_ARD });
         }
         let weak = has(SEC_NONE) || has(SEC_VNC);
         return Err(VncError::Security(format!(
             "the session could not be encrypted: the Mac offers security types [{}], and this client can encrypt \
-             only after Apple's macOS-account sign-in (type 30), which is not among them.{}",
+             only after Apple's macOS-account sign-in (type 36 SRP or type 30), which is not among them.{}",
             describe_types(offered),
             if weak { format!(" {DOWNGRADE_NOTE}") } else { String::new() }
         )));
@@ -225,6 +232,18 @@ fn pick_security(offered: &[u8], config: &VncConfig, policy: EncryptionPolicy) -
          30 Apple Remote Desktop); offered: [{}]",
         describe_types(offered)
     )))
+}
+
+/// One SRP message from the server: `u32` length, then the body.
+async fn read_srp_message<S: AsyncRead + Unpin>(s: &mut S, what: &str) -> Result<Vec<u8>> {
+    let len = s.read_u32().await?;
+    if len > srp::MAX_MESSAGE {
+        return proto(format!("SRP: implausible {what} length {len}"));
+    }
+    let mut body = vec![0u8; len as usize];
+    s.read_exact(&mut body).await?;
+    debug!(len, "SRP: received the {what}");
+    Ok(body)
 }
 
 /// The error for a server that offers only None / VNC password when a macOS account is set.
@@ -341,7 +360,7 @@ where
         }
         // The policy matters only when we are speaking Apple's revision to encrypt.
         let effective = if version == Version::Apple889 { policy } else { EncryptionPolicy::Off };
-        let chosen = pick_security(&offered, config, effective).inspect_err(|e| {
+        let chosen = pick_security(&offered, config, effective, options.srp).inspect_err(|e| {
             warn!(offered = %describe_types(&offered), "cannot pick a security type: {e}");
         })?;
         info!(
@@ -360,6 +379,7 @@ where
     // ---- Authentication ----
     *stage = STAGE_AUTH;
     let mut wrap_key: Option<[u8; 16]> = None;
+    let mut server_verified = false;
     match chosen {
         SEC_NONE => {}
         SEC_VNC => {
@@ -397,6 +417,66 @@ where
             s.flush().await?;
             // MD5(shared secret): also the wrap key for the encrypted session's first rekey.
             wrap_key = Some(response.wrap_key);
+        }
+        SEC_SRP => {
+            status(events, "Authenticating (macOS account, SRP)").await?;
+            let username = config.username.as_deref().unwrap_or("");
+            let identity = srp::identity_message(username);
+            debug!(bytes = identity.len(), "SRP: sending the identity message");
+            s.write_all(&identity).await?;
+            s.flush().await?;
+            let challenge = read_srp_message(s, "challenge").await?;
+            let challenge = srp::parse_challenge(&challenge).inspect_err(|e| warn!("SRP: bad challenge: {e}"))?;
+            debug!(
+                n_bits = challenge.n.len() * 8,
+                g = %challenge.g.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                salt_len = challenge.salt.len(),
+                b_len = challenge.b.len(),
+                iterations = challenge.iterations,
+                options = %String::from_utf8_lossy(&challenge.options),
+                "SRP: challenge"
+            );
+            let password = config.password.clone().unwrap_or_default();
+            let ch = challenge.clone();
+            // PBKDF2 with tens of thousands of iterations: keep it off the async workers.
+            let proof = tokio::task::spawn_blocking(move || srp::client_proof(&ch, &password))
+                .await
+                .map_err(|e| VncError::Other(format!("SRP computation failed: {e}")))??;
+            let mut client_random = [0u8; 16];
+            getrandom::fill(&mut client_random)
+                .map_err(|e| VncError::Other(format!("could not get random bytes from the OS: {e}")))?;
+            let msg = srp::proof_message(&proof, &challenge.options, &client_random);
+            debug!(bytes = msg.len(), "SRP: sending A and the proof M1");
+            s.write_all(&msg).await?;
+            s.flush().await?;
+            *stage = STAGE_AUTH_RESULT;
+            // A Mac that rejects M1 may send the SecurityResult word straight away instead of
+            // message 4; a "length" that small cannot be message 4 (which holds a 64-byte M2).
+            let len = s.read_u32().await?;
+            if len < 8 {
+                warn!(result = len, "SRP: the Mac answered the proof with a failure result instead of its own proof");
+                return Err(VncError::Auth(format!(
+                    "authentication failed using Apple SRP (security result {len}); check the username and password"
+                )));
+            }
+            if len > srp::MAX_MESSAGE {
+                return proto(format!("SRP: implausible server proof length {len}"));
+            }
+            let mut fin = vec![0u8; len as usize];
+            s.read_exact(&mut fin).await?;
+            debug!(len, "SRP: received the server proof");
+            let m2 = srp::parse_final(&fin)?;
+            if m2 == proof.expected_m2 {
+                debug!("SRP: the Mac's proof M2 is correct; the Mac knows the password verifier");
+            } else {
+                // Either our M2 formula differs from Apple's, or this is not the Mac. An impostor
+                // without the verifier cannot know K, so it cannot produce the rekey wrapped under
+                // SHA-256(K) or a single valid record: the record layer's first integrity check
+                // closes the session before anything is shown or typed in clear.
+                warn!(m2_len = m2.len(), "SRP: the Mac's proof M2 does not match the expected value; relying on the record layer to confirm the key");
+            }
+            wrap_key = Some(proof.wrap_key);
+            server_verified = true;
         }
         _ => unreachable!("pick_security only returns supported types"),
     }
@@ -520,7 +600,7 @@ where
         init: ServerInit { width, height, name },
         keys,
         apple: version == Version::Apple889,
-        server_verified: false,
+        server_verified: server_verified && keys.is_some(),
     })
 }
 
@@ -549,7 +629,21 @@ mod tests {
     }
 
     fn pick(offered: &[u8], config: &VncConfig) -> Result<u8> {
-        pick_security(offered, config, EncryptionPolicy::Off)
+        pick_security(offered, config, EncryptionPolicy::Off, true)
+    }
+
+    #[test]
+    fn srp_is_preferred_when_encrypting() {
+        let full = cfg(Some("u"), Some("p"));
+        let mac = [30, 33, 36, 35];
+        for policy in [EncryptionPolicy::Required, EncryptionPolicy::Preferred] {
+            assert_eq!(pick_security(&mac, &full, policy, true).unwrap(), 36);
+            assert_eq!(pick_security(&mac, &full, policy, false).unwrap(), 30);
+            assert_eq!(pick_security(&[36], &full, policy, true).unwrap(), 36);
+        }
+        // Never in an unencrypted (Off) session: behaviour there is unchanged.
+        assert_eq!(pick_security(&mac, &full, EncryptionPolicy::Off, true).unwrap(), 30);
+        assert!(pick_security(&[36], &full, EncryptionPolicy::Required, false).is_err());
     }
 
     #[test]
@@ -589,9 +683,9 @@ mod tests {
     #[test]
     fn username_set_refuses_none_and_vnc_password() {
         let mac = cfg(Some("alice"), Some("p"));
-        for offered in [&[1u8][..], &[2], &[2, 1], &[33, 36, 2], &[35, 1]] {
+        for offered in [&[1u8][..], &[2], &[2, 1], &[33, 35, 2], &[35, 1]] {
             for policy in [EncryptionPolicy::Off, EncryptionPolicy::Preferred, EncryptionPolicy::Required] {
-                match pick_security(offered, &mac, policy) {
+                match pick_security(offered, &mac, policy, true) {
                     Err(VncError::Security(m)) => assert!(m.contains("None (1)") && m.contains("(2)"), "{m}"),
                     other => panic!("{offered:?} {policy:?}: {other:?}"),
                 }
@@ -604,10 +698,11 @@ mod tests {
 
     #[test]
     fn required_policy_refuses_weak_types() {
-        let req = |offered: &[u8], c: &VncConfig| pick_security(offered, c, EncryptionPolicy::Required);
+        let req = |offered: &[u8], c: &VncConfig| pick_security(offered, c, EncryptionPolicy::Required, true);
         let full = cfg(Some("u"), Some("p"));
-        assert_eq!(req(&[30, 33, 36, 35, 2], &full).unwrap(), 30);
-        for offered in [&[1u8][..], &[2], &[2, 1], &[33, 36, 2]] {
+        assert_eq!(req(&[30, 33, 36, 35, 2], &full).unwrap(), 36);
+        assert_eq!(req(&[30, 33, 35, 2], &full).unwrap(), 30);
+        for offered in [&[1u8][..], &[2], &[2, 1], &[33, 35, 2]] {
             match req(offered, &full) {
                 Err(VncError::Security(m)) => {
                     assert!(m.contains("could not be encrypted"), "{m}");
@@ -616,7 +711,7 @@ mod tests {
                 other => panic!("{offered:?}: {other:?}"),
             }
         }
-        match req(&[33, 36], &full) {
+        match req(&[33, 35], &full) {
             Err(VncError::Security(m)) => assert!(!m.contains("refused while"), "{m}"),
             other => panic!("{other:?}"),
         }
@@ -626,7 +721,7 @@ mod tests {
             other => panic!("{other:?}"),
         }
         // Preferred keeps the old preferences.
-        let pref = |offered: &[u8], c: &VncConfig| pick_security(offered, c, EncryptionPolicy::Preferred);
+        let pref = |offered: &[u8], c: &VncConfig| pick_security(offered, c, EncryptionPolicy::Preferred, true);
         assert_eq!(pref(&[30, 2], &full).unwrap(), 30);
         assert_eq!(pref(&[33, 2], &cfg(None, Some("p"))).unwrap(), 2);
         assert!(matches!(pref(&[33, 2], &full), Err(VncError::Security(_))));

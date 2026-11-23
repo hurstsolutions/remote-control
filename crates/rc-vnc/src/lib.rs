@@ -4,7 +4,8 @@
 //! authentication with a Mac username and password). Also works with ordinary VNC servers.
 //!
 //! * Protocol versions 3.3, 3.7, 3.8, and Apple's 003.889 (for encrypted sessions).
-//! * Security types: None (1), VNC password (2), Apple Remote Desktop DH/AES (30).
+//! * Security types: None (1), VNC password (2), Apple Remote Desktop DH/AES (30), Apple SRP (36,
+//!   used only for encrypted sessions, preferred over 30).
 //! * Apple Screen Sharing's encrypted session (AES-128-CBC record layer with SHA-1 integrity),
 //!   selected by [`EncryptionPolicy`] in [`VncOptions`]. Just before `Connected` the session
 //!   emits `SessionEvent::Status(text)` where `text` is [`VncSecurity::status_text`] of the
@@ -37,6 +38,7 @@ mod keysym;
 mod proto;
 mod record;
 mod session;
+mod srp;
 #[cfg(test)]
 mod tests;
 mod zlib;
@@ -104,14 +106,28 @@ pub enum EncryptionPolicy {
 
 /// Session options beyond the credentials in [`VncConfig`]. Build with `VncOptions::default()`
 /// and set fields; new fields may be added without breaking callers.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct VncOptions {
     /// Default: [`EncryptionPolicy::Off`].
     pub encryption: EncryptionPolicy,
+    /// For encrypted sessions, sign in with SRP (security type 36) when the Mac offers it,
+    /// which also verifies the Mac's identity. Default true. Turning it off falls back to
+    /// type 30 (encrypted, Mac not verified); meant only as an escape hatch while SRP is new.
+    pub srp: bool,
+}
+
+impl Default for VncOptions {
+    fn default() -> Self {
+        VncOptions { encryption: EncryptionPolicy::default(), srp: true }
+    }
 }
 
 impl VncOptions {
+    pub fn with_srp(mut self, srp: bool) -> Self {
+        self.srp = srp;
+        self
+    }
     pub fn with_encryption(mut self, encryption: EncryptionPolicy) -> Self {
         self.encryption = encryption;
         self
