@@ -11,7 +11,7 @@ tracing = { workspace = true }
 # pkcs5, rand_core) that clash with the exact pins of picky 7.0.0-rc.25, which IronRDP 0.10 needs.
 # See .cargo/audit.toml. No `flate2`: SSH compression is compiled out (RUSTSEC-2026-0493), and no
 # `rsa`: RSA host keys are refused anyway.
-russh = { version = "0.56", default-features = false, features = ["aws-lc-rs"] }
+russh = { version = "0.60", default-features = false, features = ["aws-lc-rs"] }
 zeroize = "1"
 
 [dev-dependencies]
