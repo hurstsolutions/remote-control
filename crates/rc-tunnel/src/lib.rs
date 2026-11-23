@@ -89,9 +89,14 @@ const HOST_KEY_ALGORITHMS: &[Algorithm] = &[
     Algorithm::Ecdsa { curve: EcdsaCurve::NistP521 },
 ];
 
+/// No SSH compression. The VNC stream is already compressed where it matters, and zlib in russh
+/// had no cap on decompressed packet size (RUSTSEC-2026-0493). The `flate2` feature is off too.
+const COMPRESSION: &[russh::compression::Name] = &[russh::compression::NONE];
+
 fn preferred() -> Preferred {
     Preferred {
         key: Cow::Borrowed(HOST_KEY_ALGORITHMS),
+        compression: Cow::Borrowed(COMPRESSION),
         ..Preferred::DEFAULT
     }
 }
@@ -279,5 +284,10 @@ mod tests {
         // Excludes SHA-1 `ssh-rsa`, and RSA altogether since it is compiled out of our russh build.
         assert!(!preferred.key.iter().any(|a| matches!(a, Algorithm::Rsa { .. })));
         assert_eq!(preferred.key.first(), Some(&Algorithm::Ed25519));
+    }
+
+    #[test]
+    fn compression_is_off() {
+        assert_eq!(preferred().compression.as_ref(), &[russh::compression::NONE]);
     }
 }
