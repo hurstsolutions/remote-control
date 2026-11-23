@@ -16,6 +16,7 @@ rc-types = { path = "../../crates/rc-types" }
 rc-rdp = { path = "../../crates/rc-rdp" }
 rc-vnc = { path = "../../crates/rc-vnc" }
 rc-tunnel = { path = "../../crates/rc-tunnel" }
+rc-discover = { path = "../../crates/rc-discover" }
 tauri = { version = "2", features = [] }
 tauri-plugin-clipboard-manager = "2"
 tokio = { workspace = true }

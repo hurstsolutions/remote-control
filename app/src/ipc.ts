@@ -139,6 +139,51 @@ export interface AppInfo {
 
 export type ChannelMessage = SessionEvent | ArrayBuffer;
 
+/** A saved subnet for "Find computers". The backend validates and normalizes it on save. */
+export interface Subnet {
+  /** Empty string when new; the backend assigns one. */
+  id: string;
+  /** IPv4 CIDR, e.g. "10.0.0.0/24". Nothing larger than a /16. */
+  cidr: string;
+  label: string;
+  /** The user confirmed this public (non-private) range is their own network. Ignored for private ranges. */
+  allow_public: boolean;
+}
+
+export type HostKind = "windows" | "mac" | "unknown";
+
+/**
+ * A machine found by a scan. Every string came from the network and is untrusted: show it as
+ * text only. Nothing here is trusted for security (the certificate is pinned on first connect).
+ */
+export interface FoundHost {
+  ip: string;
+  /** The open port, or null when closed. */
+  rdp: number | null;
+  vnc: number | null;
+  ssh: number | null;
+  /** The best name found, if any. */
+  name: string | null;
+  names: {
+    rdp_certificate: string | null;
+    mdns_name: string | null;
+    mdns_host: string | null;
+    netbios: string | null;
+    dns: string | null;
+  };
+  kind: HostKind;
+  /** Information only. */
+  rdp_certificate_sha256: string | null;
+  rfb_version: string | null;
+  ssh_banner: string | null;
+  model: string | null;
+}
+
+export type ScanEvent =
+  | { type: "progress"; done: number; total: number; found: number }
+  | { type: "host"; host: FoundHost }
+  | { type: "finished"; cancelled: boolean; done: number; total: number; found: number };
+
 export const api = {
   listConnections: () => invoke<Connection[]>("list_connections"),
   saveConnection: (connection: Connection) => invoke<SavedConnection>("save_connection", { connection }),
@@ -157,6 +202,19 @@ export const api = {
   },
   sendInput: (sessionId: string, input: SessionInput) => invoke<void>("send_input", { sessionId, input }),
   disconnect: (sessionId: string) => invoke<void>("disconnect", { sessionId }),
+  listSubnets: () => invoke<Subnet[]>("list_subnets"),
+  /** Replace the saved list. Resolves with it as saved (normalized), rejects with a message. */
+  saveSubnets: (subnets: Subnet[]) => invoke<Subnet[]>("save_subnets", { subnets }),
+  /**
+   * Scan saved subnets (by id). Resolves with a scan id; progress and found machines arrive on
+   * the channel, ending with a "finished" event. One scan at a time.
+   */
+  startScan: (subnetIds: string[], onEvent: (event: ScanEvent) => void) => {
+    const events = new Channel<ScanEvent>();
+    events.onmessage = onEvent;
+    return invoke<string>("start_scan", { args: { subnet_ids: subnetIds }, events });
+  },
+  cancelScan: (scanId: string) => invoke<void>("cancel_scan", { scanId }),
   appInfo: () => invoke<AppInfo>("app_info"),
   /** The last part of the log (credentials are never logged). */
   logText: () => invoke<string>("log_text"),

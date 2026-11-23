@@ -11,6 +11,7 @@ One desktop app for remote control of Windows machines (Remote Desktop / RDP) an
 | `crates/rc-rdp` | RDP backend (IronRDP): TLS, certificate pinning, NLA sign-in, frames, input, text clipboard |
 | `crates/rc-vnc` | VNC backend, including Apple (Mac username/password) sign-in |
 | `crates/rc-tunnel` | SSH tunnel (password sign-in, pinned host key) that carries VNC to a Mac |
+| `crates/rc-discover` | "Find computers": on-demand TCP scan of saved subnets for RDP / Screen Sharing / SSH, plus best-effort names |
 | `app/` | Desktop app: web UI in `app/src`, Tauri (Rust) side in `app/src-tauri` |
 | `crates/rc-cli` | `rc`, a headless test client: connect, type, click, save a screenshot, verbose log |
 

@@ -54,11 +54,16 @@ export const PASSWORD_CLEARED_NOTE = "Saved password was cleared because the add
 
 /**
  * Open the editor. `existing` is null when adding. Resolves with what save_connection returned
- * (check `password_cleared`), or null when cancelled.
+ * (check `password_cleared`), or null when cancelled. `template` pre-fills a new connection
+ * (from "Find computers"); it is ignored when editing.
  */
-export async function openEditor(platform: Platform, existing: Connection | null): Promise<SavedConnection | null> {
+export async function openEditor(
+  platform: Platform,
+  existing: Connection | null,
+  template: Connection | null = null,
+): Promise<SavedConnection | null> {
   const api = platform.api;
-  const start = existing ?? blankConnection("rdp");
+  const start = existing ?? (template ? { ...template, id: "", pinned_identity: null } : blankConnection("rdp"));
   let hasSavedPassword = false;
   if (existing) {
     try {
@@ -82,6 +87,11 @@ export async function openEditor(platform: Platform, existing: Connection | null
   host.input.placeholder = "192.168.1.20";
   const port = textField("Port", String(start.port), { narrow: true });
   const username = textField("Username", start.username);
+  if (template && !existing) {
+    // Everything but the account is filled in already.
+    name.input.removeAttribute("data-autofocus");
+    username.input.setAttribute("data-autofocus", "");
+  }
   const domain = textField("Domain (optional)", start.domain, {
     hint: "Only for work PCs joined to a domain. Leave empty otherwise.",
   });

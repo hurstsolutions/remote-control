@@ -7,6 +7,7 @@ import { copyLogButton, showLogFileButton } from "../logs";
 import type { Platform } from "../platform";
 import { hostLabel, protocolLabel, type ConnectionStore } from "../state";
 import { PASSWORD_CLEARED_NOTE, openEditor } from "./editor";
+import { FindView } from "./find";
 
 export interface HomeHost {
   platform: Platform;
@@ -17,7 +18,10 @@ export interface HomeHost {
 }
 
 export class HomeView {
+  /** Holds the connection list and, once opened, "Find computers". */
   readonly element: HTMLElement;
+  private readonly listPage: HTMLElement;
+  private find: FindView | null = null;
   private readonly list: HTMLElement;
   private readonly problem: HTMLElement;
   private readonly info: HTMLElement;
@@ -30,14 +34,19 @@ export class HomeView {
     this.info = h("p", { class: "notice notice-warn", attrs: { role: "status", id: "home-info" } });
     this.info.hidden = true;
     this.version = h("span", { class: "muted selectable", text: "RemoteControl" });
-    this.element = h(
+    this.listPage = h(
       "section",
       { class: "home" },
       h(
         "header",
         { class: "home-header" },
         h("h1", { text: "Connections" }),
-        button("Add connection", () => void this.edit(null), { kind: "primary" }),
+        h(
+          "div",
+          { class: "row-actions" },
+          button("Find computers", () => this.showFind(true), { title: "Scan your subnets for Windows PCs and Macs" }),
+          button("Add connection", () => void this.edit(null), { kind: "primary" }),
+        ),
       ),
       h("div", { class: "home-body" }, this.problem, this.info, this.list),
       h(
@@ -49,6 +58,7 @@ export class HomeView {
         showLogFileButton(host.platform),
       ),
     );
+    this.element = h("div", { class: "home-stack" }, this.listPage);
     host.store.subscribe(() => this.render());
     this.render();
     host.platform.api.appInfo().then(
@@ -58,6 +68,15 @@ export class HomeView {
       },
       (error: unknown) => console.error("app_info failed", error),
     );
+  }
+
+  private showFind(on: boolean): void {
+    if (on && !this.find) {
+      this.find = new FindView({ platform: this.host.platform, store: this.host.store, back: () => this.showFind(false) });
+      this.element.append(this.find.element);
+    }
+    if (this.find) this.find.element.hidden = !on;
+    this.listPage.hidden = on;
   }
 
   private showProblem(message: string | null): void {
@@ -79,7 +98,12 @@ export class HomeView {
           h("p", {
             text: "Add a Windows PC to control it with Remote Desktop, or a Mac to control it with Screen Sharing. You need its name or IP address and the username you sign in with there.",
           }),
-          button("Add connection", () => void this.edit(null), { kind: "primary" }),
+          h(
+            "div",
+            { class: "row-actions" },
+            button("Add connection", () => void this.edit(null), { kind: "primary" }),
+            button("Find computers", () => this.showFind(true)),
+          ),
         ),
       );
       return;

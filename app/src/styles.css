@@ -852,3 +852,151 @@ body.fullscreen .session-top:focus-within {
   background: var(--warn-bg);
   color: var(--warn-text);
 }
+
+/* ---- find computers ---- */
+
+.home-stack {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.find-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.find-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.find-body > * {
+  flex: none;
+}
+
+.subnet-row input[type="checkbox"] {
+  margin: 0;
+  flex: none;
+}
+
+.subnet-label {
+  font-weight: 400;
+  color: var(--muted);
+}
+
+.scan-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.scan-progress {
+  width: 160px;
+}
+
+.results-filter {
+  max-width: 340px;
+}
+
+.results {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+
+.results th,
+.results td {
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+
+.results th {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  background: var(--surface-2);
+}
+
+.results tbody tr:hover {
+  background: var(--surface-2);
+}
+
+.results-ip {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.results-name {
+  max-width: 280px;
+}
+
+.results-actions {
+  white-space: nowrap;
+  text-align: right;
+}
+
+.results-actions .btn + .btn {
+  margin-left: 6px;
+}
+
+.sort-button {
+  all: unset;
+  cursor: pointer;
+  font: inherit;
+}
+
+.sort-button:focus-visible {
+  outline: 2px solid var(--accent);
+}
+
+.sort-button[data-sort="asc"]::after {
+  content: " \25B2";
+  font-size: 9px;
+}
+
+.sort-button[data-sort="desc"]::after {
+  content: " \25BC";
+  font-size: 9px;
+}
+
+.service-tag,
+.kind-tag,
+.saved-tag {
+  display: inline-block;
+  font-size: 11px;
+  padding: 1px 6px;
+  margin: 1px 4px 1px 0;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  white-space: nowrap;
+}
+
+.kind-tag {
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.saved-tag {
+  background: var(--surface-2);
+}
+
+.results-note {
+  margin: 0;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
