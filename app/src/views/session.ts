@@ -458,7 +458,7 @@ export class SessionView {
     const confirmed = await confirmDialog({
       title: "Connect without SSH?",
       message:
-        "Your password is still protected by Apple's sign-in, but the screen and everything you type will travel over the network unencrypted. Only do this on a network you trust. This connection will stay set to connect without SSH; you can turn the SSH tunnel back on in its settings.",
+        "Without SSH, the screen and everything you type travel over the network unencrypted, and someone who can intercept the connection could capture your Mac password. Only do this on a network you fully trust. This connection will stay set to connect without SSH; you can turn the SSH tunnel back on in its settings.",
       confirmLabel: "Connect without SSH",
     });
     if (!confirmed || attempt !== this.attempt || this.destroyed) return;

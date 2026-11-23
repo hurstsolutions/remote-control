@@ -106,7 +106,7 @@ const connections: Connection[] = [
     id: NEW_KEY_ID,
     name: "Mac with a new SSH key (sample)",
     protocol: "vnc",
-    host: "10.50.0.42",
+    host: "10.0.0.43",
     port: 5900,
     username: "sam",
     domain: "",

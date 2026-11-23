@@ -46,7 +46,7 @@ export function describeError(error: SessionError, target: Target): ErrorText {
         hints: [
           "This app sends Screen Sharing through an encrypted SSH connection to the Mac (Remote Login), and the Mac refused or did not answer it. That usually means Remote Login is turned off.",
           "To keep the whole session encrypted: on the Mac, turn on Remote Login (System Settings > General > Sharing > Remote Login), then click Reconnect.",
-          "Or click Connect without SSH to use Screen Sharing directly. Your password is still protected by Apple's sign-in, but the screen and what you type travel unencrypted on the network.",
+          "Or click Connect without SSH to use Screen Sharing directly. That isn't encrypted: anyone on the network can see the screen and what you type, and someone intercepting the connection could capture your Mac password.",
           "If Remote Login is already on, check that the Mac is awake and on the same network.",
         ],
       };

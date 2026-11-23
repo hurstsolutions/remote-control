@@ -183,7 +183,7 @@ export async function openEditor(platform: Platform, existing: Connection | null
     tunnelNote.classList.toggle("notice-warn", !tunnel.input.checked);
     tunnelNote.textContent = tunnel.input.checked
       ? "On the Mac, turn on both Screen Sharing and Remote Login (System Settings > General > Sharing). The screen and your password travel inside the encrypted SSH connection."
-      : "This session isn't encrypted. Your password is still protected by Apple's sign-in, but the screen and everything you type travel over the network unencrypted: only do this on a network you trust. On the Mac, turn on Screen Sharing (System Settings > General > Sharing).";
+      : "This session isn't encrypted. Anyone on the network can see the screen and everything you type, and someone who can intercept the connection can also capture your Mac password. Only do this on a network you fully trust. On the Mac, turn on Screen Sharing (System Settings > General > Sharing).";
   };
   type.addEventListener("change", () => {
     if (!portEdited) port.input.value = String(DEFAULT_PORT[protocol()]);
