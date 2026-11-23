@@ -27,6 +27,11 @@ export interface Connection {
 
 export type ErrorKind =
   | "unreachable"
+  /**
+   * VNC through SSH only: the Mac's SSH port refused or did not answer (Remote Login is off).
+   * Never used for a refused sign-in or a changed host key.
+   */
+  | "tunnel_unavailable"
   | "auth_failed"
   | "unsupported"
   | "security"

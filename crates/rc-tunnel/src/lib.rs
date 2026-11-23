@@ -5,6 +5,7 @@
 //! `direct-tcpip` channel to the Screen Sharing port on the Mac itself. The SSH host key is pinned
 //! on first use, exactly like the RDP certificate.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,6 +13,7 @@ use rc_types::{ErrorKind, SessionError};
 use russh::client::{self, AuthResult, KeyboardInteractiveAuthResponse};
 use russh::keys::ssh_key::{HashAlg, PublicKey};
 use russh::{ChannelStream, Disconnect, MethodKind};
+use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
 #[derive(Clone)]
@@ -77,7 +79,6 @@ pub async fn open(config: TunnelConfig) -> Result<Tunnel, SessionError> {
     let ssh_config = Arc::new(client::Config {
         inactivity_timeout: None,
         keepalive_interval: Some(Duration::from_secs(30)),
-        nodelay: true,
         ..Default::default()
     });
     let seen = Arc::new(std::sync::Mutex::new(None));
@@ -87,7 +88,8 @@ pub async fn open(config: TunnelConfig) -> Result<Tunnel, SessionError> {
     };
 
     info!(host = %config.ssh_host, port = config.ssh_port, "opening SSH tunnel");
-    let connect = client::connect(ssh_config, (config.ssh_host.as_str(), config.ssh_port), handler);
+    let socket = connect_tcp(&config.ssh_host, config.ssh_port).await?;
+    let connect = client::connect_stream(ssh_config, socket, handler);
     let result = tokio::time::timeout(Duration::from_secs(10), connect).await;
     let host_key = seen.lock().ok().and_then(|s| s.clone());
 
@@ -96,7 +98,7 @@ pub async fn open(config: TunnelConfig) -> Result<Tunnel, SessionError> {
             return Err(SessionError::new(
                 ErrorKind::Unreachable,
                 format!(
-                    "no answer from SSH (Remote Login) at {}:{} after 10 s",
+                    "SSH (Remote Login) at {}:{} accepted the connection but did not answer within 10 s",
                     config.ssh_host, config.ssh_port
                 ),
             ))
@@ -153,6 +155,46 @@ pub async fn open(config: TunnelConfig) -> Result<Tunnel, SessionError> {
         host_key_sha256,
         guard: TunnelGuard { handle },
     })
+}
+
+/// Open the TCP connection to the SSH port. A name that does not resolve is
+/// [`ErrorKind::Unreachable`]; a resolved address whose SSH port refuses or does not answer is
+/// [`ErrorKind::TunnelUnavailable`], which on a Mac almost always means Remote Login is off.
+async fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, SessionError> {
+    let addrs: Vec<SocketAddr> = match tokio::net::lookup_host((host, port)).await {
+        Ok(addrs) => addrs.collect(),
+        Err(error) => {
+            return Err(SessionError::new(
+                ErrorKind::Unreachable,
+                format!("cannot resolve {host}: {error}"),
+            ))
+        }
+    };
+    if addrs.is_empty() {
+        return Err(SessionError::new(
+            ErrorKind::Unreachable,
+            format!("{host} did not resolve to any address"),
+        ));
+    }
+    let socket = match tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(addrs.as_slice())).await {
+        Ok(Ok(socket)) => socket,
+        Ok(Err(error)) => {
+            return Err(SessionError::new(
+                ErrorKind::TunnelUnavailable,
+                format!("SSH (Remote Login) connection to {host}:{port} failed: {error}"),
+            ))
+        }
+        Err(_) => {
+            return Err(SessionError::new(
+                ErrorKind::TunnelUnavailable,
+                format!("no answer from SSH (Remote Login) at {host}:{port} after 10 s"),
+            ))
+        }
+    };
+    if let Err(error) = socket.set_nodelay(true) {
+        debug!(%error, "set_nodelay failed");
+    }
+    Ok(socket)
 }
 
 async fn authenticate(handle: &mut client::Handle<Handler>, config: &TunnelConfig) -> Result<(), SessionError> {

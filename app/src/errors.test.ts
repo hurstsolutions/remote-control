@@ -17,6 +17,16 @@ describe("describeError", () => {
     expect(direct.hints.join(" ")).not.toContain("Remote Login");
   });
 
+  it("says Remote Login is off when the SSH tunnel cannot be opened, and offers both ways on", () => {
+    const text = describeError({ kind: "tunnel_unavailable", detail: "os error 10061" }, mac);
+    expect(text.headline).toBe("Remote Login is off on studio-mac");
+    const hints = text.hints.join(" ");
+    expect(hints).toContain("System Settings > General > Sharing > Remote Login");
+    expect(hints).toContain("Reconnect");
+    expect(hints).toContain("Connect without SSH");
+    expect(hints).toContain("unencrypted");
+  });
+
   it("explains a refused sign-in", () => {
     expect(describeError({ kind: "auth_failed", detail: "" }, windows).headline).toBe("Wrong username or password");
   });
@@ -29,6 +39,7 @@ describe("describeError", () => {
   it("has a headline and at least one hint for every kind", () => {
     const kinds: ErrorKind[] = [
       "unreachable",
+      "tunnel_unavailable",
       "auth_failed",
       "unsupported",
       "security",
@@ -58,6 +69,10 @@ describe("describeError", () => {
 
 describe("toSessionError", () => {
   it("passes a SessionError through", () => {
+    expect(toSessionError({ kind: "tunnel_unavailable", detail: "refused" })).toEqual({
+      kind: "tunnel_unavailable",
+      detail: "refused",
+    });
     expect(toSessionError({ kind: "password_required", detail: "none saved" })).toEqual({
       kind: "password_required",
       detail: "none saved",

@@ -52,6 +52,10 @@ pub struct SessionError {
 pub enum ErrorKind {
     /// DNS failure, connection refused, timeout: the machine or port is not reachable.
     Unreachable,
+    /// The SSH tunnel could not be opened because the SSH port refused the connection or did not
+    /// answer (on a Mac: Remote Login is off). Not used for sign-in or host key failures. The UI
+    /// offers to connect without the tunnel.
+    TunnelUnavailable,
     /// Wrong username/password, or account not allowed to log in remotely.
     AuthFailed,
     /// The server offered no security/auth method this client supports.

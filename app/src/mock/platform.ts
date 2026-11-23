@@ -13,6 +13,8 @@ import type {
 import type { Api, Platform } from "../platform";
 
 const FAILING_ID = "mock-fails";
+/** A Mac with Screen Sharing on but Remote Login off: fails with tunnel_unavailable until the tunnel is off. */
+const NO_SSH_ID = "mock-mac-no-ssh";
 const FAILURES: ErrorKind[] = ["unreachable", "auth_failed", "security", "unsupported", "protocol", "disconnected", "other"];
 const HEADER = 8;
 
@@ -56,9 +58,22 @@ const connections: Connection[] = [
     ssh_port: 22,
     pinned_identity: null,
   },
+  {
+    id: NO_SSH_ID,
+    name: "Mac with Remote Login off (sample)",
+    protocol: "vnc",
+    host: "10.0.0.42",
+    port: 5900,
+    username: "sam",
+    domain: "",
+    nla: true,
+    ssh_tunnel: true,
+    ssh_port: 22,
+    pinned_identity: null,
+  },
 ];
-// The Mac sample and the failing sample have a "saved" password; the Windows sample asks.
-const savedPasswords = new Set<string>(["mock-mac", FAILING_ID]);
+// The Mac samples and the failing sample have a "saved" password; the Windows sample asks.
+const savedPasswords = new Set<string>(["mock-mac", NO_SSH_ID, FAILING_ID]);
 const sessions = new Map<string, MockSession>();
 const log: string[] = [];
 let nextId = 1;
@@ -298,6 +313,7 @@ function crosshairCursor(): SessionEvent {
 function mockError(kind: ErrorKind, host: string): SessionError {
   const details: Record<ErrorKind, string> = {
     unreachable: `tcp connect to ${host}:3389 failed: connection timed out (os error 60)`,
+    tunnel_unavailable: `SSH (Remote Login) connection to ${host}:22 failed: No connection could be made because the target machine actively refused it. (os error 10061)`,
     auth_failed: "CredSSP: the server rejected the credentials (STATUS_LOGON_FAILURE 0xC000006D)",
     security: `server identity changed for ${host}\n  pinned:    sha256:3f3f3f3f3f3f3f3f...\n  presented: sha256:a91c04be77d20e15...`,
     unsupported: "server requires a security protocol this client does not offer (HYBRID_EX)",
@@ -347,6 +363,8 @@ const mockApi: Api = {
     if (args.id === FAILING_ID && !args.trust_new_identity) {
       failure = FAILURES[failureIndex % FAILURES.length] ?? "other";
       failureIndex++;
+    } else if (args.id === NO_SSH_ID && connection.ssh_tunnel) {
+      failure = "tunnel_unavailable";
     } else if (args.password === "wrong") {
       failure = "auth_failed";
     }

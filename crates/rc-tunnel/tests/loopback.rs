@@ -141,8 +141,32 @@ async fn closed_target_port_is_reported() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn no_ssh_server_is_unreachable() {
+async fn refused_ssh_port_is_tunnel_unavailable() {
+    // Remote Login off: nothing listens on the SSH port, so the connection is refused.
     let dead = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().port();
     let error = open(config(dead, 5900, PASS)).await.err().expect("must fail");
+    assert_eq!(error.kind, ErrorKind::TunnelUnavailable, "{}", error.detail);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ssh_port_that_hangs_up_is_not_tunnel_unavailable() {
+    // Something accepts on the port but drops the connection before speaking SSH: the port is
+    // open, so this is not "Remote Login is off".
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            drop(socket);
+        }
+    });
+    let error = open(config(port, 5900, PASS)).await.err().expect("must fail");
+    assert_ne!(error.kind, ErrorKind::TunnelUnavailable, "{}", error.detail);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unknown_host_name_is_unreachable() {
+    let mut cfg = config(22, 5900, PASS);
+    cfg.ssh_host = "no-such-host.invalid".to_owned();
+    let error = open(cfg).await.err().expect("must fail");
     assert_eq!(error.kind, ErrorKind::Unreachable, "{}", error.detail);
 }

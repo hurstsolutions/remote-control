@@ -48,6 +48,7 @@ impl UiError {
 fn kind_name(kind: ErrorKind) -> &'static str {
     match kind {
         ErrorKind::Unreachable => "unreachable",
+        ErrorKind::TunnelUnavailable => "tunnel_unavailable",
         ErrorKind::AuthFailed => "auth_failed",
         ErrorKind::Unsupported => "unsupported",
         ErrorKind::Security => "security",
@@ -502,6 +503,27 @@ mod tests {
         assert_eq!(json["kind"], "bitmap");
         assert_eq!(json["rgba_base64"], "/wAA/w==");
         assert!(to_json(SessionEvent::Bell).is_some());
+    }
+
+    #[test]
+    fn error_kinds_use_the_ui_names() {
+        // Every kind the UI knows (app/src/ipc.ts ErrorKind, minus the UI-only "password_required").
+        let kinds = [
+            (ErrorKind::Unreachable, "unreachable"),
+            (ErrorKind::TunnelUnavailable, "tunnel_unavailable"),
+            (ErrorKind::AuthFailed, "auth_failed"),
+            (ErrorKind::Unsupported, "unsupported"),
+            (ErrorKind::Security, "security"),
+            (ErrorKind::Protocol, "protocol"),
+            (ErrorKind::Disconnected, "disconnected"),
+            (ErrorKind::Other, "other"),
+        ];
+        for (kind, name) in kinds {
+            assert_eq!(kind_name(kind), name);
+            assert_eq!(serde_json::to_value(kind).unwrap(), serde_json::json!(name));
+            let json = serde_json::to_value(UiError::from(&SessionError::new(kind, "d"))).unwrap();
+            assert_eq!(json, serde_json::json!({ "kind": name, "detail": "d" }));
+        }
     }
 
     #[test]

@@ -1,7 +1,7 @@
 // One session tab: the connect flow, the toolbar, the remote screen and the failure panels.
-import { isDialogOpen } from "../dialog";
+import { confirmDialog, isDialogOpen } from "../dialog";
 import { button, h } from "../dom";
-import { describeError, toSessionError } from "../errors";
+import { describeError, messageOf, toSessionError } from "../errors";
 import type { ChannelMessage, Connection, SessionError, SessionEvent, SessionInput } from "../ipc";
 import { copyLogButton } from "../logs";
 import { isMac, type Platform } from "../platform";
@@ -9,7 +9,7 @@ import { ClipboardSync } from "../remote/clipboard";
 import { remoteSizeForViewport, type DisplayMode } from "../remote/geometry";
 import { InputController } from "../remote/input";
 import { RemoteScreen } from "../remote/screen";
-import { hostLabel, type ConnectionStore } from "../state";
+import { hostLabel, pinnedIdentityAfterEdit, type ConnectionStore } from "../state";
 import { askPassword } from "./password";
 
 export interface SessionHost {
@@ -246,7 +246,10 @@ export class SessionView {
         headline: "A password is needed",
         hints: [`Enter the password for ${this.connection.username || "this account"} to connect.`],
         detail: null,
-        buttons: [button("Enter password", () => void this.promptPassword(trust, note, false), { kind: "primary" })],
+        buttons: [
+          button("Enter password", () => void this.promptPassword(trust, note, false), { kind: "primary" }),
+          this.okButton("default"),
+        ],
       });
     }
     const answer = await askPassword(this.connection, note);
@@ -339,6 +342,40 @@ export class SessionView {
     void this.start({ password: null, save: false, trust: false });
   }
 
+  /**
+   * The Mac's Remote Login is off: after the user accepts the trade-off, turn the SSH tunnel off
+   * for this connection and connect again in this tab.
+   */
+  private async connectWithoutSsh(): Promise<void> {
+    const attempt = this.attempt;
+    const confirmed = await confirmDialog({
+      title: "Connect without SSH?",
+      message:
+        "Your password is still protected by Apple's sign-in, but the screen and everything you type will travel over the network unencrypted. Only do this on a network you trust. This connection will stay set to connect without SSH; you can turn the SSH tunnel back on in its settings.",
+      confirmLabel: "Connect without SSH",
+    });
+    if (!confirmed || attempt !== this.attempt || this.destroyed) return;
+    const current = this.host.store.get(this.connection.id) ?? this.connection;
+    const draft = { ...current, ssh_tunnel: false };
+    draft.pinned_identity = pinnedIdentityAfterEdit(current, draft);
+    try {
+      await this.host.platform.api.saveConnection(draft);
+      await this.host.store.reload();
+    } catch (error) {
+      if (attempt !== this.attempt || this.destroyed) return;
+      this.showPanel({
+        headline: "Couldn't change the connection",
+        hints: ["The connection could not be switched to connect without SSH. Try again, or change it in the connection settings."],
+        detail: messageOf(error),
+        buttons: [this.okButton("primary"), button("Reconnect", () => this.reconnect())],
+        error: true,
+      });
+      return;
+    }
+    if (attempt !== this.attempt || this.destroyed) return;
+    this.reconnect();
+  }
+
   // ---- input ------------------------------------------------------------------------------
 
   private send(input: SessionInput): void {
@@ -409,39 +446,55 @@ export class SessionView {
     );
   }
 
+  /** Closes the tab, the same as the tab's close button. */
+  private okButton(kind: "primary" | "default"): HTMLButtonElement {
+    return button("OK", () => this.host.close(this), { kind, title: "Close this tab" });
+  }
+
   private showDisconnected(): void {
     this.showPanel({
       headline: "Disconnected",
       hints: [],
       detail: null,
-      buttons: [button("Reconnect", () => this.reconnect(), { kind: "primary" })],
+      buttons: [this.okButton("primary"), button("Reconnect", () => this.reconnect())],
     });
   }
 
   private showError(error: SessionError): void {
     const text = describeError(error, this.connection);
     const copyLog = copyLogButton(this.host.platform);
-    const reconnect = (kind: "primary" | "default") => button("Reconnect", () => this.reconnect(), { kind });
+    const reconnect = button("Reconnect", () => this.reconnect());
+    const ok = this.okButton("primary");
     let buttons: HTMLButtonElement[];
     if (error.kind === "auth_failed") {
       const note = AUTH_NOTE;
       // Retry with a typed password: the saved one is not used.
       buttons = [
-        button("Enter password", () => void this.promptPassword(false, note, false), { kind: "primary" }),
-        reconnect("default"),
+        ok,
+        button("Enter password", () => void this.promptPassword(false, note, false)),
+        reconnect,
         copyLog,
       ];
     } else if (error.kind === "security") {
       buttons = [
-        button("Cancel", () => this.host.close(this)),
+        ok,
         button("Trust new identity and connect", () => void this.start({ password: null, save: false, trust: true }), {
           kind: "danger",
         }),
-        reconnect("default"),
+        reconnect,
+        copyLog,
+      ];
+    } else if (error.kind === "tunnel_unavailable" && this.connection.protocol === "vnc" && this.connection.ssh_tunnel) {
+      buttons = [
+        ok,
+        reconnect,
+        button("Connect without SSH", () => void this.connectWithoutSsh(), {
+          title: "Use Screen Sharing directly, without the encrypted SSH tunnel",
+        }),
         copyLog,
       ];
     } else {
-      buttons = [reconnect("primary"), copyLog];
+      buttons = [ok, reconnect, copyLog];
     }
     this.showPanel({ headline: text.headline, hints: text.hints, detail: error.detail, buttons, error: true });
     // Re-prompt straight away after a refused sign-in; cancelling returns to this panel.
