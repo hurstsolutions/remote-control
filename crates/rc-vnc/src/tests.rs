@@ -16,7 +16,7 @@ fn config(user: Option<&str>, pass: Option<&str>) -> VncConfig {
 fn start(cfg: VncConfig) -> (DuplexStream, SessionHandle, tokio::task::JoinHandle<()>) {
     let (client, server) = tokio::io::duplex(1 << 20);
     let (io, handle) = session_channels();
-    let task = tokio::spawn(run_with_encodings(client, cfg, io, session::default_encodings()));
+    let task = tokio::spawn(run_with_encodings(client, cfg, crate::VncOptions::default(), io, session::default_encodings()));
     (server, handle, task)
 }
 

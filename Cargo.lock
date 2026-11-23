@@ -5419,6 +5419,7 @@ dependencies = [
  "png 0.17.16",
  "rc-types",
  "serde",
+ "sha1 0.11.0",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

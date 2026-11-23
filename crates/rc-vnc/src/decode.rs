@@ -446,12 +446,15 @@ fn tight_rows<S: ByteSrc>(
 fn tight_jpeg(data: &[u8], fb: &mut Framebuffer, x: usize, y: usize, w: usize, h: usize) -> Result<()> {
     use jpeg_decoder::PixelFormat;
     let mut dec = jpeg_decoder::Decoder::new(data);
-    let pixels = dec.decode().map_err(|e| VncError::Protocol(format!("Tight: JPEG decode failed: {e}")))?;
+    // Check the header before decoding anything: a tiny JPEG can claim a huge image.
+    dec.read_info().map_err(|e| VncError::Protocol(format!("Tight: JPEG header unreadable: {e}")))?;
     let info = dec.info().ok_or_else(|| VncError::Protocol("Tight: JPEG has no header".into()))?;
     let (jw, jh) = (info.width as usize, info.height as usize);
     if jw != w || jh != h {
         return proto(format!("Tight: JPEG is {jw}x{jh} but the rectangle is {w}x{h}"));
     }
+    dec.set_max_decoding_buffer_size((w * h * 3).max(1));
+    let pixels = dec.decode().map_err(|e| VncError::Protocol(format!("Tight: JPEG decode failed: {e}")))?;
     match info.pixel_format {
         PixelFormat::RGB24 if pixels.len() == w * h * 3 => {
             for (row, line) in pixels.chunks_exact(w * 3).enumerate() {
@@ -953,6 +956,25 @@ mod tests {
         assert!(near(fb.pixel(2, 2), [220, 30, 30]), "{:?}", fb.pixel(2, 2));
         assert!(near(fb.pixel(29, 13), [30, 30, 220]), "{:?}", fb.pixel(29, 13));
         assert_eq!(fb.pixel(0, 0)[3], 255);
+    }
+
+    #[tokio::test]
+    async fn tight_jpeg_claiming_a_huge_image_is_refused_before_decoding() {
+        // A valid 8x8 JPEG whose frame header is patched to claim 65000x65000.
+        let mut jpeg = Vec::new();
+        jpeg_encoder::Encoder::new(&mut jpeg, 50).encode(&[128u8; 8 * 8 * 3], 8, 8, jpeg_encoder::ColorType::Rgb).unwrap();
+        let i = jpeg.windows(2).position(|p| p == [0xFF, 0xC0]).expect("SOF0");
+        jpeg[i + 5..i + 7].copy_from_slice(&65000u16.to_be_bytes());
+        jpeg[i + 7..i + 9].copy_from_slice(&65000u16.to_be_bytes());
+        let mut data = vec![0x90];
+        data.extend(compact(jpeg.len()));
+        data.extend_from_slice(&jpeg);
+        let mut fb = Framebuffer::new(4, 4);
+        let mut r: &[u8] = &data;
+        match Decoder::new().decode(&mut r, &mut fb, (0, 0, 1, 1), ENC_TIGHT).await {
+            Err(VncError::Protocol(m)) => assert!(m.contains("65000x65000"), "{m}"),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[tokio::test]

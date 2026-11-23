@@ -2,7 +2,13 @@
 //! framebuffer (seen from some servers around a resize) is consumed from the wire but never
 //! writes out of bounds.
 
+use crate::error::{Result, VncError};
+
 pub(crate) type Rgba = [u8; 4];
+
+/// Largest desktop side we accept. 16384 x 16384 RGBA is already 1 GiB; anything larger from a
+/// server is treated as a protocol error rather than an allocation that aborts the process.
+pub(crate) const MAX_SIDE: usize = 16384;
 
 pub(crate) struct Framebuffer {
     w: usize,
@@ -11,22 +17,41 @@ pub(crate) struct Framebuffer {
 }
 
 impl Framebuffer {
-    pub fn new(w: usize, h: usize) -> Self {
+    /// A framebuffer of the server's size, or a protocol error for an implausible size (or one
+    /// the machine cannot allocate).
+    pub fn try_new(w: usize, h: usize) -> Result<Self> {
         let mut fb = Framebuffer { w: 0, h: 0, data: Vec::new() };
-        fb.resize(w, h);
-        fb
+        fb.resize(w, h)?;
+        Ok(fb)
     }
 
-    /// Reallocate to the new size; contents become opaque black.
-    pub fn resize(&mut self, w: usize, h: usize) {
-        self.w = w;
-        self.h = h;
-        self.data.clear();
-        self.data.shrink_to_fit();
-        self.data.resize(w * h * 4, 0);
+    #[cfg(test)]
+    pub fn new(w: usize, h: usize) -> Self {
+        Self::try_new(w, h).expect("test framebuffer")
+    }
+
+    /// Reallocate to the new size; contents become opaque black. On error the framebuffer is
+    /// left empty (0 x 0).
+    pub fn resize(&mut self, w: usize, h: usize) -> Result<()> {
+        self.w = 0;
+        self.h = 0;
+        self.data = Vec::new();
+        if w > MAX_SIDE || h > MAX_SIDE {
+            return Err(VncError::Protocol(format!(
+                "the server announced an implausible desktop size {w}x{h} (largest accepted: {MAX_SIDE}x{MAX_SIDE})"
+            )));
+        }
+        let bytes = w * h * 4;
+        self.data.try_reserve_exact(bytes).map_err(|_| {
+            VncError::Other(format!("not enough memory for a {w}x{h} desktop ({} MiB)", bytes >> 20))
+        })?;
+        self.data.resize(bytes, 0);
         for px in self.data.chunks_exact_mut(4) {
             px[3] = 255;
         }
+        self.w = w;
+        self.h = h;
+        Ok(())
     }
 
     pub fn width(&self) -> usize {
@@ -168,5 +193,20 @@ mod tests {
         assert_eq!((0..4).map(|y| fb.pixel(1, y)[0]).collect::<Vec<_>>(), vec![0, 1, 2, 2]);
         assert!(!fb.copy_rect(0, 0, 1, 0, 2, 1));
         assert_eq!(fb.extract(0, 1, 2, 1), vec![1, 0, 0, 255, 1, 0, 0, 255]);
+    }
+
+    #[test]
+    fn huge_sizes_are_refused_not_allocated() {
+        for (w, h) in [(65535, 65535), (MAX_SIDE + 1, 1), (1, MAX_SIDE + 1)] {
+            match Framebuffer::try_new(w, h) {
+                Err(VncError::Protocol(m)) => assert!(m.contains("implausible desktop size"), "{m}"),
+                other => panic!("{w}x{h}: {:?}", other.map(|f| f.width())),
+            }
+        }
+        let mut fb = Framebuffer::new(4, 4);
+        assert!(fb.resize(65535, 65535).is_err());
+        assert_eq!((fb.width(), fb.height()), (0, 0));
+        fb.put_bgrx_row(0, 0, &[1, 2, 3, 4]); // still safe to draw into
+        assert!(fb.resize(MAX_SIDE, 2).is_ok());
     }
 }

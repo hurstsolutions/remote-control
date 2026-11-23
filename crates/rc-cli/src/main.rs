@@ -72,15 +72,29 @@ enum Command {
         /// Screen Sharing port on the Mac.
         #[arg(long, default_value_t = 5900)]
         port: u16,
-        /// Connect straight to the VNC port, unencrypted (for non-Mac VNC servers on a trusted LAN).
+        /// Connect straight to the VNC port without an SSH tunnel. Encryption then comes from Apple
+        /// Screen Sharing itself (see --encryption).
         #[arg(long)]
         no_ssh: bool,
+        /// VNC-level encryption: required, preferred or off. Default: required with --no-ssh
+        /// (use off for non-Mac VNC servers on a trusted LAN), off through the SSH tunnel.
+        #[arg(long, value_parser = parse_encryption)]
+        encryption: Option<rc_vnc::EncryptionPolicy>,
         #[arg(long, default_value_t = 22)]
         ssh_port: u16,
         /// Expected SSH host key SHA-256 (hex).
         #[arg(long)]
         pin: Option<String>,
     },
+}
+
+fn parse_encryption(s: &str) -> Result<rc_vnc::EncryptionPolicy, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "required" => Ok(rc_vnc::EncryptionPolicy::Required),
+        "preferred" => Ok(rc_vnc::EncryptionPolicy::Preferred),
+        "off" => Ok(rc_vnc::EncryptionPolicy::Off),
+        _ => Err("expected required, preferred or off".into()),
+    }
 }
 
 fn parse_size(s: &str) -> Result<(u16, u16), String> {
@@ -122,16 +136,21 @@ async fn main() -> anyhow::Result<()> {
             rc_rdp::spawn(config, io)?;
             common
         }
-        Command::Vnc { common, port, no_ssh, ssh_port, pin } => {
+        Command::Vnc { common, port, no_ssh, ssh_port, pin, encryption } => {
             let config = rc_vnc::VncConfig {
                 username: Some(common.user.clone()).filter(|u| !u.is_empty()),
                 password: Some(common.password.clone()).filter(|p| !p.is_empty()),
                 shared: true,
                 view_only: false,
             };
+            let default_policy =
+                if no_ssh { rc_vnc::EncryptionPolicy::Required } else { rc_vnc::EncryptionPolicy::Off };
+            let options = rc_vnc::VncOptions::default().with_encryption(encryption.unwrap_or(default_policy));
             if no_ssh {
                 let host = common.host.clone();
-                tokio::spawn(async move { rc_vnc::connect_and_run(&host, port, config, io).await });
+                tokio::spawn(
+                    async move { rc_vnc::connect_and_run_with_options(&host, port, config, options, io).await },
+                );
             } else {
                 let tunnel = rc_tunnel::open(rc_tunnel::TunnelConfig {
                     ssh_host: common.host.clone(),
@@ -148,7 +167,7 @@ async fn main() -> anyhow::Result<()> {
                         println!("ssh host key sha256: {}", tunnel.host_key_sha256);
                         tokio::spawn(async move {
                             let guard = tunnel.guard;
-                            rc_vnc::run(tunnel.stream, config, io).await;
+                            rc_vnc::run_with_options(tunnel.stream, config, options, io).await;
                             guard.close().await;
                         });
                     }

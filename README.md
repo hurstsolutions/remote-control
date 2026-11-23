@@ -27,3 +27,10 @@ RC_PASSWORD='...' ./target/debug/rc rdp HOST -u USER --screenshot shot.png
 
 Actions > Release > Run workflow builds installable apps (macOS universal `.dmg` by default) and
 publishes them as a pre-release. Builds are unsigned.
+
+## Third-party code
+
+- `crates/rc-vnc/src/record.rs` (Apple Screen Sharing's encrypted record layer) adapts code from
+  [remotex](https://github.com/andrewtheguy/remotex) (`src/vnc_record.rs`), MIT License,
+  Copyright (c) 2026 Andrew Chen. The full notice is in that file. The Apple ViewerInfo bytes in
+  `crates/rc-vnc/src/apple.rs` follow remotex's measurements.
