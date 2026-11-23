@@ -1,17 +1,21 @@
 //! The running session: a reader that decodes server messages into the local framebuffer and
 //! emits events, and a writer that turns front-end input into client messages.
 
+use crate::apple;
 use crate::decode::{self, encoding_name, Decoder};
 use crate::error::{proto, Result, VncError};
 use crate::fb::Framebuffer;
 use crate::input::{self, lock, InputState, Screen, Shared, SharedRef};
 use crate::proto as hs;
-use crate::VncConfig;
+use crate::record::RecordStream;
+use crate::{VncConfig, VncOptions};
 use rc_types::{CursorShape, SessionEvent, SessionInput};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
 
@@ -19,8 +23,49 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Largest Frame event, in pixels (2 MiB of RGBA). Bigger rectangles are sent as bands so a
 /// full 5K update never needs one giant allocation.
 const MAX_FRAME_PIXELS: usize = 512 * 1024;
-const MAX_CUT_TEXT: u32 = 64 * 1024 * 1024;
+/// Larger clipboard text from the server is dropped (read past, never buffered).
+const MAX_CUT_TEXT: u32 = 1024 * 1024;
 const MAX_CURSOR_SIDE: usize = 2048;
+/// Largest compressed Apple cursor image we accept.
+const MAX_CURSOR_IMAGE: u32 = 16 * 1024 * 1024;
+/// Apple cursor shapes kept for re-selection.
+const MAX_CURSOR_CACHE: usize = 256;
+
+/// The session's byte stream: the socket as is, or inside Apple's encrypted record layer.
+enum Transport<S> {
+    Plain(S),
+    Records(Box<RecordStream<S>>),
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Transport<S> {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Transport::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            Transport::Records(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Transport<S> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Transport::Plain(s) => Pin::new(s).poll_write(cx, buf),
+            Transport::Records(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
+        }
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Transport::Plain(s) => Pin::new(s).poll_flush(cx),
+            Transport::Records(s) => Pin::new(s.as_mut()).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Transport::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            Transport::Records(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
+        }
+    }
+}
 
 /// Encodings advertised by default, in preference order.
 pub(crate) fn default_encodings() -> Vec<i32> {
@@ -116,6 +161,7 @@ async fn wait_for_close(input: &mut mpsc::UnboundedReceiver<SessionInput>) {
 pub(crate) async fn session<S>(
     mut stream: S,
     config: &VncConfig,
+    options: &VncOptions,
     events: &mpsc::Sender<SessionEvent>,
     input: &mut mpsc::UnboundedReceiver<SessionInput>,
     stage: &mut &'static str,
@@ -124,11 +170,18 @@ pub(crate) async fn session<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let init = {
-        let handshake = tokio::time::timeout(HANDSHAKE_TIMEOUT, hs::handshake(&mut stream, config, events, stage));
+    let done = {
+        let handshake =
+            tokio::time::timeout(HANDSHAKE_TIMEOUT, hs::handshake(&mut stream, config, options, events, stage));
         tokio::select! {
             r = handshake => match r {
                 Ok(r) => r?,
+                Err(_) if *stage == hs::STAGE_ENCRYPTION => {
+                    return Err(VncError::Security(format!(
+                        "the Mac did not send the encryption key within {} s of being asked for an encrypted session",
+                        HANDSHAKE_TIMEOUT.as_secs()
+                    )))
+                }
                 Err(_) => {
                     return proto(format!(
                         "the server stopped responding (no handshake progress within {} s)",
@@ -141,6 +194,23 @@ where
         }
     };
     *stage = hs::STAGE_SESSION;
+    let init = done.init;
+    let encrypted = done.keys.is_some();
+    let stream = match done.keys {
+        // The handshake read unbuffered, so the next byte on the socket starts the first record.
+        Some(keys) => Transport::Records(Box::new(RecordStream::new(stream, keys))),
+        None => Transport::Plain(stream),
+    };
+    let security = match (encrypted, done.server_verified) {
+        (false, _) => crate::VncSecurity::Unencrypted,
+        (true, false) => crate::VncSecurity::EncryptedUnverified,
+        (true, true) => crate::VncSecurity::EncryptedVerified,
+    };
+    info!(?security, "{}", security.status_text());
+    if !encrypted && options.encryption != crate::EncryptionPolicy::Off {
+        warn!(policy = ?options.encryption, "the session is not encrypted by VNC (the server or sign-in did not allow it)");
+    }
+    emit(events, SessionEvent::Status(security.status_text().into())).await?;
 
     let shared: SharedRef =
         Arc::new(Mutex::new(Shared { width: init.width, height: init.height, ..Default::default() }));
@@ -163,7 +233,7 @@ where
     let (out_tx, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let mut reader = Reader {
         rd: BufReader::with_capacity(64 * 1024, rd),
-        fb: Framebuffer::new(init.width as usize, init.height as usize),
+        fb: Framebuffer::try_new(init.width as usize, init.height as usize)?,
         dec: Decoder::new(),
         seen: HashSet::new(),
         shared: shared.clone(),
@@ -171,6 +241,8 @@ where
         out: out_tx,
         warned_oob: false,
         updates: 0,
+        apple: done.apple,
+        cursors: HashMap::new(),
     };
 
     tokio::select! {
@@ -243,6 +315,10 @@ struct Reader<'a, R> {
     out: mpsc::UnboundedSender<Vec<u8>>,
     warned_oob: bool,
     updates: u64,
+    /// Speaking Apple's 003.889: Apple messages and metadata encodings may appear.
+    apple: bool,
+    /// Apple cursor cache (encoding 0x450): id -> shape.
+    cursors: HashMap<u32, CursorShape>,
 }
 
 impl<R: AsyncRead + Unpin> Reader<'_, R> {
@@ -257,6 +333,7 @@ impl<R: AsyncRead + Unpin> Reader<'_, R> {
                     emit(self.events, SessionEvent::Bell).await?;
                 }
                 3 => self.server_cut_text().await?,
+                apple::MSG_MISC_STATUS if self.apple => apple::skip_misc_status(&mut self.rd).await?,
                 other => {
                     // The length of an unknown message is unknowable, so we cannot skip it.
                     warn!(message_type = other, "unexpected server message type; cannot continue");
@@ -289,7 +366,7 @@ impl<R: AsyncRead + Unpin> Reader<'_, R> {
             height = h,
             "remote desktop resized"
         );
-        self.fb.resize(w as usize, h as usize);
+        self.fb.resize(w as usize, h as usize)?;
         {
             let mut s = lock(&self.shared);
             s.width = w;
@@ -338,6 +415,29 @@ impl<R: AsyncRead + Unpin> Reader<'_, R> {
                 decode::ENC_DESKTOP_SIZE => resized |= self.resize(w as u16, h as u16).await?,
                 decode::ENC_EXT_DESKTOP_SIZE => resized |= self.ext_desktop_size(x, y, w, h).await?,
                 decode::ENC_CURSOR => self.cursor(x, y, w, h).await?,
+                apple::ENC_REKEY if self.apple => {
+                    // We never ask for a second rekey, and the Mac switches both of its ciphers the
+                    // moment it sends one, so records already framed under the old key would fail.
+                    warn!("the Mac sent a second encryption key mid-session; closing");
+                    return Err(VncError::Security(
+                        "the Mac changed the encryption key mid-session, which this client never asks for; the \
+                         session was closed"
+                            .into(),
+                    ));
+                }
+                apple::ENC_CURSOR_IMAGE if self.apple => self.apple_cursor(x, y, w, h).await?,
+                apple::ENC_CURSOR_POS
+                | apple::ENC_DISPLAY_INFO
+                | apple::ENC_DISPLAY_LAYOUT
+                | apple::ENC_VENDOR_KEYSYMS
+                | apple::ENC_KEYBOARD_SOURCE
+                | apple::ENC_DEVICE_INFO
+                | apple::ENC_MEDIA_STREAM
+                    if self.apple =>
+                {
+                    apple::skip_metadata(&mut self.rd, enc).await?;
+                    trace!(encoding = enc, "Apple metadata rectangle skipped");
+                }
                 decode::ENC_COPYRECT => {
                     let sx = self.rd.read_u16().await? as usize;
                     let sy = self.rd.read_u16().await? as usize;
@@ -445,6 +545,57 @@ impl<R: AsyncRead + Unpin> Reader<'_, R> {
         emit(self.events, SessionEvent::Cursor(shape)).await
     }
 
+    /// Apple's cursor cache (0x450): `u32 id, u32 compressed_len`, then (when the length is not
+    /// zero) a zlib stream of `w*h` BGRX pixels followed by a separate `w*h` alpha plane, which
+    /// is stored under the id. A zero length selects a stored shape.
+    async fn apple_cursor(&mut self, hot_x: usize, hot_y: usize, w: usize, h: usize) -> Result<()> {
+        let id = self.rd.read_u32().await?;
+        let len = self.rd.read_u32().await?;
+        if len == 0 {
+            match self.cursors.get(&id) {
+                Some(shape) => return emit(self.events, SessionEvent::Cursor(shape.clone())).await,
+                None => {
+                    debug!(id, "Apple cursor: select for an unknown id; keeping the current cursor");
+                    return Ok(());
+                }
+            }
+        }
+        if len > MAX_CURSOR_IMAGE || w == 0 || h == 0 || w > MAX_CURSOR_SIDE || h > MAX_CURSOR_SIDE {
+            return proto(format!("implausible Apple cursor image: {w}x{h}, {len} compressed bytes"));
+        }
+        let mut deflated = Vec::new();
+        let got = (&mut self.rd).take(len as u64).read_to_end(&mut deflated).await?;
+        if got != len as usize {
+            return Err(VncError::Io(std::io::ErrorKind::UnexpectedEof.into()));
+        }
+        let pixels = w * h;
+        let mut raw = vec![0u8; pixels * 5];
+        let mut z = flate2::Decompress::new(true);
+        let ok = z.decompress(&deflated, &mut raw, flate2::FlushDecompress::Sync).is_ok() && z.total_out() as usize == raw.len();
+        if !ok {
+            // Each shape is its own zlib stream, so a bad one can be dropped on its own.
+            warn!(id, w, h, "Apple cursor: could not inflate the image; ignored");
+            return Ok(());
+        }
+        let (bgrx, alpha) = raw.split_at(pixels * 4);
+        let mut rgba = Vec::with_capacity(pixels * 4);
+        for (p, &a) in bgrx.chunks_exact(4).zip(alpha) {
+            rgba.extend_from_slice(&[p[2], p[1], p[0], a]);
+        }
+        let shape = CursorShape::Bitmap {
+            width: w as u16,
+            height: h as u16,
+            hot_x: hot_x.min(w - 1) as u16,
+            hot_y: hot_y.min(h - 1) as u16,
+            rgba,
+        };
+        if self.cursors.len() >= MAX_CURSOR_CACHE {
+            self.cursors.clear();
+        }
+        self.cursors.insert(id, shape.clone());
+        emit(self.events, SessionEvent::Cursor(shape)).await
+    }
+
     async fn colour_map(&mut self) -> Result<()> {
         // We always use true colour, so a colour map is meaningless; skip it.
         let mut head = [0u8; 5];
@@ -463,7 +614,12 @@ impl<R: AsyncRead + Unpin> Reader<'_, R> {
         self.rd.read_exact(&mut pad).await?;
         let len = self.rd.read_u32().await?;
         if len > MAX_CUT_TEXT {
-            return proto(format!("implausible clipboard length {len}"));
+            let skipped = tokio::io::copy(&mut (&mut self.rd).take(len as u64), &mut tokio::io::sink()).await?;
+            if skipped != len as u64 {
+                return Err(VncError::Io(std::io::ErrorKind::UnexpectedEof.into()));
+            }
+            warn!(bytes = len, limit = MAX_CUT_TEXT, "clipboard text from the server is too large; dropped");
+            return Ok(());
         }
         let mut bytes = Vec::new();
         let got = (&mut self.rd).take(len as u64).read_to_end(&mut bytes).await?;

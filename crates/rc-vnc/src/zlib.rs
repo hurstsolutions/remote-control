@@ -5,6 +5,9 @@ use crate::error::{proto, Result, VncError};
 use flate2::{Decompress, FlushDecompress};
 
 const BUF: usize = 32 * 1024;
+/// How much a compressed block may inflate beyond what its rectangle needs. Servers sometimes
+/// leave a little; a block that keeps producing output is a decompression bomb.
+pub(crate) const MAX_EXCESS: u64 = 1024 * 1024;
 
 pub(crate) struct ZStream {
     d: Decompress,
@@ -82,14 +85,22 @@ impl ZReader<'_> {
         if self.pos < self.len {
             tracing::debug!(extra = self.len - self.pos, "zlib block produced more data than the rectangle needed");
         }
+        let mut excess = (self.len - self.pos) as u64;
         while !self.input.is_empty() {
             let (in0, out0) = (self.d.total_in(), self.d.total_out());
             self.d
                 .decompress(self.input, self.buf, FlushDecompress::None)
                 .map_err(|e| VncError::Protocol(format!("zlib inflate failed: {e}")))?;
             let used = (self.d.total_in() - in0) as usize;
-            let made = (self.d.total_out() - out0) as usize;
+            let made = self.d.total_out() - out0;
             self.input = &self.input[used..];
+            excess += made;
+            if excess > MAX_EXCESS {
+                return proto(format!(
+                    "a zlib block inflates to more than {} KiB beyond what its rectangle needs",
+                    MAX_EXCESS / 1024
+                ));
+            }
             if used == 0 && made == 0 {
                 break;
             }
@@ -156,6 +167,25 @@ pub(crate) mod tests {
             r.finish().unwrap();
             assert_eq!(&out, data);
         }
+    }
+
+    #[test]
+    fn block_inflating_far_past_the_rectangle_is_refused() {
+        let mut def = TestDeflater::new();
+        let mut z = ZStream::new();
+        let comp = def.block(&vec![0u8; 8 * 1024 * 1024]);
+        assert!(comp.len() < 64 * 1024, "a small block that inflates to 8 MiB");
+        let mut r = z.reader(&comp);
+        let mut out = [0u8; 16];
+        r.read_exact(&mut out).unwrap();
+        assert!(r.finish().is_err());
+        // A little slack is fine.
+        let mut def = TestDeflater::new();
+        let mut z = ZStream::new();
+        let comp = def.block(&[1u8; 1000]);
+        let mut r = z.reader(&comp);
+        r.read_exact(&mut out).unwrap();
+        r.finish().unwrap();
     }
 
     #[test]

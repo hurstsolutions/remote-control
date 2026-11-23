@@ -53,3 +53,10 @@ Select-String RemoteControl_0.1.0_x64-setup.exe SHA256SUMS.txt
 ```
 
 A match only shows the file arrived intact from the release; the builds are still unsigned.
+
+## Third-party code
+
+- `crates/rc-vnc/src/record.rs` (Apple Screen Sharing's encrypted record layer) adapts code from
+  [remotex](https://github.com/andrewtheguy/remotex) (`src/vnc_record.rs`), MIT License,
+  Copyright (c) 2026 Andrew Chen. The full notice is in that file. The Apple ViewerInfo bytes in
+  `crates/rc-vnc/src/apple.rs` follow remotex's measurements.

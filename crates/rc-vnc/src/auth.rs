@@ -52,7 +52,9 @@ fn put_cstr(field: &mut [u8], s: &str) -> bool {
 /// * `private`: our DH private key (big-endian bytes).
 /// * `filler`: 128 random bytes that pad the credentials block.
 ///
-/// Returns `ciphertext (128 bytes) || our public key (key_len bytes, left-padded)`.
+/// Returns `ciphertext (128 bytes) || our public key (key_len bytes, left-padded)`, and the
+/// AES key (MD5 of the shared secret). The key is also the wrap key for the encrypted session's
+/// first rekey (see `crate::record::unwrap_rekey`); it is secret and must never be logged.
 pub(crate) fn ard_response_with(
     generator: u16,
     prime: &[u8],
@@ -61,7 +63,7 @@ pub(crate) fn ard_response_with(
     password: &str,
     private: &[u8],
     filler: [u8; 128],
-) -> Result<Vec<u8>> {
+) -> Result<ArdResponse> {
     let key_len = prime.len();
     let p = BigUint::from_bytes_be(prime);
     if p <= BigUint::from(2u8) {
@@ -98,7 +100,13 @@ pub(crate) fn ard_response_with(
     let mut out = Vec::with_capacity(128 + key_len);
     out.extend_from_slice(&block);
     out.extend_from_slice(&left_pad(&public.to_bytes_be(), key_len));
-    Ok(out)
+    Ok(ArdResponse { message: out, wrap_key: aes_key })
+}
+
+/// What type 30 sends, and the key it leaves behind.
+pub(crate) struct ArdResponse {
+    pub message: Vec<u8>,
+    pub wrap_key: [u8; 16],
 }
 
 /// Apple Remote Desktop (type 30) response using OS randomness.
@@ -108,7 +116,7 @@ pub(crate) fn ard_response(
     server_pub: &[u8],
     username: &str,
     password: &str,
-) -> Result<Vec<u8>> {
+) -> Result<ArdResponse> {
     let mut private = vec![0u8; prime.len()];
     let mut filler = [0u8; 128];
     getrandom::fill(&mut private)
@@ -171,15 +179,19 @@ pub(crate) mod tests {
             let p = BigUint::from_bytes_be(&self.prime);
             left_pad(&BigUint::from(self.generator).modpow(&self.private, &p).to_bytes_be(), self.key_len())
         }
-        /// `response` = 128 bytes ciphertext || client public key.
-        pub fn decrypt(&self, response: &[u8]) -> (String, String) {
-            assert_eq!(response.len(), 128 + self.key_len());
+        /// The AES key (and rekey wrap key) for a client response.
+        pub fn wrap_key(&self, response: &[u8]) -> [u8; 16] {
             let p = BigUint::from_bytes_be(&self.prime);
             let client_pub = BigUint::from_bytes_be(&response[128..]);
             let shared = client_pub.modpow(&self.private, &p).to_bytes_be();
             let mut padded = vec![0u8; self.key_len() - shared.len()];
             padded.extend_from_slice(&shared);
-            let key: [u8; 16] = Md5::digest(&padded).into();
+            Md5::digest(&padded).into()
+        }
+        /// `response` = 128 bytes ciphertext || client public key.
+        pub fn decrypt(&self, response: &[u8]) -> (String, String) {
+            assert_eq!(response.len(), 128 + self.key_len());
+            let key = self.wrap_key(response);
             let cipher = aes::Aes128::new(&key.into());
             let mut plain = response[..128].to_vec();
             for chunk in plain.chunks_exact_mut(16) {
@@ -197,9 +209,11 @@ pub(crate) mod tests {
     #[test]
     fn ard_round_trip() {
         let server = MockArdServer::new(0x5a);
-        let resp = ard_response(2, &server.prime, &server.public_key(), "alice", "s3cret pw").unwrap();
+        let ArdResponse { message: resp, wrap_key } =
+            ard_response(2, &server.prime, &server.public_key(), "alice", "s3cret pw").unwrap();
         assert_eq!(resp.len(), 128 + 128);
         assert_eq!(server.decrypt(&resp), ("alice".to_string(), "s3cret pw".to_string()));
+        assert_eq!(wrap_key, server.wrap_key(&resp));
     }
 
     #[test]
@@ -209,7 +223,9 @@ pub(crate) mod tests {
         // to the full key length; the shared secret is then the server's public key.
         let long_user = "u".repeat(80);
         let resp =
-            ard_response_with(2, &server.prime, &server.public_key(), &long_user, "", &[1], [0xAA; 128]).unwrap();
+            ard_response_with(2, &server.prime, &server.public_key(), &long_user, "", &[1], [0xAA; 128])
+                .unwrap()
+                .message;
         assert_eq!(resp.len(), 256);
         assert!(resp[128..255].iter().all(|&b| b == 0));
         assert_eq!(resp[255], 2);
@@ -227,13 +243,15 @@ pub(crate) mod tests {
         let server_priv = BigUint::from(1234u32);
         let server_pub = left_pad(&BigUint::from(2u8).modpow(&server_priv, &p).to_bytes_be(), 8);
         let filler: [u8; 128] = core::array::from_fn(|i| 0x80 | i as u8);
-        let resp = ard_response_with(2, &prime, &server_pub, "bob", "pw", &[0x03, 0xE9], filler).unwrap();
+        let ArdResponse { message: resp, wrap_key } =
+            ard_response_with(2, &prime, &server_pub, "bob", "pw", &[0x03, 0xE9], filler).unwrap();
         assert_eq!(resp.len(), 128 + 8);
         let client_pub = BigUint::from_bytes_be(&resp[128..]);
         assert_eq!(client_pub, BigUint::from(2u8).modpow(&BigUint::from(1001u32), &p));
         let shared = left_pad(&client_pub.modpow(&server_priv, &p).to_bytes_be(), 8);
         assert_eq!(&shared[..6], &[0; 6]);
         let key: [u8; 16] = Md5::digest(&shared).into();
+        assert_eq!(wrap_key, key);
         let cipher = aes::Aes128::new(&key.into());
         let mut plain = resp[..128].to_vec();
         for chunk in plain.chunks_exact_mut(16) {
