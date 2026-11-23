@@ -90,7 +90,7 @@ fn config(ssh_port: u16, target_port: u16, password: &str) -> TunnelConfig {
         ssh_host: "127.0.0.1".into(),
         ssh_port,
         username: USER.into(),
-        password: password.into(),
+        password: password.to_owned().into(),
         target_host: "127.0.0.1".into(),
         target_port,
         pinned_host_key_sha256: None,

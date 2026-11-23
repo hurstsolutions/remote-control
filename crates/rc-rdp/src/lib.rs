@@ -7,6 +7,7 @@
 
 mod clipboard;
 mod keymap;
+mod tls;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -16,7 +17,10 @@ use ironrdp_cliprdr::backend::ClipboardMessage;
 use ironrdp_cliprdr::pdu::{ClipboardFormat, ClipboardFormatId};
 use ironrdp_cliprdr::CliprdrClient;
 use ironrdp_connector::connection_activation::ConnectionActivationState;
-use ironrdp_connector::{ConnectionResult, ConnectorError, ConnectorErrorKind};
+use ironrdp_connector::{
+    ClientConnector, ClientConnectorState, ConnectionResult, ConnectorError, ConnectorErrorKind, Sequence as _,
+    State as _,
+};
 use ironrdp_core::WriteBuf;
 use ironrdp_displaycontrol::client::DisplayControlClient;
 use ironrdp_displaycontrol::pdu::MonitorLayoutEntry;
@@ -24,10 +28,15 @@ use ironrdp_graphics::image_processing::PixelFormat;
 use ironrdp_input::{Database, MouseButton as RdpButton, MousePosition, Operation, WheelRotations};
 use ironrdp_pdu::geometry::InclusiveRectangle;
 use ironrdp_pdu::input::fast_path::FastPathInputEvent;
+use ironrdp_pdu::nego::{ConnectionConfirm, SecurityProtocol};
+use ironrdp_pdu::x224::X224;
 use ironrdp_session::image::DecodedImage;
 use ironrdp_session::{fast_path, ActiveStage, ActiveStageBuilder, ActiveStageOutput, SessionError as RdpSessionError};
 use ironrdp_tokio::reqwest::ReqwestNetworkClient;
-use ironrdp_tokio::{single_sequence_step_read, split_tokio_framed, FramedWrite as _, TokioFramed};
+use ironrdp_tokio::{
+    single_sequence_step, single_sequence_step_read, split_tokio_framed, FramedWrite as _,
+    ShouldUpgrade, TokioFramed,
+};
 use rc_types::{
     CursorShape, ErrorKind, IdentityKind, MouseButton, SessionError, SessionEvent, SessionInput, SessionIo,
     MAX_CLIPBOARD_BYTES,
@@ -37,7 +46,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
-use x509_cert::der::Encode as _;
+use x509_cert::der::Decode as _;
+use zeroize::Zeroizing;
 
 use crate::clipboard::{ClipEvent, TextClipboard};
 
@@ -46,10 +56,11 @@ pub struct RdpConfig {
     pub host: String,
     pub port: u16,
     pub username: String,
-    pub password: String,
+    /// Wiped from memory when dropped; the session drops its copy once signed in.
+    pub password: Zeroizing<String>,
     /// Windows domain, or `None` for a local / Microsoft account.
     pub domain: Option<String>,
-    /// Initial desktop size in pixels.
+    /// Initial desktop size in pixels. Clamped to what RDP allows (200..=8192 per side).
     pub width: u16,
     pub height: u16,
     /// Desktop scale factor in percent (100 = 1x, 200 = Retina).
@@ -122,7 +133,7 @@ async fn status(events: mpsc::Sender<SessionEvent>, text: &str) {
 }
 
 async fn session(
-    config: RdpConfig,
+    mut config: RdpConfig,
     events: mpsc::Sender<SessionEvent>,
     input: &mut mpsc::UnboundedReceiver<SessionInput>,
 ) -> Result<(), SessionError> {
@@ -130,8 +141,11 @@ async fn session(
     let local_text = Arc::new(Mutex::new(String::new()));
 
     let (connection, framed) = connect(&config, events.clone(), &clip_tx, &local_text).await?;
+    // Signed in: the password is not needed again. Dropping it wipes this copy.
+    config.password = Zeroizing::default();
 
     let size = connection.desktop_size;
+    check_desktop_size(size.width, size.height)?;
     info!(width = size.width, height = size.height, "RDP session established");
     let _ = events
         .send(SessionEvent::Connected {
@@ -180,23 +194,23 @@ async fn connect(
     let mut framed = TokioFramed::new(tcp);
 
     status(events.clone(), "Negotiating security").await;
-    let should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector)
-        .await
-        .map_err(|e| connector_error("security negotiation", &e))?;
+    let should_upgrade = negotiate(&mut framed, &mut connector, config.nla).await?;
 
     let (tcp, leftover) = framed.into_inner();
-    let (tls, cert) = ironrdp_tls::upgrade(tcp, &config.host)
+    let (tls, cert_der) = tls::upgrade(tcp, &config.host)
         .await
         .map_err(|e| SessionError::new(ErrorKind::Security, format!("TLS handshake failed: {e}")))?;
-    let negotiated = ironrdp_tls::negotiated(&tls);
-    info!(version = ?negotiated.version, cipher = ?negotiated.cipher_suite, "TLS established");
+    let (version, cipher) = tls::negotiated(&tls);
+    info!(?version, ?cipher, "TLS established");
 
-    // Pin the certificate before any credentials leave this machine.
-    let der = cert
-        .to_der()
-        .map_err(|e| SessionError::new(ErrorKind::Security, format!("cannot encode server certificate: {e}")))?;
-    let fingerprint = hex(&Sha256::digest(&der));
-    info!(%fingerprint, subject = %cert.tbs_certificate.subject, "server certificate");
+    // Pin the certificate before any credentials leave this machine. The TLS layer has already
+    // checked that the server holds this certificate's private key.
+    let fingerprint = hex(&Sha256::digest(cert_der.as_ref()));
+    let cert = x509_cert::Certificate::from_der(cert_der.as_ref());
+    match &cert {
+        Ok(cert) => info!(%fingerprint, subject = %cert.tbs_certificate.subject, "server certificate"),
+        Err(_) => info!(%fingerprint, "server certificate"),
+    }
     if let Some(pinned) = &config.pinned_cert_sha256 {
         if !pinned.eq_ignore_ascii_case(&fingerprint) {
             return Err(SessionError::identity_changed(
@@ -211,13 +225,19 @@ async fn connect(
             ));
         }
     }
+    let cert =
+        cert.map_err(|e| SessionError::new(ErrorKind::Security, format!("cannot parse server certificate: {e}")))?;
+    // CredSSP binds the sign-in to this key (the certificate's subjectPublicKey bits).
+    let server_public_key = cert
+        .tbs_certificate
+        .subject_public_key_info
+        .subject_public_key
+        .as_bytes()
+        .ok_or_else(|| SessionError::new(ErrorKind::Security, "server certificate has no usable public key"))?
+        .to_owned();
     let _ = events
         .send(SessionEvent::ServerIdentity { sha256: fingerprint })
         .await;
-
-    let server_public_key = ironrdp_tls::extract_tls_server_public_key(&cert)
-        .ok_or_else(|| SessionError::new(ErrorKind::Security, "server certificate has no usable public key"))?
-        .to_owned();
 
     let upgraded = ironrdp_tokio::mark_as_upgraded(should_upgrade, &mut connector);
     let boxed: Box<dyn Stream> = Box::new(tls);
@@ -237,6 +257,91 @@ async fn connect(
     .map_err(|e| connector_error("sign-in", &e))?;
 
     Ok((connection, framed))
+}
+
+/// X.224 security negotiation. With NLA on, refuses any answer other than CredSSP (HYBRID /
+/// HYBRID_EX) before the connector sees it, so a downgrade is reported as a security problem.
+async fn negotiate(
+    framed: &mut TokioFramed<TcpStream>,
+    connector: &mut ClientConnector,
+    nla: bool,
+) -> Result<ShouldUpgrade, SessionError> {
+    let mut buf = WriteBuf::new();
+    while !connector.should_perform_security_upgrade() {
+        if !matches!(connector.state, ClientConnectorState::ConnectionInitiationWaitConfirm { .. }) {
+            single_sequence_step(framed, connector, &mut buf)
+                .await
+                .map_err(|e| connector_error("security negotiation", &e))?;
+            continue;
+        }
+        let Some(hint) = connector.next_pdu_hint() else {
+            return Err(SessionError::new(ErrorKind::Protocol, "security negotiation: no reply expected"));
+        };
+        let pdu = framed.read_by_hint(hint).await.map_err(|e| {
+            SessionError::new(ErrorKind::Disconnected, format!("security negotiation: connection lost: {e}"))
+        })?;
+        if nla {
+            if let Ok(X224(ConnectionConfirm::Response { protocol, .. })) =
+                ironrdp_core::decode::<X224<ConnectionConfirm>>(&pdu)
+            {
+                check_nla_selected(protocol)?;
+            }
+        }
+        buf.clear();
+        let written = connector
+            .step(&pdu, &mut buf)
+            .map_err(|e| connector_error("security negotiation", &e))?;
+        if let Some(size) = written.size() {
+            framed.write_all(&buf.filled()[..size]).await.map_err(|e| {
+                SessionError::new(ErrorKind::Disconnected, format!("security negotiation: connection lost: {e}"))
+            })?;
+        }
+    }
+    // Defence in depth: whatever path got here, the selected protocol must still be CredSSP.
+    if nla {
+        match &connector.state {
+            ClientConnectorState::EnhancedSecurityUpgrade { selected_protocol } => check_nla_selected(*selected_protocol)?,
+            other => {
+                return Err(SessionError::new(
+                    ErrorKind::Protocol,
+                    format!("security negotiation ended in an unexpected state ({})", other.name()),
+                ))
+            }
+        }
+    }
+    Ok(ironrdp_tokio::skip_connect_begin(connector))
+}
+
+fn check_nla_selected(selected: SecurityProtocol) -> Result<(), SessionError> {
+    if selected.intersects(SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX) {
+        return Ok(());
+    }
+    Err(SessionError::new(
+        ErrorKind::Security,
+        format!(
+            "the PC tried to skip Network Level Authentication (it selected {selected:?} instead of CredSSP). \
+             This can mean another machine is intercepting the connection. No credentials were sent."
+        ),
+    ))
+}
+
+/// Largest desktop side the client will allocate a frame buffer for (16384 x 16384 x 4 = 1 GiB).
+const MAX_DESKTOP_SIDE: u16 = 16384;
+
+/// The frame buffer for a server-chosen desktop size, refusing absurd sizes before allocating.
+fn desktop_image(width: u16, height: u16) -> Result<DecodedImage, SessionError> {
+    check_desktop_size(width, height)?;
+    Ok(DecodedImage::new(PixelFormat::RgbA32, width, height))
+}
+
+fn check_desktop_size(width: u16, height: u16) -> Result<(), SessionError> {
+    if width > MAX_DESKTOP_SIDE || height > MAX_DESKTOP_SIDE {
+        return Err(SessionError::new(
+            ErrorKind::Protocol,
+            format!("the server chose a {width}x{height} desktop; the limit is {MAX_DESKTOP_SIDE} pixels per side"),
+        ));
+    }
+    Ok(())
 }
 
 fn build_connector(
@@ -262,10 +367,12 @@ fn build_connector(
     let connector_config = ironrdp_connector::Config {
         credentials: ironrdp_connector::Credentials::UsernamePassword {
             username: config.username.clone(),
-            password: config.password.clone(),
+            password: (*config.password).clone(),
         },
         domain: config.domain.clone().filter(|d| !d.is_empty()),
-        enable_tls: true,
+        // With NLA on, advertise only HYBRID / HYBRID_EX: offering plain SSL as well would let a
+        // man in the middle pick it, skip CredSSP and receive the password in the Client Info PDU.
+        enable_tls: !config.nla,
         enable_credssp: config.nla,
         keyboard_type: ironrdp_pdu::gcc::KeyboardType::IbmEnhanced,
         keyboard_subtype: 0,
@@ -337,7 +444,7 @@ async fn active(
 ) -> Result<(), SessionError> {
     let (mut reader, mut writer) = split_tokio_framed(framed);
     let size = connection.desktop_size;
-    let mut image = DecodedImage::new(PixelFormat::RgbA32, size.width, size.height);
+    let mut image = desktop_image(size.width, size.height)?;
     let activation_factory = connection.activation_factory;
 
     let mut stage = ActiveStageBuilder {
@@ -498,7 +605,7 @@ async fn active(
                         } = activation.connection_activation_state()
                         {
                             info!(width = desktop_size.width, height = desktop_size.height, "desktop reactivated");
-                            image = DecodedImage::new(PixelFormat::RgbA32, desktop_size.width, desktop_size.height);
+                            image = desktop_image(desktop_size.width, desktop_size.height)?;
                             stage.set_fastpath_processor(
                                 fast_path::ProcessorBuilder {
                                     io_channel_id: activation.io_channel_id(),
@@ -715,4 +822,66 @@ fn connector_error(stage: &str, error: &ConnectorError) -> SessionError {
 
 fn session_error(stage: &str, error: &RdpSessionError) -> SessionError {
     SessionError::new(ErrorKind::Protocol, format!("{stage}: {}", chain(error)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config(nla: bool) -> RdpConfig {
+        RdpConfig {
+            host: "pc.example".to_owned(),
+            port: 3389,
+            username: "user".to_owned(),
+            password: "secret".to_owned().into(),
+            domain: None,
+            width: 1024,
+            height: 768,
+            scale_factor: 100,
+            pinned_cert_sha256: None,
+            nla,
+            clipboard: false,
+        }
+    }
+
+    fn requested_protocol(nla: bool) -> SecurityProtocol {
+        let (clip_tx, _clip_rx) = mpsc::unbounded_channel();
+        let local_text = Arc::new(Mutex::new(String::new()));
+        let addr = SocketAddr::from(([127, 0, 0, 1], 50000));
+        let mut connector = build_connector(&test_config(nla), addr, &clip_tx, &local_text).unwrap();
+        let mut buf = WriteBuf::new();
+        connector.step_no_input(&mut buf).unwrap();
+        let X224(request) = ironrdp_core::decode::<X224<ironrdp_pdu::nego::ConnectionRequest>>(buf.filled()).unwrap();
+        request.protocol
+    }
+
+    #[test]
+    fn nla_connection_request_does_not_offer_plain_tls() {
+        assert_eq!(requested_protocol(true), SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX);
+    }
+
+    #[test]
+    fn non_nla_connection_request_offers_only_tls() {
+        assert_eq!(requested_protocol(false), SecurityProtocol::SSL);
+    }
+
+    #[test]
+    fn nla_downgrade_is_a_security_error() {
+        assert!(check_nla_selected(SecurityProtocol::HYBRID).is_ok());
+        assert!(check_nla_selected(SecurityProtocol::HYBRID_EX).is_ok());
+        for selected in [SecurityProtocol::SSL, SecurityProtocol::empty()] {
+            assert_eq!(check_nla_selected(selected).unwrap_err().kind, ErrorKind::Security);
+        }
+    }
+
+    #[test]
+    fn oversized_desktop_is_refused_before_allocating() {
+        assert!(desktop_image(1920, 1080).is_ok());
+        assert!(check_desktop_size(MAX_DESKTOP_SIDE, MAX_DESKTOP_SIDE).is_ok());
+        for (w, h) in [(MAX_DESKTOP_SIDE + 1, 600), (800, u16::MAX), (u16::MAX, u16::MAX)] {
+            let error = check_desktop_size(w, h).expect_err("must be refused");
+            assert!(desktop_image(w, h).is_err());
+            assert_eq!(error.kind, ErrorKind::Protocol);
+        }
+    }
 }

@@ -3369,17 +3369,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ironrdp-tls"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea5f0bb732e33159834f06a687f5415dae1a82c71c123c1c3a3689d41ed47645"
-dependencies = [
- "tokio",
- "tokio-rustls",
- "x509-cert",
-]
-
-[[package]]
 name = "ironrdp-tokio"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5417,6 +5406,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "aws-lc-rs",
  "ironrdp-cliprdr",
  "ironrdp-connector",
  "ironrdp-core",
@@ -5428,15 +5418,16 @@ dependencies = [
  "ironrdp-server",
  "ironrdp-session",
  "ironrdp-svc",
- "ironrdp-tls",
  "ironrdp-tokio",
  "rc-types",
  "rcgen",
  "sha2 0.10.9",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
  "x509-cert",
+ "zeroize",
 ]
 
 [[package]]
@@ -5448,6 +5439,7 @@ dependencies = [
  "russh",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]

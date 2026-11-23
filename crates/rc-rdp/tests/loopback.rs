@@ -3,6 +3,9 @@
 //! The server shows a synthetic picture (left half red, right half blue) and records the input it
 //! receives, so these tests cover TLS, certificate pinning, NLA sign-in, frame decoding (including
 //! colour channel order) and input encoding without any real remote-desktop host.
+//!
+//! Further down, hand-rolled mock servers play a man in the middle: one that presents the real
+//! certificate without holding its key, and one that tries to talk the client out of NLA.
 
 use std::net::{SocketAddr, TcpListener};
 use std::num::{NonZeroU16, NonZeroUsize};
@@ -146,7 +149,7 @@ fn config(port: u16, password: &str, nla: bool) -> RdpConfig {
         host: "127.0.0.1".to_owned(),
         port,
         username: USER.to_owned(),
-        password: password.to_owned(),
+        password: password.to_owned().into(),
         domain: None,
         width: WIDTH,
         height: HEIGHT,
@@ -332,4 +335,246 @@ async fn closed_port_reports_unreachable() {
     collect(&mut handle, &mut seen, Duration::from_secs(15), |_| false).await;
     let error = seen.closed.expect("session must close").expect("with an error");
     assert_eq!(error.kind, ErrorKind::Unreachable, "detail: {}", error.detail);
+}
+
+// ── Hostile servers ──────────────────────────────────────────────────────────
+
+use sha2::{Digest as _, Sha256};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio_rustls::rustls::{
+    self,
+    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+    server::{ClientHello, ResolvesServerCert},
+    sign::{CertifiedKey, Signer, SigningKey},
+    SignatureAlgorithm, SignatureScheme, SupportedProtocolVersion,
+};
+
+/// X.224 Connection Confirm with RDP_NEG_RSP selecting PROTOCOL_SSL (TLS without CredSSP).
+const CONFIRM_SSL: [u8; 19] = [
+    0x03, 0x00, 0x00, 0x13, 0x0e, 0xd0, 0x00, 0x00, 0x12, 0x34, 0x00, 0x02, 0x00, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00,
+];
+/// The same, selecting PROTOCOL_HYBRID (CredSSP), as a Windows PC with NLA does.
+const CONFIRM_HYBRID: [u8; 19] = [
+    0x03, 0x00, 0x00, 0x13, 0x0e, 0xd0, 0x00, 0x00, 0x12, 0x34, 0x00, 0x02, 0x00, 0x08, 0x00, 0x02, 0x00, 0x00, 0x00,
+];
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn provider() -> Arc<rustls::crypto::CryptoProvider> {
+    Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+}
+
+#[derive(Debug)]
+struct Fixed(Arc<CertifiedKey>);
+
+impl ResolvesServerCert for Fixed {
+    fn resolve(&self, _: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        Some(Arc::clone(&self.0))
+    }
+}
+
+/// An RSA key that only signs with PKCS#1 v1.5, like many Windows TLS 1.2 stacks.
+#[derive(Debug)]
+struct Pkcs1Only(Arc<dyn SigningKey>);
+
+impl SigningKey for Pkcs1Only {
+    fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn Signer>> {
+        let pkcs1: Vec<_> = offered
+            .iter()
+            .copied()
+            .filter(|s| {
+                matches!(
+                    s,
+                    SignatureScheme::RSA_PKCS1_SHA256 | SignatureScheme::RSA_PKCS1_SHA384 | SignatureScheme::RSA_PKCS1_SHA512
+                )
+            })
+            .collect();
+        self.0.choose_scheme(&pkcs1)
+    }
+
+    fn algorithm(&self) -> SignatureAlgorithm {
+        self.0.algorithm()
+    }
+}
+
+fn server_config(
+    versions: &[&'static SupportedProtocolVersion],
+    cert: CertificateDer<'static>,
+    signer: Arc<dyn SigningKey>,
+) -> Arc<rustls::ServerConfig> {
+    let key = Arc::new(CertifiedKey::new(vec![cert], signer));
+    let config = rustls::ServerConfig::builder_with_provider(provider())
+        .with_protocol_versions(versions)
+        .unwrap()
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(Fixed(key)));
+    Arc::new(config)
+}
+
+fn load_key(pkcs8: Vec<u8>) -> Arc<dyn SigningKey> {
+    provider()
+        .key_provider
+        .load_private_key(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8)))
+        .unwrap()
+}
+
+/// What a mock server saw.
+#[derive(Debug, Default)]
+struct MockLog {
+    tls_ok: bool,
+    /// Bytes received after the Connection Confirm (decrypted, when TLS was established).
+    after_confirm: Vec<u8>,
+}
+
+/// One-shot mock: answer the X.224 Connection Request with `confirm`, then either accept TLS with
+/// `tls` or just listen, and record what the client sends next.
+fn start_mock(confirm: [u8; 19], tls: Option<Arc<rustls::ServerConfig>>) -> (u16, tokio::task::JoinHandle<MockLog>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let task = tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let (mut tcp, _) = listener.accept().await.unwrap();
+        let mut log = MockLog::default();
+        let mut tpkt = [0u8; 4];
+        tcp.read_exact(&mut tpkt).await.unwrap();
+        let mut rest = vec![0u8; usize::from(u16::from_be_bytes([tpkt[2], tpkt[3]])) - 4];
+        tcp.read_exact(&mut rest).await.unwrap();
+        tcp.write_all(&confirm).await.unwrap();
+
+        let mut buf = [0u8; 4096];
+        let read = |n: std::io::Result<usize>| n.unwrap_or(0);
+        match tls {
+            Some(config) => {
+                let accepted = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    tokio_rustls::TlsAcceptor::from(config).accept(tcp),
+                )
+                .await;
+                if let Ok(Ok(mut stream)) = accepted {
+                    log.tls_ok = true;
+                    if let Ok(n) = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await {
+                        log.after_confirm.extend_from_slice(&buf[..read(n)]);
+                    }
+                }
+            }
+            None => loop {
+                match tokio::time::timeout(Duration::from_secs(5), tcp.read(&mut buf)).await {
+                    Ok(Ok(n)) if n > 0 => log.after_confirm.extend_from_slice(&buf[..n]),
+                    _ => break,
+                }
+            },
+        }
+        log
+    });
+    (port, task)
+}
+
+async fn run_to_close(cfg: RdpConfig) -> Seen {
+    let (io, mut handle) = session_channels();
+    rc_rdp::spawn(cfg, io).unwrap();
+    let mut seen = Seen::default();
+    collect(&mut handle, &mut seen, Duration::from_secs(20), |_| false).await;
+    seen
+}
+
+/// A man in the middle presents the PC's real certificate (public) but signs the handshake with
+/// its own key. The pin matches, so only the handshake signature check stops it.
+async fn mitm_with_real_certificate_is_rejected(version: &'static SupportedProtocolVersion) {
+    let real = rcgen::generate_simple_self_signed(vec!["windows-pc".to_owned()]).unwrap();
+    let real_der = real.cert.der().clone();
+    let attacker = rcgen::KeyPair::generate().unwrap();
+    let config = server_config(&[version], real_der.clone(), load_key(attacker.serialize_der()));
+    let (port, mock) = start_mock(CONFIRM_HYBRID, Some(config));
+
+    let mut cfg = config_for(port, true);
+    cfg.pinned_cert_sha256 = Some(sha256_hex(&real_der));
+    let seen = run_to_close(cfg).await;
+
+    let error = seen.closed.expect("session must close").expect("with an error");
+    assert_eq!(error.kind, ErrorKind::Security, "detail: {}", error.detail);
+    assert!(seen.identity.is_none(), "an unproven certificate must not be reported as the server identity");
+    let log = mock.await.unwrap();
+    assert!(!log.tls_ok, "the client must abort the TLS handshake");
+    assert!(log.after_confirm.is_empty(), "nothing may be sent to the impostor");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mitm_with_real_certificate_but_wrong_key_is_rejected_tls12() {
+    mitm_with_real_certificate_is_rejected(&rustls::version::TLS12).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mitm_with_real_certificate_but_wrong_key_is_rejected_tls13() {
+    mitm_with_real_certificate_is_rejected(&rustls::version::TLS13).await;
+}
+
+fn config_for(port: u16, nla: bool) -> RdpConfig {
+    config(port, PASS, nla)
+}
+
+/// A Windows-like server: self-signed 2048-bit RSA certificate, holding its key. The handshake
+/// must succeed and CredSSP must start.
+async fn rsa_server_is_accepted(version: &'static SupportedProtocolVersion, pkcs1_only: bool) {
+    use aws_lc_rs::encoding::AsDer as _;
+    let rsa = aws_lc_rs::rsa::KeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048).unwrap();
+    let pkcs8 = rsa.as_der().unwrap().as_ref().to_vec();
+    let key_pair = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(
+        &PrivatePkcs8KeyDer::from(pkcs8.clone()),
+        &rcgen::PKCS_RSA_SHA256,
+    )
+    .unwrap();
+    let cert = rcgen::CertificateParams::new(vec!["windows-pc".to_owned()])
+        .unwrap()
+        .self_signed(&key_pair)
+        .unwrap();
+    let der = cert.der().clone();
+    let mut signer = load_key(pkcs8);
+    if pkcs1_only {
+        signer = Arc::new(Pkcs1Only(signer));
+    }
+    let (port, mock) = start_mock(CONFIRM_HYBRID, Some(server_config(&[version], der.clone(), signer)));
+
+    let mut cfg = config_for(port, true);
+    cfg.pinned_cert_sha256 = Some(sha256_hex(&der));
+    let seen = run_to_close(cfg).await;
+
+    let log = mock.await.unwrap();
+    assert!(log.tls_ok, "TLS handshake must succeed; client said {:?}", seen.closed);
+    assert_eq!(seen.identity, Some(sha256_hex(&der)), "accepted certificate is reported");
+    // CredSSP's first message (TSRequest, a DER SEQUENCE carrying NTLM NEGOTIATE) follows.
+    assert_eq!(log.after_confirm.first(), Some(&0x30), "CredSSP must start: {:?}", log.after_confirm);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rsa_tls12_pkcs1_server_is_accepted() {
+    rsa_server_is_accepted(&rustls::version::TLS12, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rsa_tls12_pss_server_is_accepted() {
+    rsa_server_is_accepted(&rustls::version::TLS12, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rsa_tls13_server_is_accepted() {
+    rsa_server_is_accepted(&rustls::version::TLS13, false).await;
+}
+
+/// A man in the middle answers the Connection Request with PROTOCOL_SSL to skip CredSSP, so the
+/// password would travel in the Client Info PDU. With NLA on, the client must refuse at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn nla_downgrade_to_plain_tls_is_refused() {
+    let (port, mock) = start_mock(CONFIRM_SSL, None);
+    let seen = run_to_close(config_for(port, true)).await;
+
+    let error = seen.closed.expect("session must close").expect("with an error");
+    assert_eq!(error.kind, ErrorKind::Security, "detail: {}", error.detail);
+    assert!(error.detail.contains("Network Level Authentication"), "detail: {}", error.detail);
+    assert!(seen.connected.is_none());
+    let log = mock.await.unwrap();
+    // Not even a TLS ClientHello, let alone credentials or a Client Info PDU.
+    assert!(log.after_confirm.is_empty(), "client sent {} bytes after the downgrade", log.after_confirm.len());
 }

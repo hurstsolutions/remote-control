@@ -5,6 +5,7 @@
 //! `direct-tcpip` channel to the Screen Sharing port on the Mac itself. The SSH host key is pinned
 //! on first use, exactly like the RDP certificate.
 
+use std::borrow::Cow;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,16 +13,19 @@ use std::time::Duration;
 use rc_types::{ErrorKind, IdentityKind, SessionError};
 use russh::client::{self, AuthResult, KeyboardInteractiveAuthResponse};
 use russh::keys::ssh_key::{HashAlg, PublicKey};
-use russh::{ChannelStream, Disconnect, MethodKind};
+use russh::keys::{Algorithm, EcdsaCurve};
+use russh::{ChannelStream, Disconnect, MethodKind, Preferred};
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
+use zeroize::Zeroizing;
 
 #[derive(Clone)]
 pub struct TunnelConfig {
     pub ssh_host: String,
     pub ssh_port: u16,
     pub username: String,
-    pub password: String,
+    /// Wiped from memory when dropped; `open` drops its copy once signed in.
+    pub password: Zeroizing<String>,
     /// Where the SSH server should connect to, from its own point of view.
     pub target_host: String,
     pub target_port: u16,
@@ -75,11 +79,29 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Host key algorithms we accept, strongest first. No `ssh-rsa` (SHA-1 signatures), and no
+/// RSA at all: RSA support is compiled out of our russh build (default features off), and every
+/// macOS release since 10.x also has Ed25519 and ECDSA host keys.
+const HOST_KEY_ALGORITHMS: &[Algorithm] = &[
+    Algorithm::Ed25519,
+    Algorithm::Ecdsa { curve: EcdsaCurve::NistP256 },
+    Algorithm::Ecdsa { curve: EcdsaCurve::NistP384 },
+    Algorithm::Ecdsa { curve: EcdsaCurve::NistP521 },
+];
+
+fn preferred() -> Preferred {
+    Preferred {
+        key: Cow::Borrowed(HOST_KEY_ALGORITHMS),
+        ..Preferred::DEFAULT
+    }
+}
+
 /// Connect, verify the host key, sign in and open the forwarding channel.
-pub async fn open(config: TunnelConfig) -> Result<Tunnel, SessionError> {
+pub async fn open(mut config: TunnelConfig) -> Result<Tunnel, SessionError> {
     let ssh_config = Arc::new(client::Config {
         inactivity_timeout: None,
         keepalive_interval: Some(Duration::from_secs(30)),
+        preferred: preferred(),
         ..Default::default()
     });
     let seen = Arc::new(std::sync::Mutex::new(None));
@@ -137,6 +159,8 @@ pub async fn open(config: TunnelConfig) -> Result<Tunnel, SessionError> {
     let host_key_sha256 = host_key.unwrap_or_default();
 
     authenticate(&mut handle, &config).await?;
+    // Signed in: the password is not needed again. Dropping it wipes this copy.
+    config.password = Zeroizing::default();
 
     let channel = handle
         .channel_open_direct_tcpip(config.target_host.clone(), u32::from(config.target_port), "127.0.0.1", 0)
@@ -204,7 +228,7 @@ async fn authenticate(handle: &mut client::Handle<Handler>, config: &TunnelConfi
     let protocol = |error: russh::Error| SessionError::new(ErrorKind::Protocol, format!("SSH sign-in: {error}"));
 
     let remaining = match handle
-        .authenticate_password(config.username.clone(), config.password.clone())
+        .authenticate_password(config.username.clone(), (*config.password).clone())
         .await
         .map_err(protocol)?
     {
@@ -224,7 +248,7 @@ async fn authenticate(handle: &mut client::Handle<Handler>, config: &TunnelConfi
                 KeyboardInteractiveAuthResponse::Success => return Ok(()),
                 KeyboardInteractiveAuthResponse::Failure { .. } => break,
                 KeyboardInteractiveAuthResponse::InfoRequest { prompts, .. } => {
-                    let answers = prompts.iter().map(|_| config.password.clone()).collect();
+                    let answers = prompts.iter().map(|_| (*config.password).clone()).collect();
                     response = handle
                         .authenticate_keyboard_interactive_respond(answers)
                         .await
@@ -243,4 +267,17 @@ async fn authenticate(handle: &mut client::Handle<Handler>, config: &TunnelConfi
             config.username
         ),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_key_algorithms_exclude_sha1_rsa() {
+        let preferred = preferred();
+        // Excludes SHA-1 `ssh-rsa`, and RSA altogether since it is compiled out of our russh build.
+        assert!(!preferred.key.iter().any(|a| matches!(a, Algorithm::Rsa { .. })));
+        assert_eq!(preferred.key.first(), Some(&Algorithm::Ed25519));
+    }
 }

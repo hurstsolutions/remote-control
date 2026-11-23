@@ -8,6 +8,7 @@ rc-types = { path = "../rc-types" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 russh = { version = "0.56", default-features = false, features = ["aws-lc-rs", "flate2"] }
+zeroize = "1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "io-util", "net"] }
