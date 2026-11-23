@@ -1,6 +1,7 @@
 //! Tauri side of RemoteControl. The contract with the web UI is `app/src/ipc.ts`.
 
 mod logging;
+mod private_fs;
 mod secrets;
 mod store;
 
@@ -10,13 +11,14 @@ use std::sync::Mutex;
 
 use base64::Engine as _;
 use rc_types::{
-    session_channels, CursorShape, ErrorKind, SessionError, SessionEvent, SessionHandle, SessionInput, SessionIo,
+    session_channels, CursorShape, ErrorKind, IdentityMismatch, SessionError, SessionEvent, SessionHandle,
+    SessionInput, SessionIo, MAX_CLIPBOARD_BYTES,
 };
 use serde::{Deserialize, Serialize};
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{Manager as _, State};
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::store::{Connection, Protocol, Store};
 
@@ -25,23 +27,36 @@ const MAX_BATCH_BYTES: usize = 4 * 1024 * 1024;
 
 struct AppState {
     store: Mutex<Store>,
-    sessions: Mutex<HashMap<String, mpsc::UnboundedSender<SessionInput>>>,
+    sessions: Mutex<HashMap<String, LiveSession>>,
     log_path: PathBuf,
 }
 
-/// Error shape the UI expects: `{ kind, detail }`.
+struct LiveSession {
+    input: mpsc::UnboundedSender<SessionInput>,
+    /// The connection's clipboard setting when the session started.
+    share_clipboard: bool,
+}
+
+/// Error shape the UI expects: `{ kind, detail }`, plus `identity` for kind `identity_changed`.
 #[derive(Debug, Clone, Serialize)]
 struct UiError {
     kind: &'static str,
     detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity: Option<IdentityMismatch>,
 }
 
 impl UiError {
-    fn other(detail: impl Into<String>) -> Self {
+    fn new(kind: &'static str, detail: impl Into<String>) -> Self {
         Self {
-            kind: "other",
+            kind,
             detail: detail.into(),
+            identity: None,
         }
+    }
+
+    fn other(detail: impl Into<String>) -> Self {
+        Self::new("other", detail)
     }
 }
 
@@ -52,6 +67,7 @@ fn kind_name(kind: ErrorKind) -> &'static str {
         ErrorKind::AuthFailed => "auth_failed",
         ErrorKind::Unsupported => "unsupported",
         ErrorKind::Security => "security",
+        ErrorKind::IdentityChanged => "identity_changed",
         ErrorKind::Protocol => "protocol",
         ErrorKind::Disconnected => "disconnected",
         ErrorKind::Other => "other",
@@ -63,6 +79,7 @@ impl From<&SessionError> for UiError {
         Self {
             kind: kind_name(error.kind),
             detail: error.detail.clone(),
+            identity: error.identity.clone(),
         }
     }
 }
@@ -78,8 +95,45 @@ fn list_connections(state: State<'_, AppState>) -> Vec<Connection> {
     lock(&state.store).list()
 }
 
+/// What `save_connection` hands back.
+#[derive(Debug, Serialize)]
+struct SavedConnection {
+    connection: Connection,
+    /// The saved password was removed because the address or the account changed.
+    password_cleared: bool,
+}
+
+/// How saving `incoming` over `existing` (the stored connection with the same id, if any) treats
+/// what belongs to the old target.
+#[derive(Debug, PartialEq, Eq)]
+struct SaveDecision {
+    pinned_identity: Option<String>,
+    /// Delete any keychain entry under this id before saving.
+    clear_password: bool,
+}
+
+fn decide_save(existing: Option<&Connection>, incoming: &Connection) -> SaveDecision {
+    match existing {
+        // The pin belongs to a machine, the password to an account on it: neither follows the
+        // connection somewhere else. The pin is never taken from the caller.
+        Some(existing) => {
+            let same_target = existing.same_target(incoming);
+            SaveDecision {
+                pinned_identity: if same_target { existing.pinned_identity.clone() } else { None },
+                clear_password: !same_target || !existing.same_account(incoming),
+            }
+        }
+        // A new id, or one we do not know: start clean, and make sure no stale password from an
+        // earlier connection with that id is picked up.
+        None => SaveDecision {
+            pinned_identity: None,
+            clear_password: !incoming.id.is_empty(),
+        },
+    }
+}
+
 #[tauri::command]
-fn save_connection(state: State<'_, AppState>, mut connection: Connection) -> Result<Connection, UiError> {
+fn save_connection(state: State<'_, AppState>, mut connection: Connection) -> Result<SavedConnection, UiError> {
     connection.name = connection.name.trim().to_owned();
     connection.host = connection.host.trim().to_owned();
     connection.username = connection.username.trim().to_owned();
@@ -91,23 +145,35 @@ fn save_connection(state: State<'_, AppState>, mut connection: Connection) -> Re
         connection.name = connection.host.clone();
     }
     let mut store = lock(&state.store);
+    let existing = store.get(&connection.id).filter(|_| !connection.id.is_empty());
+    let decision = decide_save(existing.as_ref(), &connection);
     if connection.id.is_empty() {
         connection.id = uuid::Uuid::new_v4().to_string();
-        connection.pinned_identity = None;
-    } else if let Some(existing) = store.get(&connection.id) {
-        // The pin belongs to a machine: keep it only while the address is unchanged.
-        let same_machine = existing.host.eq_ignore_ascii_case(&connection.host)
-            && existing.protocol == connection.protocol
-            && existing.ssh_tunnel == connection.ssh_tunnel;
-        connection.pinned_identity = if same_machine { existing.pinned_identity } else { None };
+    }
+    connection.pinned_identity = decision.pinned_identity;
+    // Delete before saving, and refuse to save the new target while the old password is still
+    // there: `connect` would otherwise send it to the new address.
+    let deleted = decision.clear_password && secrets::delete(&connection.id);
+    if decision.clear_password && secrets::get(&connection.id).is_some() {
+        return Err(UiError::other(
+            "The address or username changed, but the saved password could not be removed from the keychain. \
+             Remove it with \"Forget saved password\" and try again.",
+        ));
+    }
+    let password_cleared = deleted && existing.is_some();
+    if password_cleared {
+        info!(id = %connection.id, "saved password removed: the connection now points at another address or account");
     }
     store.upsert(connection.clone()).map_err(UiError::other)?;
-    Ok(connection)
+    Ok(SavedConnection {
+        connection,
+        password_cleared,
+    })
 }
 
 #[tauri::command]
 fn delete_connection(state: State<'_, AppState>, id: String) -> Result<(), UiError> {
-    secrets::delete(&id);
+    let _ = secrets::delete(&id);
     lock(&state.store).remove(&id).map_err(UiError::other)
 }
 
@@ -118,12 +184,12 @@ fn has_saved_password(id: String) -> bool {
 
 #[tauri::command]
 fn forget_password(id: String) {
-    secrets::delete(&id);
+    let _ = secrets::delete(&id);
 }
 
 // ── Sessions ─────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct ConnectArgs {
     id: String,
     password: Option<String>,
@@ -132,6 +198,43 @@ struct ConnectArgs {
     height: u16,
     scale_factor: u32,
     trust_new_identity: bool,
+    /// With `trust_new_identity`: the fingerprint the user reviewed. Only that identity is
+    /// accepted; `None` accepts whatever the server presents.
+    #[serde(default)]
+    new_identity: Option<String>,
+}
+
+impl std::fmt::Debug for ConnectArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectArgs")
+            .field("id", &self.id)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("save_password", &self.save_password)
+            .field("size", &(self.width, self.height))
+            .field("scale_factor", &self.scale_factor)
+            .field("trust_new_identity", &self.trust_new_identity)
+            .field("new_identity", &self.new_identity)
+            .finish()
+    }
+}
+
+/// The password to sign in with. Trusting a new identity always needs a typed password: the saved
+/// one is never sent to a machine whose identity has just changed.
+fn choose_password(
+    typed: Option<String>,
+    trust_new_identity: bool,
+    saved: impl FnOnce() -> Option<String>,
+) -> Result<String, UiError> {
+    if let Some(password) = typed.filter(|p| !p.is_empty()) {
+        return Ok(password);
+    }
+    if trust_new_identity {
+        return Err(UiError::new(
+            "password_required",
+            "Enter the password to connect to a computer with a new identity. The saved password is not used.",
+        ));
+    }
+    saved().ok_or_else(|| UiError::new("password_required", "No password is saved for this connection."))
 }
 
 #[tauri::command]
@@ -145,18 +248,12 @@ fn connect(
         .get(&args.id)
         .ok_or_else(|| UiError::other("This connection no longer exists."))?;
 
-    let typed_password = args.password.filter(|p| !p.is_empty());
-    let password = match typed_password.clone().or_else(|| secrets::get(&connection.id)) {
-        Some(password) => password,
-        None => {
-            return Err(UiError {
-                kind: "password_required",
-                detail: "No password is saved for this connection.".to_owned(),
-            })
-        }
-    };
+    let typed_password = args.password.clone().filter(|p| !p.is_empty());
+    let password = choose_password(typed_password.clone(), args.trust_new_identity, || {
+        secrets::get(&connection.id)
+    })?;
     let pinned = if args.trust_new_identity {
-        None
+        args.new_identity.clone().map(|f| f.to_ascii_lowercase())
     } else {
         connection.pinned_identity.clone()
     };
@@ -170,11 +267,19 @@ fn connect(
         port = connection.port,
         tunnel = connection.ssh_tunnel,
         pinned = pinned.is_some(),
+        trust_new_identity = args.trust_new_identity,
+        clipboard = connection.share_clipboard,
         "connect requested"
     );
 
     let (io, handle) = session_channels();
-    lock(&state.sessions).insert(session_id.clone(), handle.input.clone());
+    lock(&state.sessions).insert(
+        session_id.clone(),
+        LiveSession {
+            input: handle.input.clone(),
+            share_clipboard: connection.share_clipboard,
+        },
+    );
 
     match connection.protocol {
         Protocol::Rdp => {
@@ -189,7 +294,7 @@ fn connect(
                 scale_factor: args.scale_factor.clamp(100, 500),
                 pinned_cert_sha256: pinned,
                 nla: connection.nla,
-                clipboard: true,
+                clipboard: connection.share_clipboard,
             };
             if let Err(e) = rc_rdp::spawn(config, io) {
                 lock(&state.sessions).remove(&session_id);
@@ -204,7 +309,10 @@ fn connect(
     let pump = Pump {
         app,
         session_id: session_id.clone(),
-        connection_id: connection.id.clone(),
+        share_clipboard: connection.share_clipboard,
+        trust_new_identity: args.trust_new_identity,
+        target: connection,
+        seen_identity: None,
         // Only a password the user just typed needs saving, and only once it has worked.
         password_to_save: typed_password.filter(|_| args.save_password),
         channel: events,
@@ -268,9 +376,43 @@ async fn run_vnc(connection: Connection, password: String, pinned: Option<String
 struct Pump {
     app: tauri::AppHandle,
     session_id: String,
-    connection_id: String,
+    /// The connection as it was when the session started. Nothing learned in this session (the
+    /// server identity, the password) is saved if the stored connection has since been pointed
+    /// somewhere else.
+    target: Connection,
+    share_clipboard: bool,
+    trust_new_identity: bool,
+    /// The identity the server proved, kept until the sign-in succeeds.
+    seen_identity: Option<String>,
     password_to_save: Option<String>,
     channel: Channel<InvokeResponseBody>,
+}
+
+/// The pin to store once the sign-in succeeded, if any. `current` is the stored connection now.
+fn pin_after_sign_in(
+    current: Option<&Connection>,
+    target: &Connection,
+    seen: Option<&str>,
+    trust_new_identity: bool,
+) -> Option<String> {
+    let current = current?;
+    let seen = seen?;
+    if !current.same_target(target) {
+        // Edited while signing in: this identity belongs to the old address.
+        return None;
+    }
+    match current.pinned_identity.as_deref() {
+        None => Some(seen.to_owned()),
+        Some(pinned) if pinned.eq_ignore_ascii_case(seen) => None,
+        // Only an explicit "trust new identity" replaces a pin.
+        Some(_) if trust_new_identity => Some(seen.to_owned()),
+        Some(_) => None,
+    }
+}
+
+/// Whether a password typed for `target` may be saved under the stored connection `current`.
+fn may_save_password(current: Option<&Connection>, target: &Connection) -> bool {
+    current.is_some_and(|c| c.same_target(target) && c.same_account(target))
 }
 
 impl Pump {
@@ -311,11 +453,23 @@ impl Pump {
                     let _ = self.send_json(serde_json::json!({ "type": "closed", "error": error }));
                     break;
                 }
+                SessionEvent::Clipboard(text) if !self.share_clipboard => {
+                    debug!(bytes = text.len(), "clipboard sharing is off; remote clipboard ignored");
+                    true
+                }
+                SessionEvent::Clipboard(text) if text.len() > MAX_CLIPBOARD_BYTES => {
+                    warn!(bytes = text.len(), limit = MAX_CLIPBOARD_BYTES, "remote clipboard text too large; ignored");
+                    true
+                }
                 other => {
-                    self.side_effects(&other);
-                    match to_json(other) {
+                    let notice = self.side_effects(&other);
+                    let forwarded = match to_json(other) {
                         Some(json) => self.send_json(json),
                         None => true,
+                    };
+                    match notice {
+                        Some(text) => forwarded && self.send_json(serde_json::json!({ "type": "notice", "text": text })),
+                        None => forwarded,
                     }
                 }
             };
@@ -335,25 +489,56 @@ impl Pump {
         self.channel.send(InvokeResponseBody::Json(value.to_string())).is_ok()
     }
 
-    /// Things the app itself does on an event, besides forwarding it.
-    fn side_effects(&mut self, event: &SessionEvent) {
+    /// Things the app itself does on an event, besides forwarding it. Returns a notice for the
+    /// user, if there is something they should know.
+    fn side_effects(&mut self, event: &SessionEvent) -> Option<String> {
         match event {
             SessionEvent::ServerIdentity { sha256 } => {
-                // Trust on first use: remember who answered so a different machine is noticed later.
-                let state = self.app.state::<AppState>();
-                let saved = lock(&state.store).set_pin(&self.connection_id, Some(sha256.clone()));
-                if let Err(e) = saved {
+                // Remembered only once the sign-in works: a machine that cannot sign us in must
+                // not become the trusted one.
+                self.seen_identity = Some(sha256.clone());
+                None
+            }
+            SessionEvent::Connected { .. } => self.signed_in(),
+            _ => None,
+        }
+    }
+
+    fn signed_in(&mut self) -> Option<String> {
+        let state = self.app.state::<AppState>();
+        let id = self.target.id.clone();
+        let save_password = {
+            let mut store = lock(&state.store);
+            let current = store.get(&id);
+            let pin = pin_after_sign_in(
+                current.as_ref(),
+                &self.target,
+                self.seen_identity.as_deref(),
+                self.trust_new_identity,
+            );
+            if let Some(pin) = pin {
+                info!(session = %self.session_id, fingerprint = %pin, "server identity saved");
+                if let Err(e) = store.set_pin(&id, Some(pin)) {
                     error!(error = %e, "cannot save the server identity");
                 }
+            } else if self.seen_identity.is_some() && !current.as_ref().is_some_and(|c| c.same_target(&self.target)) {
+                warn!(session = %self.session_id, "connection was changed while signing in; server identity not saved");
             }
-            SessionEvent::Connected { .. } => {
-                if let Some(password) = self.password_to_save.take() {
-                    if let Err(e) = secrets::set(&self.connection_id, &password) {
-                        warn!(error = %e, "password not saved");
-                    }
-                }
+            may_save_password(current.as_ref(), &self.target)
+        };
+        let password = self.password_to_save.take()?;
+        if !save_password {
+            warn!(session = %self.session_id, "connection was changed while signing in; password not saved");
+            return None;
+        }
+        match secrets::set(&id, &password) {
+            Ok(()) => None,
+            Err(e) => {
+                warn!(error = %e, "password not saved");
+                Some(format!(
+                    "Signed in, but the password could not be saved in the keychain, so you will be asked for it next time. ({e})"
+                ))
             }
-            _ => {}
         }
     }
 }
@@ -396,15 +581,27 @@ fn to_json(event: SessionEvent) -> Option<serde_json::Value> {
 
 #[tauri::command]
 fn send_input(state: State<'_, AppState>, session_id: String, input: SessionInput) {
-    if let Some(sender) = lock(&state.sessions).get(&session_id) {
-        let _ = sender.send(input);
+    let sessions = lock(&state.sessions);
+    let Some(session) = sessions.get(&session_id) else {
+        return;
+    };
+    if let SessionInput::Clipboard { text } = &input {
+        if !session.share_clipboard {
+            debug!(bytes = text.len(), "clipboard sharing is off; local clipboard not sent");
+            return;
+        }
+        if text.len() > MAX_CLIPBOARD_BYTES {
+            warn!(bytes = text.len(), limit = MAX_CLIPBOARD_BYTES, "local clipboard text too large; not sent");
+            return;
+        }
     }
+    let _ = session.input.send(input);
 }
 
 #[tauri::command]
 fn disconnect(state: State<'_, AppState>, session_id: String) {
-    if let Some(sender) = lock(&state.sessions).get(&session_id) {
-        let _ = sender.send(SessionInput::Close);
+    if let Some(session) = lock(&state.sessions).get(&session_id) {
+        let _ = session.input.send(SessionInput::Close);
     }
 }
 
@@ -435,13 +632,14 @@ fn log_text(state: State<'_, AppState>) -> String {
 
 #[tauri::command]
 fn reveal_log(state: State<'_, AppState>) -> Result<(), UiError> {
+    // A plain function of the opener crate: it needs no plugin registered (the web UI does not use
+    // the opener plugin's commands).
     tauri_plugin_opener::reveal_item_in_dir(&state.log_path).map_err(|e| UiError::other(e.to_string()))
 }
 
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
-        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let log_dir = app.path().app_log_dir()?;
             let log_path = logging::init(&log_dir);
@@ -514,6 +712,7 @@ mod tests {
             (ErrorKind::AuthFailed, "auth_failed"),
             (ErrorKind::Unsupported, "unsupported"),
             (ErrorKind::Security, "security"),
+            (ErrorKind::IdentityChanged, "identity_changed"),
             (ErrorKind::Protocol, "protocol"),
             (ErrorKind::Disconnected, "disconnected"),
             (ErrorKind::Other, "other"),
@@ -539,5 +738,164 @@ mod tests {
         serde_json::from_str::<SessionInput>(r#"{"type":"wheel","dx":0,"dy":-1.5,"x":1,"y":2}"#).unwrap();
         serde_json::from_str::<SessionInput>(r#"{"type":"resize","width":1280,"height":800}"#).unwrap();
         serde_json::from_str::<SessionInput>(r#"{"type":"clipboard","text":"hi"}"#).unwrap();
+    }
+
+    fn conn(id: &str) -> Connection {
+        Connection {
+            id: id.into(),
+            name: "Office PC".into(),
+            protocol: Protocol::Rdp,
+            host: "10.0.0.5".into(),
+            port: 3389,
+            username: "sam".into(),
+            domain: String::new(),
+            nla: true,
+            ssh_tunnel: true,
+            ssh_port: 22,
+            pinned_identity: Some("aa".repeat(32)),
+            share_clipboard: true,
+        }
+    }
+
+    #[test]
+    fn saving_a_renamed_connection_keeps_its_pin_and_password() {
+        let existing = conn("a");
+        let incoming = Connection { name: "Renamed".into(), pinned_identity: None, share_clipboard: false, ..existing.clone() };
+        let decision = decide_save(Some(&existing), &incoming);
+        assert_eq!(decision, SaveDecision { pinned_identity: existing.pinned_identity.clone(), clear_password: false });
+    }
+
+    #[test]
+    fn a_new_target_drops_the_pin_and_the_saved_password() {
+        let existing = conn("a");
+        for incoming in [
+            Connection { host: "10.0.0.6".into(), ..existing.clone() },
+            Connection { port: 3390, ..existing.clone() },
+            Connection { protocol: Protocol::Vnc, ..existing.clone() },
+            Connection { ssh_tunnel: false, ..existing.clone() },
+            Connection { ssh_port: 2222, ..existing.clone() },
+        ] {
+            let decision = decide_save(Some(&existing), &incoming);
+            assert_eq!(decision, SaveDecision { pinned_identity: None, clear_password: true }, "{incoming:?}");
+        }
+    }
+
+    #[test]
+    fn a_new_account_drops_the_saved_password_but_keeps_the_pin() {
+        let existing = conn("a");
+        for incoming in [
+            Connection { username: "admin".into(), ..existing.clone() },
+            Connection { domain: "CORP".into(), ..existing.clone() },
+        ] {
+            let decision = decide_save(Some(&existing), &incoming);
+            assert_eq!(decision.pinned_identity, existing.pinned_identity);
+            assert!(decision.clear_password, "{incoming:?}");
+        }
+    }
+
+    #[test]
+    fn the_callers_pin_is_never_kept() {
+        // A brand-new connection.
+        let incoming = Connection { id: String::new(), ..conn("") };
+        assert_eq!(decide_save(None, &incoming), SaveDecision { pinned_identity: None, clear_password: false });
+        // An id that does not exist: no pin from the caller, and no stale password under that id.
+        let unknown = conn("not-saved");
+        assert_eq!(decide_save(None, &unknown), SaveDecision { pinned_identity: None, clear_password: true });
+        // An existing connection: the stored pin wins over whatever the caller sent.
+        let existing = Connection { pinned_identity: None, ..conn("a") };
+        let incoming = Connection { pinned_identity: Some("bb".repeat(32)), ..existing.clone() };
+        assert_eq!(decide_save(Some(&existing), &incoming).pinned_identity, None);
+    }
+
+    #[test]
+    fn trusting_a_new_identity_needs_a_typed_password() {
+        let saved = || Some("saved".to_owned());
+        assert_eq!(choose_password(None, false, saved).unwrap(), "saved");
+        assert_eq!(choose_password(Some("typed".into()), false, saved).unwrap(), "typed");
+        assert_eq!(choose_password(Some("typed".into()), true, saved).unwrap(), "typed");
+        let error = choose_password(None, true, || panic!("the keychain must not be read")).unwrap_err();
+        assert_eq!(error.kind, "password_required");
+        let error = choose_password(Some(String::new()), true, || panic!("the keychain must not be read")).unwrap_err();
+        assert_eq!(error.kind, "password_required");
+        assert_eq!(choose_password(None, false, || None).unwrap_err().kind, "password_required");
+    }
+
+    #[test]
+    fn the_identity_is_pinned_only_for_the_same_target() {
+        let first = Connection { pinned_identity: None, ..conn("a") };
+        let seen = "cc".repeat(32);
+        // First connection: pin what was seen.
+        assert_eq!(pin_after_sign_in(Some(&first), &first, Some(&seen), false), Some(seen.clone()));
+        // Nothing seen (VNC without a tunnel), or the connection was deleted: nothing to pin.
+        assert_eq!(pin_after_sign_in(Some(&first), &first, None, false), None);
+        assert_eq!(pin_after_sign_in(None, &first, Some(&seen), false), None);
+        // Edited to another host while signing in: the old host's identity is not pinned.
+        let edited = Connection { host: "elsewhere".into(), ..first.clone() };
+        assert_eq!(pin_after_sign_in(Some(&edited), &first, Some(&seen), false), None);
+        assert_eq!(pin_after_sign_in(Some(&edited), &first, Some(&seen), true), None);
+        // A matching pin needs no write; a different one is replaced only when trusting.
+        let pinned = conn("a");
+        let same = pinned.pinned_identity.clone().unwrap();
+        assert_eq!(pin_after_sign_in(Some(&pinned), &pinned, Some(&same.to_uppercase()), false), None);
+        assert_eq!(pin_after_sign_in(Some(&pinned), &pinned, Some(&seen), false), None);
+        assert_eq!(pin_after_sign_in(Some(&pinned), &pinned, Some(&seen), true), Some(seen.clone()));
+        // A rename while signing in does not matter.
+        let renamed = Connection { name: "New name".into(), ..first.clone() };
+        assert_eq!(pin_after_sign_in(Some(&renamed), &first, Some(&seen), false), Some(seen));
+    }
+
+    #[test]
+    fn a_typed_password_is_saved_only_for_the_same_target_and_account() {
+        let target = conn("a");
+        assert!(may_save_password(Some(&target), &target));
+        assert!(!may_save_password(None, &target));
+        assert!(!may_save_password(Some(&Connection { host: "elsewhere".into(), ..target.clone() }), &target));
+        assert!(!may_save_password(Some(&Connection { username: "other".into(), ..target.clone() }), &target));
+    }
+
+    #[test]
+    fn identity_changes_carry_both_fingerprints_to_the_ui() {
+        let error = SessionError::identity_changed(
+            rc_types::IdentityKind::SshHostKey,
+            "AA".repeat(32),
+            "bb".repeat(32),
+            "changed",
+        );
+        let json = serde_json::to_value(UiError::from(&error)).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "kind": "identity_changed",
+                "detail": "changed",
+                "identity": {
+                    "identity_kind": "ssh_host_key",
+                    "expected_sha256": "aa".repeat(32),
+                    "received_sha256": "bb".repeat(32),
+                },
+            })
+        );
+        // Errors from older backends (no identity field) still deserialize.
+        let old: SessionError = serde_json::from_str(r#"{"kind":"security","detail":"x"}"#).unwrap();
+        assert!(old.identity.is_none());
+    }
+
+    #[test]
+    fn connect_args_never_show_the_password() {
+        let args: ConnectArgs = serde_json::from_str(
+            r#"{"id":"a","password":"hunter2","save_password":true,"width":800,"height":600,
+                "scale_factor":100,"trust_new_identity":false}"#,
+        )
+        .unwrap();
+        assert!(args.new_identity.is_none());
+        let text = format!("{args:?}");
+        assert!(!text.contains("hunter2"), "{text}");
+        assert!(text.contains("<redacted>"), "{text}");
+    }
+
+    #[test]
+    fn saved_connections_tell_the_ui_about_a_cleared_password() {
+        let json = serde_json::to_value(SavedConnection { connection: conn("a"), password_cleared: true }).unwrap();
+        assert_eq!(json["password_cleared"], true);
+        assert_eq!(json["connection"]["share_clipboard"], true);
     }
 }

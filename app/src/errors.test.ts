@@ -32,8 +32,14 @@ describe("describeError", () => {
   });
 
   it("explains a changed identity", () => {
-    const text = describeError({ kind: "security", detail: "" }, mac);
+    const text = describeError({ kind: "identity_changed", detail: "" }, mac);
     expect(text.headline).toBe("The identity of studio-mac has changed");
+  });
+
+  it("does not call other TLS failures an identity change", () => {
+    const text = describeError({ kind: "security", detail: "TLS handshake failed" }, windows);
+    expect(text.headline).toBe("Couldn't set up a secure connection to office-pc");
+    expect(text.hints.join(" ")).not.toContain("identity");
   });
 
   it("has a headline and at least one hint for every kind", () => {
@@ -43,6 +49,7 @@ describe("describeError", () => {
       "auth_failed",
       "unsupported",
       "security",
+      "identity_changed",
       "protocol",
       "disconnected",
       "other",
@@ -76,6 +83,15 @@ describe("toSessionError", () => {
     expect(toSessionError({ kind: "password_required", detail: "none saved" })).toEqual({
       kind: "password_required",
       detail: "none saved",
+    });
+  });
+
+  it("keeps the fingerprints of an identity change, and only well-formed ones", () => {
+    const identity = { identity_kind: "tls_certificate", expected_sha256: "aa", received_sha256: "bb" };
+    expect(toSessionError({ kind: "identity_changed", detail: "d", identity })).toEqual({ kind: "identity_changed", detail: "d", identity });
+    expect(toSessionError({ kind: "identity_changed", detail: "d", identity: { identity_kind: "x" } })).toEqual({
+      kind: "identity_changed",
+      detail: "d",
     });
   });
 

@@ -1,8 +1,12 @@
 //! Saved connections, kept as JSON in the app's config directory. No secrets live here.
 
+use std::fs::OpenOptions;
+use std::io::Write as _;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+
+use crate::private_fs;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -30,6 +34,27 @@ pub struct Connection {
     pub ssh_port: u16,
     #[serde(default)]
     pub pinned_identity: Option<String>,
+    /// Pass clipboard text both ways during a session. Connections saved before this setting
+    /// existed keep sharing.
+    #[serde(default = "yes")]
+    pub share_clipboard: bool,
+}
+
+impl Connection {
+    /// Whether both point at the same machine and service: the pinned identity belongs to that,
+    /// and so does a saved password. Kept in step with `pinnedIdentityAfterEdit` in app/src/state.ts.
+    pub fn same_target(&self, other: &Connection) -> bool {
+        self.protocol == other.protocol
+            && self.host.eq_ignore_ascii_case(&other.host)
+            && self.port == other.port
+            && self.ssh_tunnel == other.ssh_tunnel
+            && (!self.ssh_tunnel || self.ssh_port == other.ssh_port)
+    }
+
+    /// Whether both sign in as the same account (a saved password belongs to it).
+    pub fn same_account(&self, other: &Connection) -> bool {
+        self.username == other.username && self.domain.eq_ignore_ascii_case(&other.domain)
+    }
 }
 
 fn yes() -> bool {
@@ -96,11 +121,13 @@ impl Store {
     fn save(&self) -> Result<(), String> {
         let json = serde_json::to_vec_pretty(&self.connections).map_err(|e| e.to_string())?;
         if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+            private_fs::create_dir(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
         }
         // Write then rename so a crash never leaves a half-written file.
         let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, json).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+        private_fs::open(OpenOptions::new().write(true).create(true).truncate(true), &tmp)
+            .and_then(|mut file| file.write_all(&json).and_then(|()| file.sync_all()))
+            .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
         std::fs::rename(&tmp, &self.path).map_err(|e| format!("cannot replace {}: {e}", self.path.display()))
     }
 }
@@ -122,6 +149,7 @@ mod tests {
             ssh_tunnel: true,
             ssh_port: 22,
             pinned_identity: None,
+            share_clipboard: true,
         }
     }
 
@@ -138,6 +166,14 @@ mod tests {
         store.set_pin("a", Some("abc".into())).unwrap();
         store.remove("b").unwrap();
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&path), 0o600, "connections.json is private");
+            assert_eq!(mode(&dir), 0o700, "its directory is private");
+        }
+
         let reloaded = Store::load(path);
         assert_eq!(reloaded.list().len(), 1);
         assert_eq!(reloaded.get("a").unwrap().pinned_identity.as_deref(), Some("abc"));
@@ -148,7 +184,27 @@ mod tests {
     fn old_files_without_new_fields_still_load() {
         let json = r#"[{"id":"x","name":"Mac","protocol":"vnc","host":"mac.local","port":5900}]"#;
         let list: Vec<Connection> = serde_json::from_str(json).unwrap();
-        assert!(list[0].ssh_tunnel && list[0].nla);
+        assert!(list[0].ssh_tunnel && list[0].nla && list[0].share_clipboard);
         assert_eq!(list[0].ssh_port, 22);
+    }
+
+    #[test]
+    fn target_and_account_comparisons() {
+        let a = sample("a");
+        assert!(a.same_target(&Connection { host: "10.0.0.5".into(), name: "x".into(), ..a.clone() }));
+        assert!(!a.same_target(&Connection { host: "PC.local".into(), ..a.clone() }));
+        let named = Connection { host: "pc.LOCAL".into(), ..a.clone() };
+        assert!(named.same_target(&Connection { host: "PC.local".into(), ..a.clone() }));
+        assert!(!a.same_target(&Connection { port: 3390, ..a.clone() }));
+        assert!(!a.same_target(&Connection { protocol: Protocol::Vnc, ..a.clone() }));
+        assert!(!a.same_target(&Connection { ssh_tunnel: false, ..a.clone() }));
+        assert!(!a.same_target(&Connection { ssh_port: 2222, ..a.clone() }));
+        // The SSH port only matters while the tunnel is on.
+        let direct = Connection { ssh_tunnel: false, ..a.clone() };
+        assert!(direct.same_target(&Connection { ssh_port: 2222, ..direct.clone() }));
+
+        assert!(a.same_account(&Connection { name: "y".into(), ..a.clone() }));
+        assert!(!a.same_account(&Connection { username: "other".into(), ..a.clone() }));
+        assert!(!a.same_account(&Connection { domain: "CORP".into(), ..a.clone() }));
     }
 }

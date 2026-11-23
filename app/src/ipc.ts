@@ -21,8 +21,20 @@ export interface Connection {
   ssh_tunnel: boolean;
   /** VNC only: SSH port. Default 22. */
   ssh_port: number;
-  /** SHA-256 of the server identity pinned on first connect (TLS certificate or SSH host key). */
+  /**
+   * SHA-256 (lowercase hex) of the server identity pinned after the first successful sign-in
+   * (TLS certificate or SSH host key). The backend ignores what the UI sends here.
+   */
   pinned_identity: string | null;
+  /** Pass clipboard text both ways during a session. Default true. */
+  share_clipboard: boolean;
+}
+
+/** What save_connection resolves with. */
+export interface SavedConnection {
+  connection: Connection;
+  /** The saved password was removed because the address or the account changed. */
+  password_cleared: boolean;
 }
 
 export type ErrorKind =
@@ -34,16 +46,31 @@ export type ErrorKind =
   | "tunnel_unavailable"
   | "auth_failed"
   | "unsupported"
+  /** A TLS or certificate problem other than a changed identity. No way to override it. */
   | "security"
+  /** The pinned identity no longer matches; `SessionError.identity` has both fingerprints. */
+  | "identity_changed"
   | "protocol"
   | "disconnected"
   | "other"
   /** No password was supplied and none is saved: ask the user, then call connect again. */
   | "password_required";
 
+export type IdentityKind = "tls_certificate" | "ssh_host_key";
+
+export interface IdentityMismatch {
+  identity_kind: IdentityKind;
+  /** Lowercase hex SHA-256: the pinned identity. */
+  expected_sha256: string;
+  /** Lowercase hex SHA-256: what the server presented this time. */
+  received_sha256: string;
+}
+
 export interface SessionError {
   kind: ErrorKind;
   detail: string;
+  /** Only with kind "identity_changed". */
+  identity?: IdentityMismatch;
 }
 
 /** JSON events delivered on the session channel. Frames arrive separately as ArrayBuffers. */
@@ -56,6 +83,8 @@ export type SessionEvent =
   | { type: "cursor"; kind: "bitmap"; width: number; height: number; hot_x: number; hot_y: number; rgba_base64: string }
   | { type: "clipboard"; text: string }
   | { type: "bell" }
+  /** Something the user should know that does not end the session (a password that could not be saved). */
+  | { type: "notice"; text: string }
   | { type: "closed"; error: SessionError | null };
 
 /**
@@ -92,8 +121,13 @@ export interface ConnectArgs {
   height: number;
   /** Percent: 100 = 1x, 200 = Retina. */
   scale_factor: number;
-  /** Forget the pinned identity and pin whatever the server presents now. */
+  /**
+   * Replace the pinned identity with `new_identity` once the sign-in succeeds. Requires a typed
+   * `password`: the saved one is never used (rejects with "password_required" otherwise).
+   */
   trust_new_identity: boolean;
+  /** With trust_new_identity: the fingerprint the user reviewed; only that identity is accepted. */
+  new_identity: string | null;
 }
 
 export interface AppInfo {
@@ -107,7 +141,7 @@ export type ChannelMessage = SessionEvent | ArrayBuffer;
 
 export const api = {
   listConnections: () => invoke<Connection[]>("list_connections"),
-  saveConnection: (connection: Connection) => invoke<Connection>("save_connection", { connection }),
+  saveConnection: (connection: Connection) => invoke<SavedConnection>("save_connection", { connection }),
   deleteConnection: (id: string) => invoke<void>("delete_connection", { id }),
   hasSavedPassword: (id: string) => invoke<boolean>("has_saved_password", { id }),
   forgetPassword: (id: string) => invoke<void>("forget_password", { id }),

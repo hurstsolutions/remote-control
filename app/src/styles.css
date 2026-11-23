@@ -799,3 +799,56 @@ body.fullscreen .session-top:focus-within {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   white-space: pre-wrap;
 }
+
+/* ---- server identity (fingerprints and how to check them) ---- */
+
+.identity {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.identity-label {
+  font-size: 11px;
+  font-weight: 600;
+  opacity: 0.75;
+  margin-top: 4px;
+}
+
+.identity-value,
+.identity-command {
+  display: block;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  padding: 5px 8px;
+  border-radius: var(--radius);
+  background: rgba(127, 127, 127, 0.14);
+  border: 1px solid rgba(127, 127, 127, 0.3);
+}
+
+.identity-step {
+  font-size: 12px;
+  opacity: 0.85;
+}
+
+.toolbar-identity {
+  flex: none;
+  font-size: 12px;
+}
+
+.session-notice {
+  position: absolute;
+  z-index: 3;
+  left: 50%;
+  bottom: 14px;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: 90%;
+  padding: 6px 8px 6px 12px;
+  border-radius: var(--radius);
+  background: var(--warn-bg);
+  color: var(--warn-text);
+}

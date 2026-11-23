@@ -2,9 +2,9 @@
 import { openDialog } from "../dialog";
 import { button, h } from "../dom";
 import { messageOf } from "../errors";
-import type { Connection, Protocol } from "../ipc";
+import type { Connection, Protocol, SavedConnection } from "../ipc";
 import type { Platform } from "../platform";
-import { DEFAULT_PORT, DEFAULT_SSH_PORT, blankConnection, pinnedIdentityAfterEdit } from "../state";
+import { DEFAULT_PORT, DEFAULT_SSH_PORT, blankConnection, passwordClearedByEdit, pinnedIdentityAfterEdit } from "../state";
 import { parsePort, validateEditor, type EditorField } from "./editor-logic";
 
 let fieldCounter = 0;
@@ -49,11 +49,14 @@ function checkbox(label: string, checked: boolean): { row: HTMLElement; input: H
   return { row: h("label", { class: "check" }, input, h("span", { text: label })), input };
 }
 
+/** Shown after saving when the backend removed the saved password. */
+export const PASSWORD_CLEARED_NOTE = "Saved password was cleared because the address/user changed.";
+
 /**
- * Open the editor. `existing` is null when adding. Resolves with the saved connection, or null
- * when cancelled.
+ * Open the editor. `existing` is null when adding. Resolves with what save_connection returned
+ * (check `password_cleared`), or null when cancelled.
  */
-export async function openEditor(platform: Platform, existing: Connection | null): Promise<Connection | null> {
+export async function openEditor(platform: Platform, existing: Connection | null): Promise<SavedConnection | null> {
   const api = platform.api;
   const start = existing ?? blankConnection("rdp");
   let hasSavedPassword = false;
@@ -85,6 +88,16 @@ export async function openEditor(platform: Platform, existing: Connection | null
   const nla = checkbox("Network Level Authentication", start.nla);
   const tunnel = checkbox("Secure with SSH tunnel (recommended)", start.ssh_tunnel);
   const sshPort = textField("SSH port", String(start.ssh_port || DEFAULT_SSH_PORT), { narrow: true });
+  const shareClipboard = checkbox("Share clipboard with this computer", start.share_clipboard);
+  const clipboardRow = h(
+    "div",
+    { class: "form-group" },
+    shareClipboard.row,
+    h("p", {
+      class: "field-hint",
+      text: "Text you copy here can be pasted there, and the other way round, while connected. Turn off for computers you do not fully trust.",
+    }),
+  );
 
   const windowsOnly = h(
     "div",
@@ -108,12 +121,17 @@ export async function openEditor(platform: Platform, existing: Connection | null
   saveError.hidden = true;
 
   let forgetRow: HTMLElement | null = null;
+  // Warns before saving that the saved password will go (the backend removes it).
+  const clearWarning = h("p", { class: "notice notice-warn", attrs: { role: "status", id: "password-clear-warning" } });
+  clearWarning.hidden = true;
   if (existing && hasSavedPassword) {
     const status = h("span", { class: "muted", text: "A password is saved in the keychain." });
     const forget = button("Forget saved password", () => {
       forget.disabled = true;
       api.forgetPassword(existing.id).then(
         () => {
+          hasSavedPassword = false;
+          updateClearWarning();
           forget.remove();
           status.textContent = "The saved password was removed. You will be asked for it next time.";
         },
@@ -133,6 +151,30 @@ export async function openEditor(platform: Platform, existing: Connection | null
   });
 
   const protocol = (): Protocol => (type.value === "vnc" ? "vnc" : "rdp");
+  const draftOf = (): Connection => {
+    const mac = protocol() === "vnc";
+    return {
+      id: existing?.id ?? "",
+      name: name.input.value.trim(),
+      protocol: protocol(),
+      host: host.input.value.trim(),
+      port: parsePort(port.input.value) ?? DEFAULT_PORT[protocol()],
+      username: username.input.value.trim(),
+      domain: mac ? "" : domain.input.value.trim(),
+      nla: mac ? true : nla.input.checked,
+      ssh_tunnel: mac ? tunnel.input.checked : true,
+      ssh_port: mac && tunnel.input.checked ? (parsePort(sshPort.input.value) ?? DEFAULT_SSH_PORT) : DEFAULT_SSH_PORT,
+      pinned_identity: null,
+      share_clipboard: shareClipboard.input.checked,
+    };
+  };
+  function updateClearWarning(): void {
+    const clears = hasSavedPassword && passwordClearedByEdit(existing, draftOf());
+    clearWarning.hidden = !clears;
+    clearWarning.textContent = clears
+      ? "The address or username changed: saving removes the saved password, and you will be asked for it on the next connect."
+      : "";
+  }
   const sync = () => {
     const mac = protocol() === "vnc";
     windowsOnly.hidden = mac;
@@ -149,6 +191,10 @@ export async function openEditor(platform: Platform, existing: Connection | null
   });
   tunnel.input.addEventListener("change", sync);
   sync();
+  for (const element of [type, host.input, port.input, username.input, domain.input, tunnel.input, sshPort.input]) {
+    element.addEventListener("input", updateClearWarning);
+    element.addEventListener("change", updateClearWarning);
+  }
 
   const fields: Record<EditorField, Field> = { name, host, port, username, sshPort };
   const order: EditorField[] = ["name", "host", "port", "username", "sshPort"];
@@ -162,11 +208,13 @@ export async function openEditor(platform: Platform, existing: Connection | null
     username.row,
     windowsOnly,
     macOnly,
+    clipboardRow,
     forgetRow,
+    clearWarning,
     saveError,
   );
 
-  return openDialog<Connection>({
+  return openDialog<SavedConnection>({
     title: existing ? "Edit connection" : "Add connection",
     body,
     submitLabel: existing ? "Save" : "Add",
@@ -194,20 +242,7 @@ export async function openEditor(platform: Platform, existing: Connection | null
         firstInvalid.focus();
         return undefined;
       }
-      const mac = protocol() === "vnc";
-      const draft: Connection = {
-        id: existing?.id ?? "",
-        name: name.input.value.trim(),
-        protocol: protocol(),
-        host: host.input.value.trim(),
-        port: parsePort(port.input.value) ?? DEFAULT_PORT[protocol()],
-        username: username.input.value.trim(),
-        domain: mac ? "" : domain.input.value.trim(),
-        nla: mac ? true : nla.input.checked,
-        ssh_tunnel: mac ? tunnel.input.checked : true,
-        ssh_port: mac && tunnel.input.checked ? (parsePort(sshPort.input.value) ?? DEFAULT_SSH_PORT) : DEFAULT_SSH_PORT,
-        pinned_identity: null,
-      };
+      const draft = draftOf();
       draft.pinned_identity = pinnedIdentityAfterEdit(existing, draft);
       try {
         return await api.saveConnection(draft);

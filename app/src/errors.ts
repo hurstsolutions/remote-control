@@ -1,5 +1,5 @@
 // Plain-language text for session errors. Pure: no DOM.
-import type { Connection, ErrorKind, SessionError } from "./ipc";
+import type { Connection, ErrorKind, IdentityMismatch, SessionError } from "./ipc";
 
 export interface ErrorText {
   headline: string;
@@ -14,6 +14,7 @@ const KINDS: readonly ErrorKind[] = [
   "auth_failed",
   "unsupported",
   "security",
+  "identity_changed",
   "protocol",
   "disconnected",
   "other",
@@ -59,12 +60,23 @@ export function describeError(error: SessionError, target: Target): ErrorText {
             : "Use the short account name and password of a user on the Mac who is allowed to use Screen Sharing.",
         ],
       };
-    case "security":
+    case "identity_changed":
       return {
         headline: `The identity of ${host} has changed`,
         hints: [
-          "This computer is presenting a different identity from the one saved the first time you connected.",
+          "This computer is presenting a different identity from the one saved the first time you connected. Your password was not sent.",
           "That is expected after it was reinstalled, replaced or had its certificate renewed. If none of that happened, someone could be intercepting the connection: do not continue.",
+          "Before trusting it, compare the new identity below with the one shown on the computer itself.",
+        ],
+      };
+    case "security":
+      return {
+        headline: `Couldn't set up a secure connection to ${host}`,
+        hints: [
+          windows
+            ? "The encrypted (TLS) connection to the PC failed, or the PC's certificate could not be used. Your password was not sent."
+            : "The secure connection to the Mac failed. Your password was not sent.",
+          "Reconnecting may help if the network was interrupted. If it keeps happening, copy the log and send it along.",
         ],
       };
     case "unsupported":
@@ -113,7 +125,10 @@ export function toSessionError(value: unknown): SessionError {
     const kind = record["kind"];
     if (typeof kind === "string" && (KINDS as readonly string[]).includes(kind)) {
       const detail = record["detail"];
-      return { kind: kind as ErrorKind, detail: typeof detail === "string" ? detail : "" };
+      const error: SessionError = { kind: kind as ErrorKind, detail: typeof detail === "string" ? detail : "" };
+      const identity = identityOf(record["identity"]);
+      if (identity) error.identity = identity;
+      return error;
     }
     if (value instanceof Error) return { kind: "other", detail: value.message };
     try {
@@ -123,6 +138,18 @@ export function toSessionError(value: unknown): SessionError {
     }
   }
   return { kind: "other", detail: value === undefined || value === null ? "" : String(value) };
+}
+
+function identityOf(value: unknown): IdentityMismatch | null {
+  if (typeof value !== "object" || value === null) return null;
+  const r = value as Record<string, unknown>;
+  const kind = r["identity_kind"];
+  const expected = r["expected_sha256"];
+  const received = r["received_sha256"];
+  if ((kind !== "tls_certificate" && kind !== "ssh_host_key") || typeof expected !== "string" || typeof received !== "string") {
+    return null;
+  }
+  return { identity_kind: kind, expected_sha256: expected, received_sha256: received };
 }
 
 /** A short message for a failed non-session call (saving, deleting, log actions). */

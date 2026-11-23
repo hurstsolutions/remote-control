@@ -6,7 +6,7 @@ import type { Connection } from "../ipc";
 import { copyLogButton, showLogFileButton } from "../logs";
 import type { Platform } from "../platform";
 import { hostLabel, protocolLabel, type ConnectionStore } from "../state";
-import { openEditor } from "./editor";
+import { PASSWORD_CLEARED_NOTE, openEditor } from "./editor";
 
 export interface HomeHost {
   platform: Platform;
@@ -20,12 +20,15 @@ export class HomeView {
   readonly element: HTMLElement;
   private readonly list: HTMLElement;
   private readonly problem: HTMLElement;
+  private readonly info: HTMLElement;
   private readonly version: HTMLElement;
 
   constructor(private readonly host: HomeHost) {
     this.list = h("div", { class: "connection-list", attrs: { role: "list" } });
     this.problem = h("p", { class: "notice notice-error", attrs: { role: "alert" } });
     this.problem.hidden = true;
+    this.info = h("p", { class: "notice notice-warn", attrs: { role: "status", id: "home-info" } });
+    this.info.hidden = true;
     this.version = h("span", { class: "muted selectable", text: "RemoteControl" });
     this.element = h(
       "section",
@@ -36,7 +39,7 @@ export class HomeView {
         h("h1", { text: "Connections" }),
         button("Add connection", () => void this.edit(null), { kind: "primary" }),
       ),
-      h("div", { class: "home-body" }, this.problem, this.list),
+      h("div", { class: "home-body" }, this.problem, this.info, this.list),
       h(
         "footer",
         { class: "home-footer" },
@@ -129,7 +132,10 @@ export class HomeView {
       if (!existing) return;
     }
     const saved = await openEditor(this.host.platform, existing);
-    if (saved) await this.host.store.reload();
+    if (!saved) return;
+    this.info.hidden = !saved.password_cleared;
+    this.info.textContent = saved.password_cleared ? `${saved.connection.name}: ${PASSWORD_CLEARED_NOTE}` : "";
+    await this.host.store.reload();
   }
 
   private async remove(connection: Connection): Promise<void> {

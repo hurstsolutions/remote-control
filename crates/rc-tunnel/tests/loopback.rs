@@ -123,12 +123,16 @@ async fn wrong_password_is_auth_failed() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn changed_host_key_is_a_security_error() {
+async fn changed_host_key_is_an_identity_change() {
     let (ssh, echo) = (start_ssh().await, start_echo().await);
     let mut cfg = config(ssh, echo, PASS);
     cfg.pinned_host_key_sha256 = Some("11".repeat(32));
     let error = open(cfg).await.err().expect("must fail");
-    assert_eq!(error.kind, ErrorKind::Security, "{}", error.detail);
+    assert_eq!(error.kind, ErrorKind::IdentityChanged, "{}", error.detail);
+    let identity = error.identity.expect("both fingerprints come with the error");
+    assert_eq!(identity.identity_kind, rc_types::IdentityKind::SshHostKey);
+    assert_eq!(identity.expected_sha256, "11".repeat(32));
+    assert_eq!(identity.received_sha256.len(), 64);
 }
 
 #[tokio::test(flavor = "multi_thread")]

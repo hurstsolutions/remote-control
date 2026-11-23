@@ -28,7 +28,10 @@ use ironrdp_session::image::DecodedImage;
 use ironrdp_session::{fast_path, ActiveStage, ActiveStageBuilder, ActiveStageOutput, SessionError as RdpSessionError};
 use ironrdp_tokio::reqwest::ReqwestNetworkClient;
 use ironrdp_tokio::{single_sequence_step_read, split_tokio_framed, FramedWrite as _, TokioFramed};
-use rc_types::{CursorShape, ErrorKind, MouseButton, SessionError, SessionEvent, SessionInput, SessionIo};
+use rc_types::{
+    CursorShape, ErrorKind, IdentityKind, MouseButton, SessionError, SessionEvent, SessionInput, SessionIo,
+    MAX_CLIPBOARD_BYTES,
+};
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -83,7 +86,9 @@ type Framed = TokioFramed<Box<dyn Stream>>;
 /// `SessionEvent::Closed`.
 pub async fn run(config: RdpConfig, io: SessionIo) {
     let SessionIo { events, mut input } = io;
-    info!(?config, "starting RDP session");
+    // Only the target: the full config (with the username) goes to the debug level.
+    info!(host = %config.host, port = config.port, nla = config.nla, clipboard = config.clipboard, "starting RDP session");
+    debug!(?config, "RDP session config");
     let error = match session(config, events.clone(), &mut input).await {
         Ok(()) => None,
         Err(error) => {
@@ -194,12 +199,14 @@ async fn connect(
     info!(%fingerprint, subject = %cert.tbs_certificate.subject, "server certificate");
     if let Some(pinned) = &config.pinned_cert_sha256 {
         if !pinned.eq_ignore_ascii_case(&fingerprint) {
-            return Err(SessionError::new(
-                ErrorKind::Security,
+            return Err(SessionError::identity_changed(
+                IdentityKind::TlsCertificate,
+                pinned.as_str(),
+                fingerprint.as_str(),
                 format!(
                     "the server's certificate changed (expected {pinned}, got {fingerprint}). \
                      This happens after Windows is reinstalled or the certificate renews, but it can \
-                     also mean another machine is answering at this address."
+                     also mean another machine is answering at this address. No credentials were sent."
                 ),
             ));
         }
@@ -386,6 +393,14 @@ async fn active(
                                 Vec::new()
                             }
                         }
+                    }
+                    SessionInput::Clipboard { text } if !config.clipboard => {
+                        debug!(bytes = text.len(), "clipboard sharing is off; local clipboard not sent");
+                        Vec::new()
+                    }
+                    SessionInput::Clipboard { text } if text.len() > MAX_CLIPBOARD_BYTES => {
+                        warn!(bytes = text.len(), limit = MAX_CLIPBOARD_BYTES, "local clipboard text too large; not sent");
+                        Vec::new()
                     }
                     SessionInput::Clipboard { text } => {
                         if let Ok(mut local) = local_text.lock() {

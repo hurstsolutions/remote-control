@@ -14,7 +14,8 @@ export function askPassword(connection: Connection, note: string | null): Promis
     attrs: { type: "password", id: "password-input", autocomplete: "off", "data-autofocus": "" },
   });
   const save = h("input", { attrs: { type: "checkbox", id: "password-save" } });
-  save.checked = true;
+  // Off unless the user asks: a saved password is used without asking next time.
+  save.checked = false;
   const error = h("p", { class: "field-error", attrs: { role: "alert" } });
   error.hidden = true;
   const who = connection.username ? `${connection.username} on ${connection.host}` : connection.host;

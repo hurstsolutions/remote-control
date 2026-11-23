@@ -6,6 +6,10 @@
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
+/// Clipboard text larger than this many bytes (UTF-8) is not passed between the machines, in
+/// either direction: it would stall the session, and nobody means to paste a megabyte.
+pub const MAX_CLIPBOARD_BYTES: usize = 1_000_000;
+
 /// Sent from a backend to the front end.
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
@@ -45,6 +49,28 @@ pub enum CursorShape {
 pub struct SessionError {
     pub kind: ErrorKind,
     pub detail: String,
+    /// Set only with [`ErrorKind::IdentityChanged`]: what was pinned and what was presented.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<IdentityMismatch>,
+}
+
+/// Which kind of server identity a fingerprint belongs to. They are verified in different places
+/// on the remote machine, so the UI explains each one differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityKind {
+    /// SHA-256 of the RDP server's TLS certificate (DER).
+    TlsCertificate,
+    /// SHA-256 of the SSH host key blob, as `ssh-keygen -l` hashes it.
+    SshHostKey,
+}
+
+/// A pinned identity that no longer matches. Both fingerprints are lowercase hex SHA-256.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityMismatch {
+    pub identity_kind: IdentityKind,
+    pub expected_sha256: String,
+    pub received_sha256: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,8 +86,12 @@ pub enum ErrorKind {
     AuthFailed,
     /// The server offered no security/auth method this client supports.
     Unsupported,
-    /// TLS / certificate / SSH host key problem.
+    /// TLS / certificate / SSH host key problem other than a changed identity (a failed handshake,
+    /// a certificate that cannot be used).
     Security,
+    /// The server presented a different identity (TLS certificate or SSH host key) from the pinned
+    /// one. Always comes with [`SessionError::identity`]. Nothing secret was sent.
+    IdentityChanged,
     /// The server sent something the client could not parse.
     Protocol,
     /// The connection dropped mid-session.
@@ -71,7 +101,25 @@ pub enum ErrorKind {
 
 impl SessionError {
     pub fn new(kind: ErrorKind, detail: impl Into<String>) -> Self {
-        Self { kind, detail: detail.into() }
+        Self { kind, detail: detail.into(), identity: None }
+    }
+
+    /// A pinned identity mismatch: kind [`ErrorKind::IdentityChanged`] with both fingerprints.
+    pub fn identity_changed(
+        identity_kind: IdentityKind,
+        expected_sha256: impl Into<String>,
+        received_sha256: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: ErrorKind::IdentityChanged,
+            detail: detail.into(),
+            identity: Some(IdentityMismatch {
+                identity_kind,
+                expected_sha256: expected_sha256.into().to_ascii_lowercase(),
+                received_sha256: received_sha256.into().to_ascii_lowercase(),
+            }),
+        }
     }
 }
 

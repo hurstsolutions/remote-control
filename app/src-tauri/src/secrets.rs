@@ -23,8 +23,13 @@ pub fn set(id: &str, password: &str) -> Result<(), String> {
         .map_err(|e| format!("cannot save the password in the keychain: {e}"))
 }
 
-pub fn delete(id: &str) {
-    if let Ok(entry) = entry(id) {
-        let _ = entry.delete_credential();
+/// Remove the saved password. Returns whether one was there and is now gone.
+pub fn delete(id: &str) -> bool {
+    match entry(id).and_then(|e| e.delete_credential().map_err(|e| e.to_string())) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::debug!(%error, "no saved password removed");
+            false
+        }
     }
 }

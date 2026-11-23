@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rc_types::{ErrorKind, SessionError};
+use rc_types::{ErrorKind, IdentityKind, SessionError};
 use russh::client::{self, AuthResult, KeyboardInteractiveAuthResponse};
 use russh::keys::ssh_key::{HashAlg, PublicKey};
 use russh::{ChannelStream, Disconnect, MethodKind};
@@ -25,7 +25,8 @@ pub struct TunnelConfig {
     /// Where the SSH server should connect to, from its own point of view.
     pub target_host: String,
     pub target_port: u16,
-    /// Expected SHA-256 (lowercase hex) of the SSH host key. `None` = first connection.
+    /// Expected SHA-256 (lowercase hex) of the SSH host key. `None` = first connection. This is the
+    /// same digest `ssh-keygen -lf <key>.pub` prints, which shows it as unpadded base64.
     pub pinned_host_key_sha256: Option<String>,
 }
 
@@ -107,12 +108,14 @@ pub async fn open(config: TunnelConfig) -> Result<Tunnel, SessionError> {
             // A rejected host key surfaces as a generic key-exchange error; tell the two apart.
             if let (Some(pinned), Some(got)) = (&config.pinned_host_key_sha256, &host_key) {
                 if !pinned.eq_ignore_ascii_case(got) {
-                    return Err(SessionError::new(
-                        ErrorKind::Security,
+                    return Err(SessionError::identity_changed(
+                        IdentityKind::SshHostKey,
+                        pinned.as_str(),
+                        got.as_str(),
                         format!(
                             "the Mac's SSH host key changed (expected {pinned}, got {got}). This happens \
                              after macOS is reinstalled, but it can also mean another machine is answering \
-                             at this address."
+                             at this address. No password was sent."
                         ),
                     ));
                 }

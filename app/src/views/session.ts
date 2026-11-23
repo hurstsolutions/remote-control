@@ -1,8 +1,9 @@
 // One session tab: the connect flow, the toolbar, the remote screen and the failure panels.
-import { confirmDialog, isDialogOpen } from "../dialog";
+import { confirmDialog, isDialogOpen, openDialog } from "../dialog";
 import { button, h } from "../dom";
 import { describeError, messageOf, toSessionError } from "../errors";
-import type { ChannelMessage, Connection, SessionError, SessionEvent, SessionInput } from "../ipc";
+import { formatFingerprint, identityCheckSteps, identityKindOf } from "../fingerprint";
+import type { ChannelMessage, Connection, IdentityKind, IdentityMismatch, SessionError, SessionEvent, SessionInput } from "../ipc";
 import { copyLogButton } from "../logs";
 import { isMac, type Platform } from "../platform";
 import { ClipboardSync } from "../remote/clipboard";
@@ -30,12 +31,37 @@ interface ConnectOptions {
   /** null = use the saved password. */
   password: string | null;
   save: boolean;
-  trust: boolean;
+  /** Trust this new identity (lowercase hex SHA-256) in place of the pinned one; needs `password`. */
+  trust: string | null;
+}
+
+const PLAIN: Omit<ConnectOptions, "password" | "save"> = { trust: null };
+
+/** The fingerprints and how to check them on the remote machine. Used in panels and dialogs. */
+export function identityDetails(kind: IdentityKind, rows: { label: string; sha256: string }[]): HTMLElement {
+  const box = h("div", { class: "identity" });
+  for (const row of rows) {
+    box.append(
+      h("div", { class: "identity-label", text: row.label }),
+      h("code", { class: "identity-value selectable", text: formatFingerprint(kind, row.sha256) }),
+    );
+  }
+  box.append(h("div", { class: "identity-label", text: "How to check" }));
+  for (const step of identityCheckSteps(kind)) {
+    box.append(h("p", { class: "identity-step selectable", text: step.text }));
+    if (step.command) box.append(h("code", { class: "identity-command selectable", text: step.command }));
+  }
+  return box;
+}
+
+function identityName(kind: IdentityKind): string {
+  return kind === "tls_certificate" ? "certificate" : "SSH host key";
 }
 
 const RESIZE_DEBOUNCE_MS = 400;
 const FALLBACK_SIZE = { width: 1280, height: 800 };
 const AUTH_NOTE = "The username or password was not accepted. Enter the password again.";
+const TRUST_NOTE = "The computer's identity changed, so the saved password is not used. Type the password to connect and trust the new identity.";
 
 let nextTabId = 1;
 
@@ -57,6 +83,12 @@ export class SessionView {
   private readonly disconnectButton: HTMLButtonElement;
   private readonly cadButton: HTMLButtonElement | null;
   private readonly hint: HTMLElement;
+  private readonly identityButton: HTMLButtonElement;
+  private readonly notice: HTMLElement;
+  /** The identity the server proved in the current attempt, and whether it was not pinned yet. */
+  private seenIdentity: { sha256: string; isNew: boolean } | null = null;
+  /** The identity being trusted by the current attempt, kept for a password retry. */
+  private currentTrust: string | null = null;
 
   /** Bumped for every connect attempt; messages from older attempts are ignored. */
   private attempt = 0;
@@ -83,6 +115,7 @@ export class SessionView {
       host.platform,
       (text) => this.send({ type: "clipboard", text }),
       () => this.state === "connected" && this.sessionId !== null,
+      () => this.connection.share_clipboard,
     );
 
     this.title = h("span", { class: "toolbar-title", text: connection.name });
@@ -106,12 +139,16 @@ export class SessionView {
     this.actualButton = tool("Actual size", () => this.setMode("actual"), "Show the remote screen pixel for pixel");
     this.fullscreenButton = tool("Full screen", () => host.toggleFullscreen());
     this.disconnectButton = button("Disconnect", () => this.disconnect());
+    this.identityButton = button("Identity", () => void this.showIdentity(), { kind: "quiet" });
+    this.identityButton.classList.add("toolbar-identity");
+    this.identityButton.hidden = true;
 
     const toolbar = h(
       "div",
       { class: "toolbar", attrs: { role: "toolbar", "aria-label": "Session" } },
       this.title,
       this.subtitle,
+      this.identityButton,
       h("span", { class: "spacer" }),
       this.cadButton,
       h("div", { class: "segmented", attrs: { role: "group", "aria-label": "Display size" } }, this.fitButton, this.actualButton),
@@ -122,7 +159,9 @@ export class SessionView {
     this.overlay = h("div", { class: "overlay" });
     this.hint = h("div", { class: "hint", text: "Move the pointer to the top edge to show the toolbar." });
     this.hint.hidden = true;
-    this.screen.stage.append(this.overlay, this.hint);
+    this.notice = h("div", { class: "session-notice", attrs: { role: "status" } });
+    this.notice.hidden = true;
+    this.screen.stage.append(this.overlay, this.hint, this.notice);
     this.element = h(
       "section",
       { class: "session", attrs: { "data-protocol": connection.protocol } },
@@ -138,7 +177,7 @@ export class SessionView {
 
   /** Begin the first connection. Call once the view is in the page and visible. */
   begin(): void {
-    void this.start({ password: null, save: false, trust: false });
+    void this.start({ password: null, save: false, ...PLAIN });
   }
 
   /** The tab became the active one. */
@@ -191,6 +230,10 @@ export class SessionView {
     this.title.textContent = this.connection.name;
     this.subtitle.textContent = hostLabel(this.connection);
     this.clipboard.reset();
+    this.seenIdentity = null;
+    this.currentTrust = options.trust;
+    this.identityButton.hidden = true;
+    this.notice.hidden = true;
     this.screen.setCursor({ kind: "default" });
     this.setState("connecting");
     this.showConnecting(`Connecting to ${this.connection.host}...`);
@@ -211,7 +254,8 @@ export class SessionView {
           width: size.width,
           height: size.height,
           scale_factor: Math.round(window.devicePixelRatio * 100),
-          trust_new_identity: options.trust,
+          trust_new_identity: options.trust !== null,
+          new_identity: options.trust,
         },
         (message) => this.onMessage(attempt, message),
       );
@@ -226,7 +270,7 @@ export class SessionView {
       if (attempt !== this.attempt) return;
       const error = toSessionError(raw);
       if (error.kind === "password_required") {
-        await this.promptPassword(options.trust, null, true);
+        await this.promptPassword(options.trust, options.trust ? TRUST_NOTE : null, true);
       } else {
         this.setState("closed");
         this.showError(error);
@@ -238,7 +282,7 @@ export class SessionView {
    * Ask for the password, then connect with it (the saved one is not used). Cancelling leaves
    * a panel to try again from: the current error panel, or a plain one when `replacePanel`.
    */
-  private async promptPassword(trust: boolean, note: string | null, replacePanel: boolean): Promise<void> {
+  private async promptPassword(trust: string | null, note: string | null, replacePanel: boolean): Promise<void> {
     const attempt = this.attempt;
     if (replacePanel) {
       this.setState("closed");
@@ -271,9 +315,20 @@ export class SessionView {
       case "status":
         if (this.state === "connecting") this.showConnecting(event.text);
         break;
-      case "identity":
-        // The backend pinned this machine's identity; refresh so a later edit keeps the pin.
-        void this.host.store.reload();
+      case "identity": {
+        // Proven, but not saved until the sign-in succeeds.
+        const pinned = this.connection.pinned_identity;
+        this.seenIdentity = { sha256: event.sha256, isNew: pinned === null || pinned.toLowerCase() !== event.sha256.toLowerCase() };
+        break;
+      }
+      case "notice":
+        this.notice.replaceChildren(
+          h("span", { class: "selectable", text: event.text }),
+          button("Dismiss", () => {
+            this.notice.hidden = true;
+          }),
+        );
+        this.notice.hidden = false;
         break;
       case "connected":
         this.screen.setRemoteSize(event.width, event.height);
@@ -282,6 +337,9 @@ export class SessionView {
         this.overlay.hidden = true;
         this.element.title = "";
         this.subtitle.textContent = event.name ? `${hostLabel(this.connection)} - ${event.name}` : hostLabel(this.connection);
+        this.updateIdentityButton();
+        // The backend saved the identity on sign-in; refresh so a later edit keeps the pin.
+        void this.host.store.reload();
         if (this.host.isActive(this)) {
           if (!isDialogOpen()) this.focusScreen();
           void this.clipboard.pushLocal();
@@ -339,7 +397,56 @@ export class SessionView {
   }
 
   private reconnect(): void {
-    void this.start({ password: null, save: false, trust: false });
+    void this.start({ password: null, save: false, ...PLAIN });
+  }
+
+  /**
+   * The identity changed and the user wants to accept the new one: confirm, then ask for the
+   * password (the saved one is never sent to a machine whose identity just changed).
+   */
+  private async trustNewIdentity(identity: IdentityMismatch): Promise<void> {
+    const attempt = this.attempt;
+    const kind = identity.identity_kind;
+    const confirmed = await confirmDialog({
+      title: "Trust the new identity?",
+      message: `Only continue if you checked that ${formatFingerprint(kind, identity.received_sha256)} is the ${identityName(kind)} shown on ${this.connection.host} itself, or you know it was reinstalled or replaced. If someone is intercepting the connection, they would receive the password you type next.`,
+      confirmLabel: "Trust and enter password",
+      danger: true,
+    });
+    if (!confirmed || attempt !== this.attempt || this.destroyed) return;
+    await this.promptPassword(identity.received_sha256, TRUST_NOTE, false);
+  }
+
+  /** The toolbar's Identity button: the fingerprint of the machine in this session. */
+  private async showIdentity(): Promise<void> {
+    const seen = this.seenIdentity;
+    const kind = identityKindOf(this.connection);
+    if (!seen || !kind) return;
+    const intro = seen.isNew
+      ? `This is the first time this app has seen ${this.connection.host}, so it saved its ${identityName(kind)}. If it ever changes you will be warned before your password is sent. To be sure you reached the right computer, compare it with the one shown there.`
+      : `${this.connection.host} presented the same ${identityName(kind)} as before.`;
+    await openDialog<boolean>({
+      title: `Identity of ${this.connection.name}`,
+      body: h(
+        "div",
+        { class: "form" },
+        h("p", { class: "dialog-text", text: intro }),
+        identityDetails(kind, [{ label: kind === "tls_certificate" ? "Certificate (SHA-256)" : "SSH host key (SHA-256)", sha256: seen.sha256 }]),
+      ),
+      submitLabel: "Close",
+      cancelLabel: "Cancel",
+      onSubmit: () => true,
+    });
+    this.focusScreen();
+  }
+
+  private updateIdentityButton(): void {
+    const seen = this.seenIdentity;
+    const kind = identityKindOf(this.connection);
+    this.identityButton.hidden = !seen || !kind || this.state !== "connected";
+    if (!seen || !kind) return;
+    this.identityButton.textContent = seen.isNew ? "New identity saved" : "Identity";
+    this.identityButton.title = `${identityName(kind)}: ${formatFingerprint(kind, seen.sha256)}`;
   }
 
   /**
@@ -471,16 +578,15 @@ export class SessionView {
       // Retry with a typed password: the saved one is not used.
       buttons = [
         ok,
-        button("Enter password", () => void this.promptPassword(false, note, false)),
+        button("Enter password", () => void this.promptPassword(this.currentTrust, note, false)),
         reconnect,
         copyLog,
       ];
-    } else if (error.kind === "security") {
+    } else if (error.kind === "identity_changed" && error.identity) {
+      const identity = error.identity;
       buttons = [
         ok,
-        button("Trust new identity and connect", () => void this.start({ password: null, save: false, trust: true }), {
-          kind: "danger",
-        }),
+        button("Trust new identity...", () => void this.trustNewIdentity(identity), { kind: "danger" }),
         reconnect,
         copyLog,
       ];
@@ -496,10 +602,17 @@ export class SessionView {
     } else {
       buttons = [ok, reconnect, copyLog];
     }
-    this.showPanel({ headline: text.headline, hints: text.hints, detail: error.detail, buttons, error: true });
+    const identity = error.kind === "identity_changed" ? error.identity : undefined;
+    const extra = identity
+      ? identityDetails(identity.identity_kind, [
+          { label: "Saved identity", sha256: identity.expected_sha256 },
+          { label: "Presented now", sha256: identity.received_sha256 },
+        ])
+      : null;
+    this.showPanel({ headline: text.headline, hints: text.hints, detail: error.detail, buttons, error: true, extra });
     // Re-prompt straight away after a refused sign-in; cancelling returns to this panel.
     if (error.kind === "auth_failed" && this.host.isActive(this) && !isDialogOpen()) {
-      void this.promptPassword(false, AUTH_NOTE, false);
+      void this.promptPassword(this.currentTrust, AUTH_NOTE, false);
     }
   }
 
@@ -509,6 +622,7 @@ export class SessionView {
     detail: string | null;
     buttons: HTMLButtonElement[];
     error?: boolean;
+    extra?: HTMLElement | null;
   }): void {
     const panel = h(
       "div",
@@ -520,6 +634,7 @@ export class SessionView {
     } else if (options.hints.length > 1) {
       panel.append(h("ul", { class: "panel-hints selectable" }, ...options.hints.map((hint) => h("li", { text: hint }))));
     }
+    if (options.extra) panel.append(options.extra);
     if (options.detail !== null) {
       panel.append(
         h("div", { class: "panel-detail-label", text: "Technical detail" }),

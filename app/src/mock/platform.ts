@@ -15,7 +15,20 @@ import type { Api, Platform } from "../platform";
 const FAILING_ID = "mock-fails";
 /** A Mac with Screen Sharing on but Remote Login off: fails with tunnel_unavailable until the tunnel is off. */
 const NO_SSH_ID = "mock-mac-no-ssh";
-const FAILURES: ErrorKind[] = ["unreachable", "auth_failed", "security", "unsupported", "protocol", "disconnected", "other"];
+const FAILURES: ErrorKind[] = ["unreachable", "auth_failed", "security", "identity_changed", "unsupported", "protocol", "disconnected", "other"];
+/** A Windows PC whose certificate changed since it was pinned (it has a saved password, which trusting must not use). */
+const NEW_CERT_ID = "mock-new-cert";
+/** A Mac whose SSH host key changed since it was pinned. */
+const NEW_KEY_ID = "mock-new-key";
+const OLD_IDENTITY = "aa".repeat(32);
+/** What each sample presents now; anything else presents DEFAULT_IDENTITY. */
+const PRESENTED: Record<string, string> = {
+  [NEW_CERT_ID]: "b7e1" + "0c".repeat(28) + "9f42",
+  [NEW_KEY_ID]: "5d" + "e3".repeat(30) + "71",
+};
+const DEFAULT_IDENTITY = "3f".repeat(32);
+/** Typing this password with "save" ticked makes the mock keychain fail, to show the notice. */
+const KEYCHAIN_FAILS = "keychain-fails";
 const HEADER = 8;
 
 const connections: Connection[] = [
@@ -31,6 +44,7 @@ const connections: Connection[] = [
     ssh_tunnel: true,
     ssh_port: 22,
     pinned_identity: null,
+    share_clipboard: true,
   },
   {
     id: "mock-mac",
@@ -44,6 +58,7 @@ const connections: Connection[] = [
     ssh_tunnel: true,
     ssh_port: 22,
     pinned_identity: null,
+    share_clipboard: true,
   },
   {
     id: FAILING_ID,
@@ -57,6 +72,7 @@ const connections: Connection[] = [
     ssh_tunnel: true,
     ssh_port: 22,
     pinned_identity: null,
+    share_clipboard: true,
   },
   {
     id: NO_SSH_ID,
@@ -70,10 +86,40 @@ const connections: Connection[] = [
     ssh_tunnel: true,
     ssh_port: 22,
     pinned_identity: null,
+    share_clipboard: true,
+  },
+  {
+    id: NEW_CERT_ID,
+    name: "PC with a new certificate (sample)",
+    protocol: "rdp",
+    host: "10.0.0.42",
+    port: 3389,
+    username: "sam",
+    domain: "",
+    nla: true,
+    ssh_tunnel: true,
+    ssh_port: 22,
+    pinned_identity: OLD_IDENTITY,
+    share_clipboard: true,
+  },
+  {
+    id: NEW_KEY_ID,
+    name: "Mac with a new SSH key (sample)",
+    protocol: "vnc",
+    host: "10.50.0.42",
+    port: 5900,
+    username: "sam",
+    domain: "",
+    nla: true,
+    ssh_tunnel: true,
+    ssh_port: 22,
+    pinned_identity: OLD_IDENTITY,
+    share_clipboard: false,
   },
 ];
-// The Mac samples and the failing sample have a "saved" password; the Windows sample asks.
-const savedPasswords = new Set<string>(["mock-mac", NO_SSH_ID, FAILING_ID]);
+// The Mac samples, the failing sample and the changed-identity samples have a "saved" password;
+// the Windows sample asks.
+const savedPasswords = new Set<string>(["mock-mac", NO_SSH_ID, FAILING_ID, NEW_CERT_ID, NEW_KEY_ID]);
 const sessions = new Map<string, MockSession>();
 const log: string[] = [];
 let nextId = 1;
@@ -143,6 +189,8 @@ class MockSession {
     readonly id: string,
     private readonly connection: Connection,
     private readonly emit: Emit,
+    /** Runs on sign-in, before "connected" is sent (where the real backend saves the pin). */
+    private readonly onSignedIn: () => string | null = () => null,
   ) {}
 
   private event(event: SessionEvent): void {
@@ -159,15 +207,23 @@ class MockSession {
     this.event({ type: "status", text: `Looking up ${host}...` });
     this.later(400, () => this.event({ type: "status", text: `Connecting to ${host}...` }));
     if (failure && failure !== "disconnected") {
-      this.later(1100, () => this.finish(mockError(failure, host)));
+      const error =
+        failure === "identity_changed"
+          ? identityChanged({ ...this.connection, pinned_identity: OLD_IDENTITY }, presentedIdentity(this.connection.id))
+          : mockError(failure, host);
+      this.later(1100, () => this.finish(error));
       return;
     }
     this.later(800, () => {
-      this.event({ type: "identity", sha256: "3f".repeat(32) });
+      if (this.connection.protocol === "rdp" || this.connection.ssh_tunnel) {
+        this.event({ type: "identity", sha256: presentedIdentity(this.connection.id) });
+      }
       this.event({ type: "status", text: "Signing in..." });
     });
     this.later(1300, () => {
+      const notice = this.onSignedIn();
       this.event({ type: "connected", width: this.width, height: this.height, name: `${this.connection.name} (mock)` });
+      if (notice) this.event({ type: "notice", text: notice });
       this.emit(this.frame(0, 0, this.width, this.height));
       this.interval = window.setInterval(() => this.animate(), 50);
       if (failure === "disconnected") this.later(3000, () => this.finish(mockError("disconnected", host)));
@@ -197,6 +253,12 @@ class MockSession {
       if (input.code === "F8") this.event({ type: "clipboard", text: `Copied on the mock remote at ${new Date().toLocaleTimeString()}` });
       if (input.code === "F9") this.finish(mockError("disconnected", this.connection.host));
     }
+  }
+
+  /** Fail after the first status steps with a ready-made error. */
+  fail(error: SessionError): void {
+    this.event({ type: "status", text: `Connecting to ${this.connection.host}...` });
+    this.later(900, () => this.finish(error));
   }
 
   finish(error: SessionError | null): void {
@@ -310,12 +372,39 @@ function crosshairCursor(): SessionEvent {
   return { type: "cursor", kind: "bitmap", width: size, height: size, hot_x: 12, hot_y: 12, rgba_base64: btoa(binary) };
 }
 
+function presentedIdentity(id: string): string {
+  return PRESENTED[id] ?? DEFAULT_IDENTITY;
+}
+
+function sameTarget(a: Connection, b: Connection): boolean {
+  return (
+    a.protocol === b.protocol &&
+    a.host.toLowerCase() === b.host.toLowerCase() &&
+    a.port === b.port &&
+    a.ssh_tunnel === b.ssh_tunnel &&
+    (!a.ssh_tunnel || a.ssh_port === b.ssh_port)
+  );
+}
+
+function identityChanged(connection: Connection, presented: string): SessionError {
+  const ssh = connection.protocol === "vnc";
+  const expected = connection.pinned_identity ?? "";
+  return {
+    kind: "identity_changed",
+    detail: ssh
+      ? `the Mac's SSH host key changed (expected ${expected}, got ${presented}). No password was sent.`
+      : `the server's certificate changed (expected ${expected}, got ${presented}). No credentials were sent.`,
+    identity: { identity_kind: ssh ? "ssh_host_key" : "tls_certificate", expected_sha256: expected, received_sha256: presented },
+  };
+}
+
 function mockError(kind: ErrorKind, host: string): SessionError {
   const details: Record<ErrorKind, string> = {
     unreachable: `tcp connect to ${host}:3389 failed: connection timed out (os error 60)`,
     tunnel_unavailable: `SSH (Remote Login) connection to ${host}:22 failed: No connection could be made because the target machine actively refused it. (os error 10061)`,
     auth_failed: "CredSSP: the server rejected the credentials (STATUS_LOGON_FAILURE 0xC000006D)",
-    security: `server identity changed for ${host}\n  pinned:    sha256:3f3f3f3f3f3f3f3f...\n  presented: sha256:a91c04be77d20e15...`,
+    security: `TLS handshake failed: invalid peer certificate: UnsupportedCertVersion (${host})`,
+    identity_changed: `the server's certificate changed (expected ${OLD_IDENTITY}, got ${DEFAULT_IDENTITY}).`,
     unsupported: "server requires a security protocol this client does not offer (HYBRID_EX)",
     protocol: "decode error: unexpected PDU type 0x17 in state CapabilitiesExchange",
     disconnected: "connection reset by peer (os error 54)",
@@ -332,12 +421,23 @@ const delay = <T>(value: T, ms = 60): Promise<T> => new Promise((resolve) => win
 const mockApi: Api = {
   listConnections: () => delay(connections.map((c) => ({ ...c }))),
   saveConnection: (connection: Connection) => {
+    // The same rules as save_connection in lib.rs: the pin and the password stay only with the
+    // same machine (and the password only with the same account); the caller's pin is ignored.
     const saved = { ...connection, id: connection.id || `mock-${nextId++}` };
     const index = connections.findIndex((c) => c.id === saved.id);
-    if (index >= 0) connections[index] = saved;
+    const existing = index >= 0 ? connections[index] : undefined;
+    const target = existing !== undefined && sameTarget(existing, saved);
+    const account = existing !== undefined && existing.username === saved.username && existing.domain.toLowerCase() === saved.domain.toLowerCase();
+    saved.pinned_identity = existing && target ? existing.pinned_identity : null;
+    let passwordCleared = false;
+    if (connection.id !== "" && (!target || !account)) {
+      passwordCleared = existing !== undefined && savedPasswords.has(saved.id);
+      savedPasswords.delete(saved.id);
+    }
+    if (existing) connections[index] = saved;
     else connections.push(saved);
-    note(`saved connection ${saved.id}`);
-    return delay({ ...saved });
+    note(`saved connection ${saved.id}${passwordCleared ? " (saved password cleared)" : ""}`);
+    return delay({ connection: { ...saved }, password_cleared: passwordCleared });
   },
   deleteConnection: (id: string) => {
     const index = connections.findIndex((c) => c.id === id);
@@ -355,12 +455,24 @@ const mockApi: Api = {
     await delay(null, 150);
     const connection = connections.find((c) => c.id === args.id);
     if (!connection) throw { kind: "other", detail: `no connection with id ${args.id}` } satisfies SessionError;
+    if (args.trust_new_identity && args.password === null) {
+      // Like the backend: the saved password is never used to trust a new identity.
+      note(`connect ${args.id}: trusting a new identity needs a typed password`);
+      throw { kind: "password_required", detail: "Enter the password to connect to a computer with a new identity." } satisfies SessionError;
+    }
     if (args.password === null && !savedPasswords.has(args.id)) {
       note(`connect ${args.id}: password required`);
       throw mockError("password_required", connection.host);
     }
+    const presented = presentedIdentity(args.id);
+    const expected = args.trust_new_identity ? args.new_identity : connection.pinned_identity;
+    const pinsIdentity = connection.protocol === "rdp" || connection.ssh_tunnel;
     let failure: ErrorKind | null = null;
-    if (args.id === FAILING_ID && !args.trust_new_identity) {
+    let error: SessionError | null = null;
+    if (pinsIdentity && expected !== null && expected !== presented && args.id !== FAILING_ID) {
+      failure = "identity_changed";
+      error = identityChanged(connection, presented);
+    } else if (args.id === FAILING_ID && !args.trust_new_identity) {
       failure = FAILURES[failureIndex % FAILURES.length] ?? "other";
       failureIndex++;
     } else if (args.id === NO_SSH_ID && connection.ssh_tunnel) {
@@ -368,12 +480,28 @@ const mockApi: Api = {
     } else if (args.password === "wrong") {
       failure = "auth_failed";
     }
-    if (failure === null && args.password !== null && args.save_password) savedPasswords.add(args.id);
     const id = `mock-session-${nextId++}`;
-    note(`connect ${args.id} as ${id}: ${args.width}x${args.height} at ${args.scale_factor}%, outcome ${failure ?? "ok"}`);
-    const session = new MockSession(id, connection, onMessage);
+    note(
+      `connect ${args.id} as ${id}: ${args.width}x${args.height} at ${args.scale_factor}%, trust ${args.trust_new_identity}, outcome ${failure ?? "ok"}`,
+    );
+    const snapshot = { ...connection };
+    const signedIn = (): string | null => {
+      // As the backend: pin and password are saved only now, and only for an unchanged target.
+      const current = connections.find((c) => c.id === snapshot.id);
+      if (!current || !sameTarget(current, snapshot)) return null;
+      if (pinsIdentity && (current.pinned_identity === null || args.trust_new_identity)) current.pinned_identity = presented;
+      if (args.password !== null && args.save_password) {
+        if (args.password === KEYCHAIN_FAILS) {
+          return "Signed in, but the password could not be saved in the keychain, so you will be asked for it next time. (mock: no keychain)";
+        }
+        savedPasswords.add(args.id);
+      }
+      return null;
+    };
+    const session = new MockSession(id, connection, onMessage, signedIn);
     sessions.set(id, session);
-    session.run(failure);
+    if (error) session.fail(error);
+    else session.run(failure);
     return id;
   },
   sendInput: (sessionId: string, input: SessionInput) => {

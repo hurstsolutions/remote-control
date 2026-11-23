@@ -8,6 +8,8 @@ use std::sync::{Arc, Mutex};
 
 use tracing_subscriber::fmt::MakeWriter;
 
+use crate::private_fs;
+
 const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 const TAIL_BYTES: u64 = 256 * 1024;
 
@@ -42,14 +44,14 @@ impl<'a> MakeWriter<'a> for FileWriter {
 /// runs is moved to `.old` first.
 pub fn init(dir: &Path) -> PathBuf {
     let path = dir.join("remote-control.log");
-    let _ = std::fs::create_dir_all(dir);
+    let _ = private_fs::create_dir(dir);
     if std::fs::metadata(&path).map(|m| m.len() > MAX_LOG_BYTES).unwrap_or(false) {
         let _ = std::fs::rename(&path, path.with_extension("log.old"));
     }
     let filter = tracing_subscriber::EnvFilter::try_from_env("RC_LOG").unwrap_or_else(|_| {
         "info,remote_control_lib=debug,rc_rdp=debug,rc_vnc=debug,rc_tunnel=debug,ironrdp_connector=debug".into()
     });
-    match OpenOptions::new().create(true).append(true).open(&path) {
+    match private_fs::open(OpenOptions::new().create(true).append(true), &path) {
         Ok(file) => {
             let _ = tracing_subscriber::fmt()
                 .with_env_filter(filter)

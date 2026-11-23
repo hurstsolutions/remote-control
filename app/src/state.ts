@@ -22,6 +22,7 @@ export function blankConnection(protocol: Protocol = "rdp"): Connection {
     ssh_tunnel: true,
     ssh_port: DEFAULT_SSH_PORT,
     pinned_identity: null,
+    share_clipboard: true,
   };
 }
 
@@ -45,6 +46,13 @@ export function pinnedIdentityAfterEdit(before: Connection | null, after: Connec
     before.ssh_tunnel === after.ssh_tunnel &&
     (!after.ssh_tunnel || before.ssh_port === after.ssh_port);
   return sameTarget ? before.pinned_identity : null;
+}
+
+/** Whether saving `after` over `before` removes the saved password (kept in step with lib.rs). */
+export function passwordClearedByEdit(before: Connection | null, after: Connection): boolean {
+  if (!before) return false;
+  const sameAccount = before.username.trim() === after.username.trim() && before.domain.trim().toLowerCase() === after.domain.trim().toLowerCase();
+  return pinnedIdentityAfterEdit({ ...before, pinned_identity: "x" }, after) === null || !sameAccount;
 }
 
 type Listener = () => void;

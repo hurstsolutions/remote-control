@@ -297,7 +297,14 @@ async fn changed_certificate_is_rejected_before_sign_in() {
     collect(&mut handle, &mut seen, Duration::from_secs(20), |_| false).await;
     assert!(seen.connected.is_none());
     let error = seen.closed.expect("session must close").expect("with an error");
-    assert_eq!(error.kind, ErrorKind::Security, "detail: {}", error.detail);
+    assert_eq!(error.kind, ErrorKind::IdentityChanged, "detail: {}", error.detail);
+    let identity = error.identity.expect("both fingerprints come with the error");
+    assert_eq!(identity.identity_kind, rc_types::IdentityKind::TlsCertificate);
+    assert_eq!(identity.expected_sha256, "00".repeat(32));
+    assert_eq!(identity.received_sha256.len(), 64);
+    assert_ne!(identity.received_sha256, identity.expected_sha256);
+    // The new identity is not reported as if it had been accepted.
+    assert!(seen.identity.is_none(), "a rejected certificate must not be reported as the server identity");
 }
 
 #[tokio::test(flavor = "multi_thread")]

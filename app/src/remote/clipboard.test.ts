@@ -18,7 +18,7 @@ describe("shouldSendClipboard", () => {
 
 describe("ClipboardSync", () => {
   function setup(initial: string) {
-    const state = { local: initial, sent: [] as string[], open: true, failRead: false };
+    const state = { local: initial, sent: [] as string[], open: true, failRead: false, enabled: true };
     const sync = new ClipboardSync(
       {
         readClipboard: () => (state.failRead ? Promise.reject(new Error("no text")) : Promise.resolve(state.local)),
@@ -29,6 +29,7 @@ describe("ClipboardSync", () => {
       },
       (text) => state.sent.push(text),
       () => state.open,
+      () => state.enabled,
     );
     return { state, sync };
   }
@@ -67,5 +68,22 @@ describe("ClipboardSync", () => {
     sync.reset();
     await sync.pushLocal();
     expect(state.sent).toEqual(["same", "same"]);
+  });
+
+  it("ignores remote text over the limit", async () => {
+    const { state, sync } = setup("mine");
+    await sync.receiveRemote("x".repeat(MAX_CLIPBOARD_CHARS + 1));
+    expect(state.local).toBe("mine");
+    await sync.receiveRemote("y".repeat(MAX_CLIPBOARD_CHARS));
+    expect(state.local.length).toBe(MAX_CLIPBOARD_CHARS);
+  });
+
+  it("passes nothing either way when sharing is off", async () => {
+    const { state, sync } = setup("local text");
+    state.enabled = false;
+    await sync.pushLocal();
+    await sync.receiveRemote("remote text");
+    expect(state.sent).toEqual([]);
+    expect(state.local).toBe("local text");
   });
 });

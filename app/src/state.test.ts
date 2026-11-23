@@ -1,10 +1,18 @@
 import { describe, expect, it } from "vitest";
-import { blankConnection, hostLabel, pinnedIdentityAfterEdit, protocolLabel } from "./state";
+import { blankConnection, hostLabel, passwordClearedByEdit, pinnedIdentityAfterEdit, protocolLabel } from "./state";
 import { parsePort, validateEditor } from "./views/editor-logic";
 
 describe("connections", () => {
   it("starts new connections with the documented defaults", () => {
-    expect(blankConnection("rdp")).toMatchObject({ id: "", port: 3389, nla: true, ssh_tunnel: true, ssh_port: 22, pinned_identity: null });
+    expect(blankConnection("rdp")).toMatchObject({
+      id: "",
+      port: 3389,
+      nla: true,
+      ssh_tunnel: true,
+      ssh_port: 22,
+      pinned_identity: null,
+      share_clipboard: true,
+    });
     expect(blankConnection("vnc").port).toBe(5900);
   });
 
@@ -25,6 +33,20 @@ describe("connections", () => {
     expect(pinnedIdentityAfterEdit(before, { ...before, ssh_port: 2222 })).toBeNull();
     expect(pinnedIdentityAfterEdit(before, { ...before, protocol: "rdp" })).toBeNull();
     expect(pinnedIdentityAfterEdit(null, before)).toBeNull();
+  });
+});
+
+describe("passwordClearedByEdit", () => {
+  const before = { ...blankConnection("rdp"), id: "1", host: "pc.local", username: "sam", pinned_identity: null };
+  it("matches the backend: a new address or account clears the saved password", () => {
+    expect(passwordClearedByEdit(before, { ...before, name: "Renamed", share_clipboard: false, nla: false })).toBe(false);
+    expect(passwordClearedByEdit(before, { ...before, host: "PC.local" })).toBe(false);
+    expect(passwordClearedByEdit(before, { ...before, host: "other.local" })).toBe(true);
+    expect(passwordClearedByEdit(before, { ...before, port: 3390 })).toBe(true);
+    expect(passwordClearedByEdit(before, { ...before, protocol: "vnc" })).toBe(true);
+    expect(passwordClearedByEdit(before, { ...before, username: "admin" })).toBe(true);
+    expect(passwordClearedByEdit(before, { ...before, domain: "CORP" })).toBe(true);
+    expect(passwordClearedByEdit(null, before)).toBe(false);
   });
 });
 
