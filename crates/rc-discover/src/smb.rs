@@ -84,7 +84,12 @@ pub fn negotiate_request() -> Vec<u8> {
     out.extend_from_slice(&1u16.to_le_bytes()); // SecurityMode: signing enabled
     out.extend_from_slice(&0u16.to_le_bytes()); // Reserved
     out.extend_from_slice(&0u32.to_le_bytes()); // Capabilities
-    out.extend_from_slice(&[0x52, 0x43, 0x2D, 0x44, 0x49, 0x53, 0x43, 0x4F, 0x56, 0x45, 0x52, 0, 0, 0, 0, 1]); // ClientGuid
+    // ClientGuid: random per probe, so the scan carries no fixed fingerprint.
+    let mut guid = [0u8; 16];
+    if getrandom::fill(&mut guid).is_err() {
+        guid = [0x11; 16];
+    }
+    out.extend_from_slice(&guid);
     out.extend_from_slice(&0u64.to_le_bytes()); // ClientStartTime
     for dialect in DIALECTS {
         out.extend_from_slice(&dialect.to_le_bytes());

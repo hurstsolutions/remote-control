@@ -20,7 +20,10 @@ pub fn request(id: u16) -> Vec<u8> {
 }
 
 pub async fn query(ip: Ipv4Addr, port: u16, limit: Duration) -> Option<String> {
-    let id = (u32::from(ip) as u16) ^ 0x5A5A;
+    // A random transaction ID, so another host cannot easily forge the reply.
+    let mut b = [0u8; 2];
+    getrandom::fill(&mut b).ok()?;
+    let id = u16::from_be_bytes(b);
     let reply = crate::udp_exchange(SocketAddr::from((ip, port)), &request(id), limit).await?;
     parse(&reply, id)
 }

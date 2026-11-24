@@ -490,12 +490,21 @@ async fn reverse_dns(ip: Ipv4Addr, limit: Duration) -> Option<String> {
 
 /// Characters that are invisible or reorder text: Unicode format characters (category Cf, such
 /// as bidi overrides and zero-width characters), line and paragraph separators, and the
-/// interlinear annotation and object replacement marks. A small explicit list instead of a
+/// interlinear annotation and object replacement marks, plus characters that render blank
+/// (Hangul fillers, braille blank, combining grapheme joiner, variation selectors). A small explicit list instead of a
 /// Unicode tables crate.
 pub fn is_hidden_char(c: char) -> bool {
     matches!(
         c,
         '\u{00AD}'
+            | '\u{034F}'
+            | '\u{115F}'..='\u{1160}'
+            | '\u{17B4}'..='\u{17B5}'
+            | '\u{2800}'
+            | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{FFA0}'
+            | '\u{E0100}'..='\u{E01EF}'
             | '\u{0600}'..='\u{0605}'
             | '\u{061C}'
             | '\u{06DD}'
