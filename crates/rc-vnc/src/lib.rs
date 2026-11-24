@@ -4,8 +4,9 @@
 //! authentication with a Mac username and password). Also works with ordinary VNC servers.
 //!
 //! * Protocol versions 3.3, 3.7, 3.8, and Apple's 003.889 (for encrypted sessions).
-//! * Security types: None (1), VNC password (2), Apple Remote Desktop DH/AES (30), Apple SRP (36,
-//!   used only for encrypted sessions, preferred over 30).
+//! * Security types: None (1), VNC password (2), Apple Remote Desktop DH/AES (30), Apple SRP (33
+//!   with its RSA envelope, or 36 when the Mac does not list 33; used only for encrypted sessions,
+//!   preferred over 30).
 //! * Apple Screen Sharing's encrypted session (AES-128-CBC record layer with SHA-1 integrity),
 //!   selected by [`EncryptionPolicy`] in [`VncOptions`]. Just before `Connected` the session
 //!   emits one `SessionEvent::Security` describing VNC's own protection
@@ -92,7 +93,8 @@ impl std::fmt::Debug for VncConfig {
 /// Whether the session must be encrypted by the VNC protocol itself.
 ///
 /// Only Apple Screen Sharing (macOS, RFB 003.889) can encrypt a VNC session here; it does so
-/// after signing in with a macOS username and password (security type 36 SRP, or type 30).
+/// after signing in with a macOS username and password (SRP over security type 33 or 36, or
+/// type 30).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EncryptionPolicy {
     /// Encrypt or do not connect. For direct connections (no SSH tunnel). Refuses servers that
@@ -100,7 +102,7 @@ pub enum EncryptionPolicy {
     /// even if the server offers them: a man in the middle could otherwise strip the other
     /// types from the list and read the session. Never falls back to cleartext.
     ///
-    /// Also requires the verified sign-in (SRP, type 36): Apple's type 30 is refused unless
+    /// Also requires the verified sign-in (SRP, types 33/36): Apple's type 30 is refused unless
     /// [`VncOptions::allow_unverified_sign_in`] is set, whether the Mac did not offer type 36
     /// (see [`SRP_NOT_OFFERED`]) or SRP is turned off with [`VncOptions::srp`].
     Required,
@@ -123,7 +125,8 @@ pub enum EncryptionPolicy {
 pub struct VncOptions {
     /// Default: [`EncryptionPolicy::Off`].
     pub encryption: EncryptionPolicy,
-    /// For encrypted sessions, sign in with SRP (security type 36) when the Mac offers it,
+    /// For encrypted sessions, sign in with SRP when the Mac offers it (lists type 36; carried
+    /// by type 33 when that is listed too, as Apple's viewer does),
     /// which also verifies the Mac's identity. Default true. Turning it off falls back to
     /// type 30 (encrypted, Mac not verified); meant only as an escape hatch while SRP is new.
     /// Under [`EncryptionPolicy::Required`] that fallback also needs `allow_unverified_sign_in`.
@@ -180,7 +183,7 @@ pub enum VncSecurity {
     /// eavesdropping only. An active man in the middle can impersonate the Mac and learn the
     /// password.
     EncryptedUnverified,
-    /// Encrypted, and the Mac proved it knows the account's password verifier (SRP, type 36,
+    /// Encrypted, and the Mac proved it knows the account's password verifier (SRP, type 33 or 36,
     /// its proof M2 checked) and the first encrypted message from it passed its integrity check:
     /// protects against eavesdropping and impersonation.
     EncryptedVerified,

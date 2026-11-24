@@ -1,18 +1,42 @@
-//! Apple Screen Sharing's SRP sign-in (security type 36): SRP-6a over an RFC 5054 group (only
-//! those are accepted; macOS sends the 4096-bit group, g = 5), SHA-512, password stretched with
-//! PBKDF2-HMAC-SHA512. Unlike type 30, the Mac has to prove it knows the account's password
-//! verifier, so a man in the middle cannot impersonate it or learn the password.
+//! Apple Screen Sharing's SRP sign-in: SRP-6a over an RFC 5054 group (only those are accepted;
+//! macOS sends the 4096-bit group, g = 5), SHA-512, password stretched with PBKDF2-HMAC-SHA512.
+//! Unlike type 30, the Mac has to prove it knows the account's password verifier, so a man in the
+//! middle cannot impersonate it or learn the password. Two security types carry it: 33 (the SRP
+//! messages inside an "RSA1" envelope; what Apple's own viewer tries first) and 36 (the same
+//! messages in clear).
 //!
-//! Wire format (type 36 sends these in clear, each a `u32` length then fields; field kinds:
-//! `u8`, big number = `u16` length + bytes, opaque = `u8` length + bytes, string = `u16`
-//! length + bytes, `u64`):
+//! SRP messages (each a `u32` length then fields; field kinds: `u8`, big number = `u16` length +
+//! bytes, opaque = `u8` length + bytes, string = `u16` length + bytes, `u64`):
 //!
 //! 1. client: string "" , string username, string "", opaque ""
 //! 2. server: u8 0, N, g, opaque salt, B, u64 PBKDF2 iterations, string options
 //! 3. client: A, opaque M1, string options (echoed), opaque 16 random bytes
 //! 4. server: opaque M2, opaque server random, string "", u32 0
 //!
-//! then the ordinary SecurityResult. Math (all numbers padded to the length of N where noted):
+//! then the ordinary SecurityResult. Big numbers from the Mac may carry a leading zero byte
+//! (N is normalised before the group check).
+//!
+//! Type 33 (all integers big-endian unless noted). A client envelope is `u32 total` (bytes after
+//! it), `01 00` (version), `"RSA1"`, `u16 kind`, `u16 aux` (length of the meaningful body), body:
+//!
+//! * kind 0, key request: `00 00 00 0a 01 00 "RSA1" 00 00 00 00`. The Mac answers `u32 len`,
+//!   `00 01 00 00`, `u16 n`, n bytes of DER `SubjectPublicKeyInfo` (RSA, 2048 bits on macOS),
+//!   and a zero byte. The key is not authenticated; that is fine because M2 still proves the
+//!   Mac knows the verifier.
+//! * kind 2, message 1: aux = 256 (the ciphertext length), body = message 1 (with its `u32`
+//!   length) encrypted with RSA PKCS#1 v1.5, zero-padded to 640 bytes (total 650, as Apple's
+//!   viewer sends it).
+//! * kind 2, message 3 in clear: aux = length of message 3 including its `u32` length, body =
+//!   message 3 (with its `u32` length), zero-padded so the total is 1076 (Apple's viewer's size).
+//!
+//! The Mac sends messages 2 and 4 as `u32 len`, then a header `u8 step, u32 x, u32 payload_len`
+//! (x = payload_len + 4), then the SRP message without its own `u32` length; message 4 is followed
+//! by the SecurityResult. If it cannot decrypt message 1 it sends its key again instead.
+//! Because neither source was a capture we could check ourselves, two other layouts are also
+//! accepted (a 6-byte header `u32, u16 n`, and fixed offsets with the control byte at 12 and a
+//! 512-byte N without a length); whatever the layout, the group check below still applies.
+//!
+//! Math (all numbers padded to the length of N where noted):
 //!
 //! ```text
 //! P' = PBKDF2-HMAC-SHA512(password, salt, iterations, 128)
@@ -24,10 +48,11 @@
 //! wrap key for the encrypted session's rekey = SHA-256(K)[0..16]
 //! ```
 //!
-//! Sources: remotex `docs/apple-vnc-889.md` (message grammar, MIT) and the iShareScreen protocol
-//! notes and client (read for protocol facts only; nothing copied). Type 36's framing has not
-//! been captured by either; type 33 carries the same SRP messages inside an RSA envelope and is
-//! known to work with this math.
+//! Sources: remotex `docs/apple-vnc-889.md` (message grammar and the type 33 envelope, MIT) and
+//! the iShareScreen protocol notes and client (AGPL; read for protocol facts only, nothing
+//! copied), whose type 33 SRP client is reported to work against macOS 15 and later. Type 36's
+//! framing has not been captured by either: a Mac answered our type 36 message 1 with a zero
+//! length, so type 33 is preferred whenever the Mac lists it.
 
 use crate::error::{Result, VncError};
 use num_bigint::BigUint;
@@ -225,7 +250,15 @@ pub(crate) fn parse_challenge(body: &[u8]) -> Result<Challenge> {
     if control != 0 {
         return Err(VncError::Protocol(format!("SRP: challenge starts with {control:#04x}, expected 0")));
     }
-    let n = c.big("modulus N")?.to_vec();
+    let n = c.big("modulus N")?;
+    challenge_after_n(c, n)
+}
+
+/// The rest of message 2 after N.
+fn challenge_after_n(mut c: Cursor<'_>, n: &[u8]) -> Result<Challenge> {
+    // The Mac may send N with a leading zero byte (a positive-integer encoding); the group check
+    // and the hashes use the plain bytes.
+    let n = n[n.iter().position(|&b| b != 0).unwrap_or(n.len())..].to_vec();
     let g = c.big("generator g")?.to_vec();
     let salt = c.opaque("salt")?.to_vec();
     let b = c.big("server public value B")?.to_vec();
@@ -252,6 +285,155 @@ pub(crate) fn proof_message(proof: &Proof, options: &[u8], client_random: &[u8; 
 pub(crate) fn parse_final(body: &[u8]) -> Result<Vec<u8>> {
     let mut c = Cursor(body);
     Ok(c.opaque("server proof M2")?.to_vec())
+}
+
+// ---- Type 33: the RSA1 envelope ----
+
+/// Largest RSA key reply accepted (a 4096-bit key's DER is about 550 bytes).
+pub(crate) const MAX_RSA_KEY_REPLY: u32 = 4096;
+/// RSA key sizes accepted from the Mac (macOS uses 2048).
+pub(crate) const RSA_BITS: std::ops::RangeInclusive<usize> = 2048..=4096;
+/// Envelope sizes Apple's viewer sends (bytes after the leading `u32`).
+const RSA1_IDENTITY_TOTAL: usize = 650;
+const RSA1_PROOF_TOTAL: usize = 1076;
+const RSA1_KIND_KEY_REQUEST: u16 = 0;
+const RSA1_KIND_SRP: u16 = 2;
+
+/// A client envelope with its `u32` length, zero-padded to `min_total` bytes after the length.
+fn rsa1_envelope(kind: u16, aux: usize, body: &[u8], min_total: usize) -> Result<Vec<u8>> {
+    let aux = u16::try_from(aux).map_err(|_| VncError::Other("SRP: message too long for the RSA1 envelope".into()))?;
+    let mut m = Vec::with_capacity(4 + min_total.max(10 + body.len()));
+    m.extend_from_slice(&[0; 4]);
+    m.extend_from_slice(&[1, 0]);
+    m.extend_from_slice(b"RSA1");
+    m.extend_from_slice(&kind.to_be_bytes());
+    m.extend_from_slice(&aux.to_be_bytes());
+    m.extend_from_slice(body);
+    if m.len() - 4 < min_total {
+        m.resize(4 + min_total, 0);
+    }
+    let total = (m.len() - 4) as u32;
+    m[..4].copy_from_slice(&total.to_be_bytes());
+    Ok(m)
+}
+
+/// Kind 0: ask for the Mac's RSA public key (14 bytes, after the selector byte).
+pub(crate) fn rsa1_key_request() -> Vec<u8> {
+    rsa1_envelope(RSA1_KIND_KEY_REQUEST, 0, &[], 0).expect("empty envelope")
+}
+
+/// The Mac's RSA public key, for PKCS#1 v1.5 encryption of message 1.
+pub(crate) struct MacRsaKey(aws_lc_rs::rsa::Pkcs1PublicEncryptingKey);
+
+impl MacRsaKey {
+    pub(crate) fn bits(&self) -> usize {
+        self.0.key_size_bits()
+    }
+}
+
+/// Parse the reply to the key request (the body after its `u32` length): `00 01 00 00`,
+/// `u16 n`, n bytes of DER `SubjectPublicKeyInfo`, a trailing zero byte.
+pub(crate) fn parse_rsa_key_reply(body: &[u8]) -> Result<MacRsaKey> {
+    let mut c = Cursor(body);
+    let prefix = c.take(4, "RSA key reply header")?;
+    if prefix != [0, 1, 0, 0] {
+        tracing::debug!(prefix = %hex_bytes(prefix), "SRP: unexpected RSA key reply header (continuing)");
+    }
+    let der = c.big("RSA public key")?;
+    if c.0.len() > 1 {
+        tracing::debug!(extra = c.0.len(), "SRP: trailing bytes after the RSA key (ignored)");
+    }
+    let key = aws_lc_rs::rsa::PublicEncryptingKey::from_der(der)
+        .map_err(|e| VncError::Protocol(format!("SRP: the Mac's RSA public key could not be read ({e})")))?;
+    let bits = key.key_size_bits();
+    if !RSA_BITS.contains(&bits) {
+        return Err(VncError::Security(format!(
+            "SRP: the Mac's RSA key has {bits} bits (accepted: {} to {})",
+            RSA_BITS.start(),
+            RSA_BITS.end()
+        )));
+    }
+    let key = aws_lc_rs::rsa::Pkcs1PublicEncryptingKey::new(key)
+        .map_err(|_| VncError::Protocol("SRP: the Mac's RSA key cannot be used for encryption".into()))?;
+    Ok(MacRsaKey(key))
+}
+
+/// Kind 2 with message 1 encrypted to the Mac's key, with its `u32` length.
+pub(crate) fn rsa1_identity_packet(key: &MacRsaKey, username: &str) -> Result<Vec<u8>> {
+    let plain = identity_message(username);
+    if plain.len() > key.0.max_plaintext_size() {
+        return Err(VncError::Auth(format!(
+            "the username is too long for Apple's sign-in ({} bytes; at most {})",
+            username.len(),
+            key.0.max_plaintext_size() - (plain.len() - username.len())
+        )));
+    }
+    let mut ct = vec![0u8; key.0.ciphertext_size()];
+    let ct_len = key
+        .0
+        .encrypt(&plain, &mut ct)
+        .map_err(|_| VncError::Other("SRP: RSA encryption of the sign-in request failed".into()))?
+        .len();
+    ct.truncate(ct_len);
+    rsa1_envelope(RSA1_KIND_SRP, ct.len(), &ct, RSA1_IDENTITY_TOTAL)
+}
+
+/// Kind 2 with message 3 in clear, with its `u32` length.
+pub(crate) fn rsa1_proof_packet(proof: &Proof, options: &[u8], client_random: &[u8; 16]) -> Result<Vec<u8>> {
+    let inner = proof_message(proof, options, client_random);
+    rsa1_envelope(RSA1_KIND_SRP, inner.len(), &inner, RSA1_PROOF_TOTAL)
+}
+
+/// The SRP message inside one of the Mac's type 33 replies (the body after its `u32` length),
+/// and the name of the layout that matched (for the log).
+fn rsa1_payload(body: &[u8]) -> (&[u8], &'static str) {
+    let be32 = |b: &[u8]| u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize;
+    if body.len() >= 9 {
+        let (x, len) = (be32(&body[1..5]), be32(&body[5..9]));
+        if x == len.wrapping_add(4) && len <= body.len() - 9 {
+            return (&body[9..9 + len], "step, x, length");
+        }
+    }
+    if body.len() >= 6 && body[..4] == [0, 0, 0, 2] {
+        let len = u16::from_be_bytes([body[4], body[5]]) as usize;
+        if len > 0 && len <= body.len() - 6 {
+            return (&body[6..6 + len], "u32, u16 length");
+        }
+    }
+    (body, "no header")
+}
+
+/// Parse message 2 from a type 33 reply (the body after its `u32` length).
+pub(crate) fn parse_rsa1_challenge(body: &[u8]) -> Result<Challenge> {
+    let (payload, layout) = rsa1_payload(body);
+    let first = match parse_challenge(payload) {
+        Ok(ch) => {
+            tracing::debug!(layout, header = %hex_bytes(&body[..body.len() - payload.len()]), "SRP: type 33 challenge layout");
+            return Ok(ch);
+        }
+        Err(e) => e,
+    };
+    // Fixed offsets as another client reads them: control byte at 12, then a 512-byte N with no
+    // length of its own.
+    if body.len() > 13 + 512 && body[12] == 0 {
+        if let Ok(ch) = challenge_after_n(Cursor(&body[13 + 512..]), &body[13..13 + 512]) {
+            tracing::debug!(header = %hex_bytes(&body[..12]), "SRP: type 33 challenge layout: fixed offsets");
+            return Ok(ch);
+        }
+    }
+    Err(first)
+}
+
+/// Parse message 4 from a type 33 reply (the body after its `u32` length); returns M2.
+pub(crate) fn parse_rsa1_final(body: &[u8]) -> Result<Vec<u8>> {
+    let (payload, layout) = rsa1_payload(body);
+    tracing::debug!(layout, "SRP: type 33 server proof layout");
+    parse_final(payload)
+}
+
+/// Lowercase hex, for diagnostics of public protocol bytes only.
+pub(crate) fn hex_bytes(b: &[u8]) -> String {
+    b.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn pad(v: &BigUint, len: usize) -> Vec<u8> {
@@ -461,6 +643,156 @@ mod tests {
         let mut ch = kat_challenge();
         ch.n = vec![0xff; 32]; // 256-bit group
         assert!(refused(&ch));
+    }
+
+    /// A Mac's RSA key pair (test-only) and its public key as the Mac's kind 0 reply body.
+    fn mac_rsa_key() -> (aws_lc_rs::rsa::PrivateDecryptingKey, Vec<u8>) {
+        use aws_lc_rs::encoding::AsDer;
+        let private = aws_lc_rs::rsa::PrivateDecryptingKey::generate(aws_lc_rs::rsa::KeySize::Rsa2048).unwrap();
+        let der = private.public_key().as_der().unwrap();
+        let der = der.as_ref();
+        let mut reply = vec![0, 1, 0, 0];
+        reply.extend_from_slice(&(der.len() as u16).to_be_bytes());
+        reply.extend_from_slice(der);
+        reply.push(0);
+        (private, reply)
+    }
+
+    /// The challenge of `kat_challenge` as message 2 without its `u32` length, N with a leading
+    /// zero byte as the Mac may send it.
+    fn challenge_body(ch: &Challenge, zero_before_n: bool) -> Vec<u8> {
+        let mut body = vec![0];
+        let mut n = if zero_before_n { vec![0] } else { vec![] };
+        n.extend_from_slice(&ch.n);
+        put_string(&mut body, &n);
+        put_string(&mut body, &ch.g);
+        put_opaque(&mut body, &ch.salt);
+        put_string(&mut body, &ch.b);
+        body.extend_from_slice(&ch.iterations.to_be_bytes());
+        put_string(&mut body, &ch.options);
+        body
+    }
+
+    /// The Mac's type 33 reply header: u8 step, u32 x = len + 4, u32 len.
+    fn with_rsa1_header(payload: &[u8]) -> Vec<u8> {
+        let mut m = vec![1];
+        m.extend_from_slice(&(payload.len() as u32 + 4).to_be_bytes());
+        m.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        m.extend_from_slice(payload);
+        m
+    }
+
+    #[test]
+    fn rsa1_key_request_bytes() {
+        assert_eq!(rsa1_key_request(), [0, 0, 0, 10, 1, 0, b'R', b'S', b'A', b'1', 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn rsa1_key_reply_and_identity_packet() {
+        let (private, reply) = mac_rsa_key();
+        let key = parse_rsa_key_reply(&reply).unwrap();
+        assert_eq!(key.bits(), 2048);
+        // Without the trailing zero byte (as when the Mac re-sends it) too.
+        assert!(parse_rsa_key_reply(&reply[..reply.len() - 1]).is_ok());
+        let packet = rsa1_identity_packet(&key, "alice").unwrap();
+        assert_eq!(packet.len(), 4 + 650);
+        assert_eq!(&packet[..14], &[0, 0, 2, 0x8a, 1, 0, b'R', b'S', b'A', b'1', 0, 2, 1, 0]);
+        assert!(packet[14 + 256..].iter().all(|&b| b == 0), "zero padding after the ciphertext");
+        let decrypter = aws_lc_rs::rsa::Pkcs1PrivateDecryptingKey::new(private).unwrap();
+        let mut out = vec![0u8; 256];
+        let plain = decrypter.decrypt(&packet[14..14 + 256], &mut out).unwrap();
+        assert_eq!(plain, identity_message("alice").as_slice());
+        // A fresh random padding each time.
+        assert_ne!(rsa1_identity_packet(&key, "alice").unwrap(), packet);
+        // A name that cannot fit in one RSA block is an error, not a truncation.
+        assert!(matches!(rsa1_identity_packet(&key, &"n".repeat(240)), Err(VncError::Auth(_))));
+    }
+
+    #[test]
+    fn rsa1_key_reply_is_bounded_and_checked() {
+        let (_, reply) = mac_rsa_key();
+        // n larger than what follows.
+        let mut long = reply.clone();
+        long[4..6].copy_from_slice(&((reply.len() - 5) as u16).to_be_bytes());
+        assert!(matches!(parse_rsa_key_reply(&long), Err(VncError::Protocol(_))));
+        assert!(parse_rsa_key_reply(&reply[..5]).is_err());
+        assert!(parse_rsa_key_reply(&[0, 1, 0, 0, 0, 3, 1, 2, 3]).is_err());
+        // A 1024-bit key is refused (here by the key size check or by the parser itself).
+        let der = unhex(RSA_1024_DER);
+        let mut small = vec![0, 1, 0, 0];
+        small.extend_from_slice(&(der.len() as u16).to_be_bytes());
+        small.extend_from_slice(&der);
+        assert!(parse_rsa_key_reply(&small).is_err());
+    }
+
+    /// A 1024-bit RSA public key (SubjectPublicKeyInfo DER), generated with openssl for this test.
+    const RSA_1024_DER: &str = concat!(
+        "30819f300d06092a864886f70d010101050003818d0030818902818100b90877b78b5b10b25cf5575b90bf8294",
+        "4a10d63db1a166a5bd1b9f6b9712f5febf052717b94f4647ccf7c9cab61a2aba884bb6b0ce26fb3dbb7356e52b",
+        "10ee481f58b2c02aa9c24759f270d4921b7630b854a51e7da5df8378f5a93e090491eaed4bd17032113a328347",
+        "16569d17074be0d647deece1892e43b8b54aca1230e10203010001",
+    );
+
+    #[test]
+    fn rsa1_challenge_layouts() {
+        let ch = kat_challenge();
+        let check = |parsed: Challenge| {
+            assert_eq!((&parsed.n, &parsed.g, &parsed.salt, &parsed.b), (&ch.n, &ch.g, &ch.salt, &ch.b));
+            assert_eq!((parsed.iterations, &parsed.options), (ch.iterations, &ch.options));
+            assert!(check_challenge(&parsed).is_ok());
+        };
+        // The documented layout, N with and without the leading zero.
+        for zero in [true, false] {
+            let body = with_rsa1_header(&challenge_body(&ch, zero));
+            check(parse_rsa1_challenge(&body).unwrap());
+        }
+        // A 1165-byte challenge (the size reported for macOS) has its control byte at 9 and
+        // a zero at 12: the first byte of a 513-byte N.
+        let body = with_rsa1_header(&challenge_body(&ch, true));
+        assert_eq!((body.len(), body[9], &body[10..12], body[12]), (1165, 0, &[2u8, 1][..], 0));
+        // The 6-byte header (u32 2, u16 length).
+        let payload = challenge_body(&ch, false);
+        let mut body = vec![0, 0, 0, 2];
+        body.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        body.extend_from_slice(&payload);
+        check(parse_rsa1_challenge(&body).unwrap());
+        // Fixed offsets: 12 header bytes, control byte, N without its length.
+        let mut body = vec![0xee; 12];
+        body.push(0);
+        body.extend_from_slice(&ch.n);
+        body.extend_from_slice(&challenge_body(&ch, false)[3 + ch.n.len()..]);
+        check(parse_rsa1_challenge(&body).unwrap());
+        // Garbage is an error, and an unknown group still fails the group check.
+        assert!(parse_rsa1_challenge(&[0, 1, 0, 0, 1, 0]).is_err());
+        let mut odd = ch.clone();
+        odd.n[100] ^= 1;
+        let parsed = parse_rsa1_challenge(&with_rsa1_header(&challenge_body(&odd, true))).unwrap();
+        assert!(matches!(check_challenge(&parsed), Err(VncError::Security(_))));
+    }
+
+    #[test]
+    fn rsa1_proof_packet_and_final() {
+        let ch = kat_challenge();
+        let p = client_proof_with(&ch, "p@ss wörd", &[0x42; 64]).unwrap();
+        let random = [0x5c; 16];
+        let packet = rsa1_proof_packet(&p, &ch.options, &random).unwrap();
+        let inner = proof_message(&p, &ch.options, &random);
+        assert_eq!(packet.len(), 4 + 1076);
+        assert_eq!(&packet[..12], &[0, 0, 4, 0x34, 1, 0, b'R', b'S', b'A', b'1', 0, 2]);
+        assert_eq!(u16::from_be_bytes([packet[12], packet[13]]) as usize, inner.len());
+        // The capture's sizes: aux 682 = 678 + 4, then u32 678, then A's length 512.
+        assert_eq!(&packet[12..20], &[0x02, 0xaa, 0, 0, 0x02, 0xa6, 0x02, 0x00]);
+        assert_eq!(&packet[14..14 + inner.len()], inner.as_slice());
+        assert!(packet[14 + inner.len()..].iter().all(|&b| b == 0));
+        // Message 4 with the reply header.
+        let mut fin = vec![64];
+        fin.extend_from_slice(&unhex(KAT_M2));
+        fin.push(16);
+        fin.extend_from_slice(&[0xab; 16]);
+        fin.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        let m2 = parse_rsa1_final(&with_rsa1_header(&fin)).unwrap();
+        assert!(p.server_proof_matches(&m2));
+        assert!(p.server_proof_matches(&parse_rsa1_final(&fin).unwrap()));
     }
 
     /// SHA-256 of each group's big-endian bytes, computed in Python from the hex in the RFC 5054

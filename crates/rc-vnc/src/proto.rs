@@ -23,6 +23,7 @@ pub(crate) const STAGE_SESSION: &str = "the session";
 pub(crate) const SEC_NONE: u8 = 1;
 pub(crate) const SEC_VNC: u8 = 2;
 pub(crate) const SEC_ARD: u8 = 30;
+pub(crate) const SEC_RSA_SRP: u8 = 33;
 pub(crate) const SEC_SRP: u8 = 36;
 
 const MAX_REASON: u32 = 64 * 1024;
@@ -43,7 +44,7 @@ pub(crate) fn security_type_name(t: u8) -> &'static str {
         21 => "MD5 hash",
         22 => "xvp",
         30 => "Apple Remote Desktop (DH)",
-        33 => "Apple (newer, type 33)",
+        33 => "Apple RSA/SRP",
         35 => "Apple (newer, type 35)",
         36 => "Apple SRP",
         129 => "RA2 (RealVNC 129)",
@@ -203,13 +204,16 @@ fn pick_security(
     let has = |t: u8| offered.contains(&t);
     let have_user = has_user(config);
     let have_pass = config.password.is_some();
-    // SRP (36) only when we are encrypting (policy is Off for every non-889 session).
+    // SRP only when we are encrypting (policy is Off for every non-889 session), and only when
+    // the Mac lists 36: a Mac takes SRP inside type 33 only then (and Apple's viewer sends 33's
+    // SRP form only then). Carried by 33 when listed, as Apple's viewer does; 36 otherwise.
     let use_srp = srp && policy != EncryptionPolicy::Off && has(SEC_SRP);
+    let srp_type = if has(SEC_RSA_SRP) { SEC_RSA_SRP } else { SEC_SRP };
     if use_srp && have_user && have_pass {
-        return Ok(SEC_SRP);
+        return Ok(srp_type);
     }
     if policy == EncryptionPolicy::Required {
-        // Types 36 (SRP, above) and 30 lead to an encrypted session.
+        // SRP (types 33 / 36, above) and type 30 lead to an encrypted session.
         if has(SEC_ARD) || has(SEC_SRP) {
             if !have_user {
                 return Err(VncError::Auth(format!(
@@ -222,7 +226,7 @@ fn pick_security(
                 return Err(VncError::Auth("the server needs a password for this macOS account, but none was supplied".into()));
             }
             if use_srp {
-                return Ok(SEC_SRP);
+                return Ok(srp_type);
             }
             if !allow_unverified || !has(SEC_ARD) {
                 return Err(unverified_refused(offered, srp));
@@ -233,7 +237,7 @@ fn pick_security(
         let weak = has(SEC_NONE) || has(SEC_VNC);
         return Err(VncError::Security(format!(
             "the session could not be encrypted: the Mac offers security types [{}], and this client can encrypt \
-             only after Apple's macOS-account sign-in (type 36 SRP or type 30), which is not among them.{}",
+             only after Apple's macOS-account sign-in (SRP, types 33 and 36, or type 30), which is not among them.{}",
             describe_types(offered),
             if weak { format!(" {DOWNGRADE_NOTE}") } else { String::new() }
         )));
@@ -272,16 +276,43 @@ fn pick_security(
     )))
 }
 
-/// One SRP message from the server: `u32` length, then the body.
-async fn read_srp_message<S: AsyncRead + Unpin>(s: &mut S, what: &str) -> Result<Vec<u8>> {
+/// One SRP message from the server: `u32` length (at most `max`), then the body.
+async fn read_srp_message<S: AsyncRead + Unpin>(s: &mut S, what: &str, max: u32) -> Result<Vec<u8>> {
     let len = s.read_u32().await?;
-    if len > srp::MAX_MESSAGE {
+    if len > max {
+        log_following_bytes(s, what).await;
         return proto(format!("SRP: implausible {what} length {len}"));
     }
     let mut body = vec![0u8; len as usize];
     s.read_exact(&mut body).await?;
     debug!(len, "SRP: received the {what}");
     Ok(body)
+}
+
+/// The shortest plausible SRP challenge (a 3072-bit N alone takes 386 bytes).
+const MIN_SRP_CHALLENGE: u32 = 256;
+
+/// Diagnostics after an implausible length from the Mac: log (debug) up to 64 bytes that
+/// follow, waiting at most two seconds. Only bytes the Mac sent are logged, never ours.
+async fn log_following_bytes<S: AsyncRead + Unpin>(s: &mut S, what: &str) {
+    let mut buf = [0u8; 64];
+    let mut got = 0;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while got < buf.len() {
+        match tokio::time::timeout_at(deadline, s.read(&mut buf[got..])).await {
+            Ok(Ok(n)) if n > 0 => got += n,
+            Ok(Ok(_)) => {
+                debug!("SRP: the Mac closed the connection");
+                break;
+            }
+            Ok(Err(e)) => {
+                debug!("SRP: read error while collecting diagnostics: {e}");
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+    debug!(bytes = got, following = %srp::hex_bytes(&buf[..got]), "SRP: bytes that followed the {what} length");
 }
 
 /// The error for a server that offers only None / VNC password when a macOS account is set.
@@ -460,15 +491,55 @@ where
             // MD5(shared secret): also the wrap key for the encrypted session's first rekey.
             wrap_key = Some(response.wrap_key);
         }
-        SEC_SRP => {
+        SEC_SRP | SEC_RSA_SRP => {
             status(events, "Authenticating (macOS account, SRP)").await?;
             let username = config.username.as_deref().unwrap_or("");
-            let identity = srp::identity_message(username);
-            debug!(bytes = identity.len(), "SRP: sending the identity message");
-            s.write_all(&identity).await?;
-            s.flush().await?;
-            let challenge = read_srp_message(s, "challenge").await?;
-            let challenge = srp::parse_challenge(&challenge).inspect_err(|e| warn!("SRP: bad challenge: {e}"))?;
+            let rsa = chosen == SEC_RSA_SRP;
+            let challenge = if rsa {
+                // Type 33: fetch the Mac's RSA key, send message 1 encrypted to it.
+                debug!("SRP (type 33): asking for the Mac's RSA public key");
+                s.write_all(&srp::rsa1_key_request()).await?;
+                s.flush().await?;
+                let reply = read_srp_message(s, "RSA key reply", srp::MAX_RSA_KEY_REPLY).await?;
+                let key = srp::parse_rsa_key_reply(&reply).inspect_err(|e| {
+                    warn!("SRP: bad RSA key reply: {e}");
+                    debug!(head = %srp::hex_bytes(&reply[..reply.len().min(64)]), "SRP: start of the RSA key reply");
+                })?;
+                // Not authenticated, and it need not be: the Mac's proof M2 below verifies the Mac.
+                debug!(bits = key.bits(), "SRP (type 33): the Mac's RSA key");
+                let packet = srp::rsa1_identity_packet(&key, username)?;
+                debug!(bytes = packet.len(), "SRP (type 33): sending the encrypted identity message");
+                s.write_all(&packet).await?;
+                s.flush().await?;
+                let body = read_srp_message(s, "challenge", srp::MAX_MESSAGE).await?;
+                srp::parse_rsa1_challenge(&body).map_err(|e| {
+                    debug!(head = %srp::hex_bytes(&body[..body.len().min(64)]), "SRP: start of the challenge");
+                    if body.starts_with(&[0, 1, 0, 0]) {
+                        warn!("SRP: the Mac sent its RSA key again instead of the challenge");
+                        VncError::Protocol(
+                            "SRP: the Mac could not decrypt the sign-in request (it sent its RSA key again)".into(),
+                        )
+                    } else {
+                        warn!("SRP: bad challenge: {e}");
+                        e
+                    }
+                })?
+            } else {
+                let identity = srp::identity_message(username);
+                debug!(bytes = identity.len(), "SRP: sending the identity message");
+                s.write_all(&identity).await?;
+                s.flush().await?;
+                let len = s.read_u32().await?;
+                if !(MIN_SRP_CHALLENGE..=srp::MAX_MESSAGE).contains(&len) {
+                    warn!(len, "SRP: implausible challenge length");
+                    log_following_bytes(s, "challenge").await;
+                    return proto(format!("SRP: the Mac answered the identity message with an implausible length ({len})"));
+                }
+                let mut body = vec![0u8; len as usize];
+                s.read_exact(&mut body).await?;
+                debug!(len, "SRP: received the challenge");
+                srp::parse_challenge(&body).inspect_err(|e| warn!("SRP: bad challenge: {e}"))?
+            };
             debug!(
                 n_bits = challenge.n.len() * 8,
                 g = %challenge.g.iter().map(|b| format!("{b:02x}")).collect::<String>(),
@@ -491,7 +562,11 @@ where
             let mut client_random = [0u8; 16];
             getrandom::fill(&mut client_random)
                 .map_err(|e| VncError::Other(format!("could not get random bytes from the OS: {e}")))?;
-            let msg = srp::proof_message(&proof, &challenge.options, &client_random);
+            let msg = if rsa {
+                srp::rsa1_proof_packet(&proof, &challenge.options, &client_random)?
+            } else {
+                srp::proof_message(&proof, &challenge.options, &client_random)
+            };
             debug!(bytes = msg.len(), "SRP: sending A and the proof M1");
             s.write_all(&msg).await?;
             s.flush().await?;
@@ -506,12 +581,13 @@ where
                 )));
             }
             if len > srp::MAX_MESSAGE {
+                log_following_bytes(s, "server proof").await;
                 return proto(format!("SRP: implausible server proof length {len}"));
             }
             let mut fin = vec![0u8; len as usize];
             s.read_exact(&mut fin).await?;
             debug!(len, "SRP: received the server proof");
-            let m2 = srp::parse_final(&fin)?;
+            let m2 = if rsa { srp::parse_rsa1_final(&fin)? } else { srp::parse_final(&fin)? };
             if !proof.server_proof_matches(&m2) {
                 warn!(m2_len = m2.len(), "SRP: the Mac's proof M2 is wrong");
                 return Err(VncError::Security(
@@ -691,7 +767,10 @@ mod tests {
         let mac = [30, 33, 36, 35];
         for policy in [EncryptionPolicy::Required, EncryptionPolicy::Preferred] {
             for allow in [false, true] {
-                assert_eq!(pick_security(&mac, &full, policy, true, allow).unwrap(), 36);
+                // 33 carries SRP when listed (as Apple's viewer does); 36 only without 33.
+                assert_eq!(pick_security(&mac, &full, policy, true, allow).unwrap(), 33);
+                assert_eq!(pick_security(&[36, 33], &full, policy, true, allow).unwrap(), 33);
+                assert_eq!(pick_security(&[30, 36, 35], &full, policy, true, allow).unwrap(), 36);
                 assert_eq!(pick_security(&[36], &full, policy, true, allow).unwrap(), 36);
             }
         }
@@ -793,7 +872,9 @@ mod tests {
     fn required_policy_refuses_weak_types() {
         let req = |offered: &[u8], c: &VncConfig| pick_security(offered, c, EncryptionPolicy::Required, true, false);
         let full = cfg(Some("u"), Some("p"));
-        assert_eq!(req(&[30, 33, 36, 35, 2], &full).unwrap(), 36);
+        assert_eq!(req(&[30, 33, 36, 35, 2], &full).unwrap(), 33);
+        // 33 without 36: the Mac would not take SRP inside 33, so it is not a verified sign-in.
+        assert!(matches!(req(&[30, 33, 35], &full), Err(VncError::Security(_))));
         assert_eq!(pick_security(&[30, 33, 35, 2], &full, EncryptionPolicy::Required, true, true).unwrap(), 30);
         for offered in [&[1u8][..], &[2], &[2, 1], &[33, 35, 2]] {
             match req(offered, &full) {

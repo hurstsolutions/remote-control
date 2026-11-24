@@ -5485,6 +5485,7 @@ name = "rc-vnc"
 version = "0.1.0"
 dependencies = [
  "aes 0.9.4",
+ "aws-lc-rs",
  "des",
  "flate2",
  "getrandom 0.3.4",

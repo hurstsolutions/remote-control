@@ -80,7 +80,7 @@ enum Command {
         /// (use off for non-Mac VNC servers on a trusted LAN), off through the SSH tunnel.
         #[arg(long, value_parser = parse_encryption)]
         encryption: Option<rc_vnc::EncryptionPolicy>,
-        /// Do not sign in with SRP (type 36); use type 30 for encrypted sessions.
+        /// Do not sign in with SRP (types 33/36); use type 30 for encrypted sessions.
         #[arg(long)]
         no_srp: bool,
         #[arg(long, default_value_t = 22)]

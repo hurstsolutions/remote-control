@@ -785,9 +785,11 @@ struct AppleOpts {
     big_update: bool,
     /// Split every server message into records of at most this many body bytes.
     chunk: Option<usize>,
-    /// Offer type 36 (SRP) besides 30.
+    /// Offer type 36 (SRP) besides 30 (and 33, which then carries SRP).
     offer_srp: bool,
-    /// The client is expected to pick 36 when offered (it does unless SRP is turned off).
+    /// Leave 33 out of the list, so that SRP goes over 36.
+    no_33: bool,
+    /// The client is expected to use SRP when offered (it does unless SRP is turned off).
     expect_srp: bool,
     /// Send a wrong SRP proof M2 (an impostor that got the password check past somehow).
     bad_m2: bool,
@@ -854,19 +856,62 @@ fn sha512(parts: &[&[u8]]) -> Vec<u8> {
     d.finalize().to_vec()
 }
 
-/// Type 36 (SRP-6a, SHA-512, PBKDF2) on the mock Mac, the server's half written from the
-/// formulas: v = g^x, B = k*v + g^b, S = (A * v^u)^b. Returns the wrap key SHA-256(K)[..16],
-/// or None after refusing the proof.
-async fn srp_server(s: &mut TcpStream, user: &str, pass: &str, bad_m2: bool) -> Option<[u8; 16]> {
+/// The Mac's type 33 reply: u32 total, u8 step, u32 x = len + 4, u32 len, the SRP message.
+fn rsa1_reply(payload: &[u8]) -> Vec<u8> {
+    let mut m = ((payload.len() + 9) as u32).to_be_bytes().to_vec();
+    m.push(1);
+    m.extend_from_slice(&(payload.len() as u32 + 4).to_be_bytes());
+    m.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    m.extend_from_slice(payload);
+    m
+}
+
+/// Read a client RSA1 envelope of kind 2; checks the header and returns (aux, body).
+async fn read_rsa1_envelope(s: &mut TcpStream, expected_total: usize) -> (usize, Vec<u8>) {
+    let total = s.read_u32().await.unwrap() as usize;
+    assert_eq!(total, expected_total);
+    let e = skip(s, total).await.unwrap();
+    assert_eq!(&e[..10], &[1, 0, b'R', b'S', b'A', b'1', 0, 2, e[8], e[9]]);
+    let aux = u16::from_be_bytes([e[8], e[9]]) as usize;
+    (aux, e[10..].to_vec())
+}
+
+/// SRP-6a (SHA-512, PBKDF2) on the mock Mac, over type 36 or (with `rsa`) type 33, the server's
+/// half written from the formulas: v = g^x, B = k*v + g^b, S = (A * v^u)^b. Returns the wrap key
+/// SHA-256(K)[..16], or None after refusing the proof.
+async fn srp_server(s: &mut TcpStream, user: &str, pass: &str, bad_m2: bool, rsa: bool) -> Option<[u8; 16]> {
     let len = APPLE_KEY_LEN;
     let n_bytes = unhex(SRP_N_4096);
     assert_eq!(n_bytes.len(), len);
     let n = BigUint::from_bytes_be(&n_bytes);
     let g = BigUint::from(5u8);
     let pad = |v: &BigUint| pad_left(v.to_bytes_be(), len);
-    // Message 1: "", username, "", opaque "".
-    let mlen = s.read_u32().await.unwrap() as usize;
-    let id = skip(s, mlen).await.unwrap();
+    // Message 1: "", username, "", opaque "" (type 33: encrypted to the Mac's RSA key).
+    let id = if rsa {
+        use aws_lc_rs::encoding::AsDer;
+        assert_eq!(skip(s, 14).await.unwrap(), [0, 0, 0, 10, 1, 0, b'R', b'S', b'A', b'1', 0, 0, 0, 0]);
+        let private = aws_lc_rs::rsa::PrivateDecryptingKey::generate(aws_lc_rs::rsa::KeySize::Rsa2048).unwrap();
+        let der = private.public_key().as_der().unwrap();
+        let der = der.as_ref();
+        let mut m = ((der.len() + 7) as u32).to_be_bytes().to_vec();
+        m.extend_from_slice(&[0, 1, 0, 0]);
+        m.extend_from_slice(&(der.len() as u16).to_be_bytes());
+        m.extend_from_slice(der);
+        m.push(0);
+        s.write_all(&m).await.unwrap();
+        let (aux, body) = read_rsa1_envelope(s, 650).await;
+        assert_eq!(aux, 256);
+        assert!(body[256..].iter().all(|&b| b == 0));
+        let mut out = vec![0u8; 256];
+        let plain =
+            aws_lc_rs::rsa::Pkcs1PrivateDecryptingKey::new(private).unwrap().decrypt(&body[..256], &mut out).unwrap();
+        let mlen = u32::from_be_bytes(plain[..4].try_into().unwrap()) as usize;
+        assert_eq!(mlen, plain.len() - 4);
+        plain[4..].to_vec()
+    } else {
+        let mlen = s.read_u32().await.unwrap() as usize;
+        skip(s, mlen).await.unwrap()
+    };
     let ulen = u16::from_be_bytes([id[2], id[3]]) as usize;
     assert_eq!(&id[..2], &[0, 0]);
     assert_eq!(&id[4..4 + ulen], user.as_bytes());
@@ -883,7 +928,13 @@ async fn srp_server(s: &mut TcpStream, user: &str, pass: &str, bad_m2: bool) -> 
     let big_b = (&k * &v + g.modpow(&b, &n)) % &n;
     let options = b"mda=SHA-512,replay_detection,conf+int=ChaCha20-Poly1305,kdf=SALTED-SHA512-PBKDF2";
     let mut m = vec![0u8];
-    m.extend_from_slice(&(len as u16).to_be_bytes());
+    if rsa {
+        // N as a 513-byte positive integer, as macOS may send it.
+        m.extend_from_slice(&(len as u16 + 1).to_be_bytes());
+        m.push(0);
+    } else {
+        m.extend_from_slice(&(len as u16).to_be_bytes());
+    }
     m.extend_from_slice(&n_bytes);
     m.extend_from_slice(&[0, 1, 5]);
     m.push(salt.len() as u8);
@@ -893,12 +944,25 @@ async fn srp_server(s: &mut TcpStream, user: &str, pass: &str, bad_m2: bool) -> 
     m.extend_from_slice(&iterations.to_be_bytes());
     m.extend_from_slice(&(options.len() as u16).to_be_bytes());
     m.extend_from_slice(options);
-    let mut framed = (m.len() as u32).to_be_bytes().to_vec();
-    framed.extend(m);
+    let framed = if rsa {
+        rsa1_reply(&m)
+    } else {
+        let mut framed = (m.len() as u32).to_be_bytes().to_vec();
+        framed.extend(m);
+        framed
+    };
     s.write_all(&framed).await.unwrap();
-    // Message 3: A, M1, options echo, 16 random bytes.
-    let mlen = s.read_u32().await.unwrap() as usize;
-    let p3 = skip(s, mlen).await.unwrap();
+    // Message 3: A, M1, options echo, 16 random bytes (type 33: in clear in an envelope).
+    let p3 = if rsa {
+        let (aux, body) = read_rsa1_envelope(s, 1076).await;
+        let mlen = u32::from_be_bytes(body[..4].try_into().unwrap()) as usize;
+        assert_eq!(aux, mlen + 4);
+        assert!(body[aux..].iter().all(|&b| b == 0));
+        body[4..aux].to_vec()
+    } else {
+        let mlen = s.read_u32().await.unwrap() as usize;
+        skip(s, mlen).await.unwrap()
+    };
     let alen = u16::from_be_bytes([p3[0], p3[1]]) as usize;
     assert_eq!(alen, len, "A is padded to the length of N");
     let a_bytes = &p3[2..2 + alen];
@@ -930,8 +994,13 @@ async fn srp_server(s: &mut TcpStream, user: &str, pass: &str, bad_m2: bool) -> 
     m.push(16);
     m.extend_from_slice(&[0xab; 16]);
     m.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
-    let mut framed = (m.len() as u32).to_be_bytes().to_vec();
-    framed.extend(m);
+    let framed = if rsa {
+        rsa1_reply(&m)
+    } else {
+        let mut framed = (m.len() as u32).to_be_bytes().to_vec();
+        framed.extend(m);
+        framed
+    };
     s.write_all(&framed).await.unwrap();
     if bad_m2 {
         return None;
@@ -946,13 +1015,22 @@ async fn serve_apple(mut s: TcpStream, enc: Enc, user: &str, pass: &str, opts: A
     let mut v = [0u8; 12];
     s.read_exact(&mut v).await.unwrap();
     assert_eq!(&v, b"RFB 003.889\n", "client must answer Apple's revision to encrypt");
-    let offer: &[u8] = if opts.offer_srp { &[30, 33, 36, 35] } else { &[30, 33, 35] };
+    let offer: &[u8] = match (opts.offer_srp, opts.no_33) {
+        (true, false) => &[30, 33, 36, 35],
+        (true, true) => &[30, 36, 35],
+        (false, _) => &[30, 33, 35],
+    };
     s.write_all(&[offer.len() as u8]).await.unwrap();
     s.write_all(offer).await.unwrap();
     let chosen = s.read_u8().await.unwrap();
-    assert_eq!(chosen, if opts.offer_srp && opts.expect_srp { 36 } else { 30 });
-    let wrap = if chosen == 36 {
-        match srp_server(&mut s, user, pass, opts.bad_m2).await {
+    let expected = match (opts.offer_srp && opts.expect_srp, opts.no_33) {
+        (true, false) => 33,
+        (true, true) => 36,
+        (false, _) => 30,
+    };
+    assert_eq!(chosen, expected);
+    let wrap = if chosen == 33 || chosen == 36 {
+        match srp_server(&mut s, user, pass, opts.bad_m2, chosen == 33).await {
             Some(w) => w,
             None => return Vec::new(),
         }
@@ -1398,6 +1476,15 @@ async fn apple_srp_session_is_encrypted_and_verified() {
     assert!(run.received.contains(&vec![4, 1, 0, 0, 0, 0, 0, 0x61]));
 }
 
+/// Type 36 carries SRP when the Mac does not list 33.
+#[tokio::test]
+async fn apple_srp_over_type_36_without_33() {
+    let opts = AppleOpts { offer_srp: true, no_33: true, expect_srp: true, ..Default::default() };
+    let run = run_apple(Enc::Raw, opts, vec![]).await;
+    assert_picture(&run.fb);
+    assert_eq!(run.security, [VncSecurity::EncryptedVerified], "{:?}", run.statuses);
+}
+
 #[tokio::test]
 async fn apple_srp_turned_off_uses_type_30() {
     let opts = AppleOpts { offer_srp: true, expect_srp: false, ..Default::default() };
@@ -1408,30 +1495,33 @@ async fn apple_srp_turned_off_uses_type_30() {
 
 #[tokio::test]
 async fn apple_srp_wrong_password_is_an_auth_failure() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let server = tokio::spawn(async move {
-        let (s, _) = listener.accept().await.unwrap();
-        let opts = AppleOpts { offer_srp: true, expect_srp: true, ..Default::default() };
-        serve_apple(s, Enc::Raw, "u", "right", opts).await
-    });
-    let config = VncConfig { username: Some("u".into()), password: Some(String::from("wrong").into()), ..Default::default() };
-    let options = VncOptions::default().with_encryption(EncryptionPolicy::Required);
-    let (io, mut handle) = session_channels();
-    let client =
-        tokio::spawn(async move { rc_vnc::connect_and_run_with_options("127.0.0.1", port, config, options, io).await });
-    let err = loop {
-        match tokio::time::timeout(T, handle.events.recv()).await.expect("timed out") {
-            Some(SessionEvent::Closed { error }) => break error.expect("expected an error"),
-            Some(SessionEvent::Connected { .. }) => panic!("must not connect"),
-            Some(_) => {}
-            None => panic!("no Closed event"),
-        }
-    };
-    assert_eq!(err.kind, ErrorKind::AuthFailed, "{}", err.detail);
-    assert!(err.detail.contains("SRP"), "{}", err.detail);
-    client.await.unwrap();
-    server.await.unwrap();
+    // Over type 33 and over type 36.
+    for no_33 in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            let opts = AppleOpts { offer_srp: true, expect_srp: true, no_33, ..Default::default() };
+            serve_apple(s, Enc::Raw, "u", "right", opts).await
+        });
+        let config = VncConfig { username: Some("u".into()), password: Some(String::from("wrong").into()), ..Default::default() };
+        let options = VncOptions::default().with_encryption(EncryptionPolicy::Required);
+        let (io, mut handle) = session_channels();
+        let client =
+            tokio::spawn(async move { rc_vnc::connect_and_run_with_options("127.0.0.1", port, config, options, io).await });
+        let err = loop {
+            match tokio::time::timeout(T, handle.events.recv()).await.expect("timed out") {
+                Some(SessionEvent::Closed { error }) => break error.expect("expected an error"),
+                Some(SessionEvent::Connected { .. }) => panic!("must not connect"),
+                Some(_) => {}
+                None => panic!("no Closed event"),
+            }
+        };
+        assert_eq!(err.kind, ErrorKind::AuthFailed, "{}", err.detail);
+        assert!(err.detail.contains("SRP"), "{}", err.detail);
+        client.await.unwrap();
+        server.await.unwrap();
+    }
 }
 
 /// Security audit round 2: a man in the middle strips SRP (36) from the Mac's list to force
@@ -1459,30 +1549,60 @@ async fn required_refuses_srp_stripped_from_the_list() {
 /// verified. Now it ends the connection before ClientInit.
 #[tokio::test]
 async fn apple_srp_wrong_server_proof_is_refused() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let server = tokio::spawn(async move {
-        let (s, _) = listener.accept().await.unwrap();
-        let opts = AppleOpts { offer_srp: true, expect_srp: true, bad_m2: true, ..Default::default() };
-        serve_apple(s, Enc::Raw, "u", "right", opts).await
-    });
-    let config =
-        VncConfig { username: Some("u".into()), password: Some(String::from("right").into()), ..Default::default() };
-    let options = VncOptions::default().with_encryption(EncryptionPolicy::Required);
+    // Over type 33 and over type 36.
+    for no_33 in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            let opts = AppleOpts { offer_srp: true, expect_srp: true, no_33, bad_m2: true, ..Default::default() };
+            serve_apple(s, Enc::Raw, "u", "right", opts).await
+        });
+        let config =
+            VncConfig { username: Some("u".into()), password: Some(String::from("right").into()), ..Default::default() };
+        let options = VncOptions::default().with_encryption(EncryptionPolicy::Required);
+        let (io, mut handle) = session_channels();
+        let client =
+            tokio::spawn(async move { rc_vnc::connect_and_run_with_options("127.0.0.1", port, config, options, io).await });
+        let err = loop {
+            match tokio::time::timeout(T, handle.events.recv()).await.expect("timed out") {
+                Some(SessionEvent::Closed { error }) => break error.expect("expected an error"),
+                Some(SessionEvent::Connected { .. }) => panic!("must not connect"),
+                Some(ev @ SessionEvent::Security { .. }) => panic!("must not report security: {ev:?}"),
+                Some(_) => {}
+                None => panic!("no Closed event"),
+            }
+        };
+        assert_eq!(err.kind, ErrorKind::Security, "{}", err.detail);
+        assert!(err.detail.contains("M2"), "{}", err.detail);
+        client.await.unwrap();
+        server.await.unwrap();
+    }
+}
+
+/// A real Mac answered type 36's first message with a zero length. The client now names the
+/// length and (in the debug log) the bytes that followed, instead of failing to parse.
+#[tokio::test]
+async fn srp_type_36_zero_length_is_reported() {
+    let (client, mut server) = tokio::io::duplex(1 << 16);
     let (io, mut handle) = session_channels();
-    let client =
-        tokio::spawn(async move { rc_vnc::connect_and_run_with_options("127.0.0.1", port, config, options, io).await });
+    let options = VncOptions::default().with_encryption(EncryptionPolicy::Required);
+    let task = tokio::spawn(rc_vnc::run_with_options(client, creds(), options, io));
+    server.write_all(b"RFB 003.889\n").await.unwrap();
+    server.write_all(&[3, 30, 36, 35]).await.unwrap();
+    let mut got = [0u8; 12 + 1 + 4 + 12];
+    server.read_exact(&mut got).await.unwrap();
+    assert_eq!(&got[12..13], &[36]);
+    assert_eq!(&got[13..17], &[0, 0, 0, 12], "type 36 message 1 for \"alice\"");
+    server.write_all(&[0, 0, 0, 0, 0xde, 0xad]).await.unwrap();
     let err = loop {
         match tokio::time::timeout(T, handle.events.recv()).await.expect("timed out") {
             Some(SessionEvent::Closed { error }) => break error.expect("expected an error"),
             Some(SessionEvent::Connected { .. }) => panic!("must not connect"),
-            Some(ev @ SessionEvent::Security { .. }) => panic!("must not report security: {ev:?}"),
             Some(_) => {}
             None => panic!("no Closed event"),
         }
     };
-    assert_eq!(err.kind, ErrorKind::Security, "{}", err.detail);
-    assert!(err.detail.contains("M2"), "{}", err.detail);
-    client.await.unwrap();
-    server.await.unwrap();
+    assert!(err.detail.contains("implausible length (0)"), "{}", err.detail);
+    task.await.unwrap();
 }
