@@ -124,7 +124,15 @@ export function sortHosts(hosts: FoundHost[], key: SortKey, ascending: boolean):
 
 /** Every name a host is known by, best first, without duplicates. */
 export function allNames(host: FoundHost): string[] {
-  const names = [host.name, host.names.rdp_certificate, host.names.mdns_name, host.names.mdns_host, host.names.netbios, host.names.dns];
+  const names = [
+    host.name,
+    host.names.rdp_certificate,
+    host.names.mdns_name,
+    host.names.mdns_host,
+    host.names.smb,
+    host.names.netbios,
+    host.names.dns,
+  ];
   const seen = new Set<string>();
   const out: string[] = [];
   for (const name of names) {
@@ -152,6 +160,61 @@ export function filterHosts(hosts: FoundHost[], text: string): FoundHost[] {
   return hosts.filter((host) =>
     [host.ip, ...allNames(host), ...serviceLabels(host), host.model ?? ""].some((value) => value.toLowerCase().includes(needle)),
   );
+}
+
+/** Where the best name came from, for the results list. Same order as the backend picks it. */
+export function nameSource(host: FoundHost): string | null {
+  if (host.name === null) return null;
+  const sources: Array<[string | null, string]> = [
+    [host.names.rdp_certificate, "Remote Desktop certificate"],
+    [host.names.mdns_name, "Bonjour"],
+    [host.names.mdns_host, "Bonjour"],
+    [host.names.smb, "file sharing (SMB)"],
+    [host.names.netbios, "NetBIOS"],
+    [host.names.dns, "DNS"],
+  ];
+  return sources.find(([name]) => name === host.name)?.[1] ?? null;
+}
+
+/**
+ * A Windows PC or a Mac, shown by default. Anything answering Remote Desktop counts, and so does
+ * a Screen Sharing port whose greeting we could not read (it may be a Mac). Other devices (access
+ * points, switches, printers, Linux boxes with SSH or a non-Apple VNC server) are hidden until the
+ * user asks to see everything.
+ */
+export function isComputer(host: FoundHost): boolean {
+  if (host.kind === "windows" || host.kind === "mac") return true;
+  if (host.rdp !== null) return true;
+  return host.vnc !== null && host.rfb_version === null;
+}
+
+/** Whether an IPv4 address is inside a CIDR (false for anything unparsable). */
+export function ipInCidr(ip: string, cidr: string): boolean {
+  const address = parseIpv4(ip);
+  const parsed = parseCidr(cidr);
+  if (address === null || !parsed.ok) return false;
+  const network = parseIpv4(parsed.value.cidr.split("/")[0] ?? "");
+  const mask = maskOf(parsed.value.prefix);
+  return network !== null && ((address & mask) >>> 0) === network;
+}
+
+/** The results with every machine inside any of `cidrs` taken out (before those are rescanned). */
+export function withoutSubnets(hosts: FoundHost[], cidrs: string[]): FoundHost[] {
+  return hosts.filter((host) => !cidrs.some((cidr) => ipInCidr(host.ip, cidr)));
+}
+
+/** Add a found machine, replacing an earlier result for the same address. */
+export function upsertHost(hosts: FoundHost[], host: FoundHost): FoundHost[] {
+  const index = hosts.findIndex((h) => h.ip === host.ip);
+  if (index < 0) return [...hosts, host];
+  const out = [...hosts];
+  out[index] = host;
+  return out;
+}
+
+/** "Show all devices (3 hidden)". */
+export function hiddenToggleLabel(hidden: number): string {
+  return hidden > 0 ? `Show all devices (${hidden.toLocaleString("en-US")} hidden)` : "Show all devices";
 }
 
 function normalizeHost(host: string): string {

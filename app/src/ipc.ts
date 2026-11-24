@@ -194,6 +194,8 @@ export interface FoundHost {
     mdns_name: string | null;
     mdns_host: string | null;
     netbios: string | null;
+    /** The computer name from the SMB server's NTLM challenge (DNS form when given, else NetBIOS). */
+    smb: string | null;
     dns: string | null;
   };
   kind: HostKind;
