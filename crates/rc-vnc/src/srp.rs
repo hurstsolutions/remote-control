@@ -365,7 +365,7 @@ pub(crate) fn rsa1_identity_packet(key: &MacRsaKey, username: &str) -> Result<Ve
         return Err(VncError::Auth(format!(
             "the username is too long for Apple's sign-in ({} bytes; at most {})",
             username.len(),
-            key.0.max_plaintext_size() - (plain.len() - username.len())
+            key.0.max_plaintext_size().saturating_sub(plain.len().saturating_sub(username.len()))
         )));
     }
     let mut ct = vec![0u8; key.0.ciphertext_size()];
@@ -408,7 +408,7 @@ pub(crate) fn parse_rsa1_challenge(body: &[u8]) -> Result<Challenge> {
     let (payload, layout) = rsa1_payload(body);
     let first = match parse_challenge(payload) {
         Ok(ch) => {
-            tracing::debug!(layout, header = %hex_bytes(&body[..body.len() - payload.len()]), "SRP: type 33 challenge layout");
+            tracing::debug!(layout, header = %hex_bytes(&body[..body.len().saturating_sub(payload.len()).min(16)]), "SRP: type 33 challenge layout");
             return Ok(ch);
         }
         Err(e) => e,
