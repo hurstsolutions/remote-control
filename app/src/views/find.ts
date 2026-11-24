@@ -12,6 +12,8 @@ import {
   allNames,
   estimateDuration,
   filterHosts,
+  nameMatchWarning,
+  nameOnlyMatches,
   parseCidr,
   prefillConnection,
   progressText,
@@ -29,6 +31,10 @@ export interface FindHost {
 
 /** Ask before scanning more addresses than this. */
 const CONFIRM_ABOVE = 1024;
+/** Found machines arriving during a scan are shown in batches, at most this often. */
+const RENDER_BATCH_MS = 150;
+export const TOO_MANY_MESSAGE =
+  "The scan stopped: too many addresses answered. A proxy or firewall may be answering for every address, so these results don't show real computers.";
 let fieldCounter = 0;
 
 export class FindView {
@@ -42,6 +48,10 @@ export class FindView {
   private scanId: string | null = null;
   /** Bumped per scan, so events of an earlier scan are ignored. */
   private generation = 0;
+  /** A batched results render is pending. */
+  private renderTimer = 0;
+  /** Built rows, reused across renders; dropped when the saved connections change. */
+  private rows = new WeakMap<FoundHost, HTMLElement>();
 
   private readonly problem: HTMLElement;
   private readonly subnetList: HTMLElement;
@@ -124,7 +134,10 @@ export class FindView {
         this.resultsNote,
       ),
     );
-    host.store.subscribe(() => this.renderResults());
+    host.store.subscribe(() => {
+      this.rows = new WeakMap();
+      this.renderResults();
+    });
     this.renderSort();
     this.renderResults();
     void this.loadSubnets();
@@ -378,14 +391,19 @@ export class FindView {
         break;
       case "host":
         this.hosts.push(event.host);
-        this.renderResults();
+        this.scheduleRender();
         break;
       case "finished": {
         this.scanning = false;
         this.scanId = null;
         this.progress.hidden = true;
         const summary = progressText(event.done, event.total, event.found);
-        this.status.textContent = event.cancelled ? `Scan cancelled: ${summary}.` : `Scan finished: ${summary}.`;
+        this.status.textContent = event.too_many
+          ? `Scan stopped: ${summary}.`
+          : event.cancelled
+            ? `Scan cancelled: ${summary}.`
+            : `Scan finished: ${summary}.`;
+        if (event.too_many) this.showProblem(TOO_MANY_MESSAGE);
         this.renderScanState();
         this.renderResults();
         break;
@@ -425,9 +443,17 @@ export class FindView {
     }
   }
 
+  /** Render soon, once for everything that arrived meanwhile. */
+  private scheduleRender(): void {
+    if (this.renderTimer) return;
+    this.renderTimer = window.setTimeout(() => this.renderResults(), RENDER_BATCH_MS);
+  }
+
   private renderResults(): void {
+    window.clearTimeout(this.renderTimer);
+    this.renderTimer = 0;
     const shown = sortHosts(filterHosts(this.hosts, this.filter.value), this.sortKey, this.ascending);
-    this.resultsBody.replaceChildren(...shown.map((host) => this.resultRow(host)));
+    this.resultsBody.replaceChildren(...shown.map((host) => this.cachedRow(host)));
     if (this.hosts.length === 0) {
       this.resultsNote.textContent = this.scanning ? "Computers appear here as they are found." : "No results yet. Choose subnets and press Scan.";
     } else if (shown.length < this.hosts.length) {
@@ -436,6 +462,15 @@ export class FindView {
       this.resultsNote.textContent = "";
     }
     this.resultsNote.hidden = this.resultsNote.textContent === "";
+  }
+
+  private cachedRow(found: FoundHost): HTMLElement {
+    let row = this.rows.get(found);
+    if (!row) {
+      row = this.resultRow(found);
+      this.rows.set(found, row);
+    }
+    return row;
   }
 
   private resultRow(found: FoundHost): HTMLElement {
@@ -456,6 +491,10 @@ export class FindView {
     const savedCell = h("td", { class: "results-saved" });
     if (matches.length > 0) {
       savedCell.append(h("span", { class: "saved-tag", text: matches.length === 1 ? `Saved: ${matches[0]?.name ?? ""}` : `Saved (${matches.length})`, title: matches.map((m) => m.name).join(", ") }));
+    }
+    // Names are announced by the machine itself: a name match alone is only worth a warning.
+    for (const match of nameOnlyMatches(found, this.host.store.connections)) {
+      savedCell.append(h("span", { class: "saved-tag name-only", text: nameMatchWarning(match), title: "Anyone on the network can announce any name. Only the address identifies a saved computer." }));
     }
 
     const protocols = addableProtocols(found);
@@ -486,7 +525,7 @@ export class FindView {
   }
 
   private async add(found: FoundHost, protocol: Protocol): Promise<void> {
-    const saved = await openEditor(this.host.platform, null, prefillConnection(found, protocol));
+    const saved = await openEditor(this.host.platform, null, prefillConnection(found, protocol, this.host.store.connections));
     if (saved) await this.host.store.reload();
   }
 }

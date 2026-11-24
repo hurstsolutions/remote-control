@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { DIRECT_MAC_SUMMARY, describeError, messageOf, toSessionError, vncSecurityProblem } from "./errors";
+import { DIRECT_MAC_SUMMARY, describeError, messageOf, passwordRequiredNote, toSessionError, vncSecurityProblem } from "./errors";
 import type { ErrorKind } from "./ipc";
 
 const windows = { host: "office-pc", protocol: "rdp" as const, ssh_tunnel: true, name: "Office" };
@@ -25,7 +25,7 @@ describe("describeError", () => {
     expect(hints).toContain("Reconnect");
     expect(hints).toContain("Connect without SSH");
     expect(hints).toContain("still encrypted");
-    expect(hints).toContain("impersonate the Mac");
+    expect(hints).toContain("verified sign-in");
     expect(hints).not.toContain("isn't encrypted");
   });
 
@@ -72,9 +72,45 @@ describe("describeError", () => {
 
   it("describes direct Mac connections as encrypted, with SSH still the best", () => {
     expect(DIRECT_MAC_SUMMARY).toContain("won't connect unencrypted");
-    expect(DIRECT_MAC_SUMMARY).toContain("SRP");
-    expect(DIRECT_MAC_SUMMARY).toContain("impersonate the Mac");
+    expect(DIRECT_MAC_SUMMARY).toContain("requires Apple's verified sign-in");
+    expect(DIRECT_MAC_SUMMARY).toContain("allow older Macs");
     expect(DIRECT_MAC_SUMMARY).toContain("SSH (Remote Login)");
+  });
+
+  // rc_vnc::SRP_NOT_OFFERED and the text after it (crates/rc-vnc/src/proto.rs).
+  const NO_SRP =
+    "the Mac didn't offer SRP sign-in (Apple's verified sign-in); this can mean someone is interfering with the connection, or an older Mac. Apple's older sign-in (type 30) does not verify the Mac, and an impostor could learn the password through it, so it is refused. Use an SSH tunnel, or allow unverified sign-in for this connection if the network is trusted. Offered: [30 (Apple Remote Desktop)]";
+
+  it("explains a Mac that didn't offer verified sign-in, with both ways out", () => {
+    // The backend maps rc_vnc::is_srp_not_offered to its own kind; the detail is not parsed here.
+    expect(vncSecurityProblem(NO_SRP)).toBeNull();
+    expect(toSessionError({ kind: "no_verified_sign_in", detail: NO_SRP }).kind).toBe("no_verified_sign_in");
+    const direct = { ...mac, ssh_tunnel: false };
+    const text = describeError({ kind: "no_verified_sign_in", detail: NO_SRP }, direct);
+    expect(text.headline).toBe("studio-mac didn't offer verified sign-in");
+    const hints = text.hints.join(" ");
+    expect(hints).toContain("interfering");
+    expect(hints).toContain("older Mac");
+    expect(hints).toContain("Use SSH tunnel");
+    expect(hints).toContain("Allow older Macs without verified sign-in");
+    expect(hints).toContain("capture your password");
+    expect(hints).not.toContain("used verified sign-in before");
+  });
+
+  it("never suggests the older sign-in for a Mac that used verified sign-in before", () => {
+    const seen = { ...mac, ssh_tunnel: false, srp_seen: true, allow_older_mac_sign_in: true };
+    const hints = describeError({ kind: "no_verified_sign_in", detail: NO_SRP }, seen).hints.join(" ");
+    expect(hints).toContain("This Mac used verified sign-in before");
+    expect(hints).toContain("ignored");
+    expect(hints).toContain("Use SSH tunnel");
+    expect(hints).not.toContain("tick");
+  });
+
+  it("shows why a saved password was not used", () => {
+    expect(passwordRequiredNote({ kind: "password_required", detail: "No password is saved for this connection." })).toBeNull();
+    const removed = "The saved password was for a different address or account, so it was removed and not sent. Enter the password.";
+    expect(passwordRequiredNote({ kind: "password_required", detail: removed })).toBe(removed);
+    expect(passwordRequiredNote({ kind: "password_required", detail: "The saved password could not be read from the keychain (locked)." })).toContain("keychain");
   });
 
   it("explains a refused sign-in", () => {

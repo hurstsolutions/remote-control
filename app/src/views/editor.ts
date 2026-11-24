@@ -1,7 +1,7 @@
 // The dialog for adding or editing a saved connection.
 import { openDialog } from "../dialog";
 import { button, h } from "../dom";
-import { DIRECT_MAC_SUMMARY, messageOf } from "../errors";
+import { DIRECT_MAC_SUMMARY, OLDER_MAC_IGNORED, OLDER_MAC_WARNING, messageOf } from "../errors";
 import type { Connection, Protocol, SavedConnection } from "../ipc";
 import type { Platform } from "../platform";
 import { DEFAULT_PORT, DEFAULT_SSH_PORT, blankConnection, passwordClearedByEdit, pinnedIdentityAfterEdit } from "../state";
@@ -125,7 +125,13 @@ export async function openEditor(
     ),
   );
   const tunnelNote = h("p", { class: "notice" });
-  const macOnly = h("div", { class: "form-group" }, tunnel.row, sshPort.row, tunnelNote);
+  // Direct connections only: Macs that don't offer Apple's verified sign-in.
+  const olderMac = checkbox("Allow older Macs without verified sign-in", start.allow_older_mac_sign_in);
+  olderMac.input.id = `field-${++fieldCounter}`;
+  const olderMacWarning = h("p", { class: "field-hint", text: OLDER_MAC_WARNING });
+  const olderMacIgnored = h("p", { class: "notice", text: OLDER_MAC_IGNORED });
+  const olderMacRow = h("div", { class: "form-group older-mac" }, olderMac.row, olderMacWarning, olderMacIgnored);
+  const macOnly = h("div", { class: "form-group" }, tunnel.row, sshPort.row, tunnelNote, olderMacRow);
 
   const saveError = h("p", { class: "notice notice-error", attrs: { role: "alert" } });
   saveError.hidden = true;
@@ -176,6 +182,9 @@ export async function openEditor(
       ssh_port: mac && tunnel.input.checked ? (parsePort(sshPort.input.value) ?? DEFAULT_SSH_PORT) : DEFAULT_SSH_PORT,
       pinned_identity: null,
       share_clipboard: shareClipboard.input.checked,
+      allow_older_mac_sign_in: mac && !tunnel.input.checked && olderMac.input.checked,
+      // The backend keeps its own value; sent only to keep the shape.
+      srp_seen: existing?.srp_seen ?? false,
     };
   };
   function updateClearWarning(): void {
@@ -190,6 +199,11 @@ export async function openEditor(
     windowsOnly.hidden = mac;
     macOnly.hidden = !mac;
     sshPort.row.hidden = !tunnel.input.checked;
+    olderMacRow.hidden = tunnel.input.checked;
+    olderMacWarning.classList.toggle("field-warn", olderMac.input.checked);
+    // The backend forgets that a Mac did verified sign-in when the address changes.
+    const sameMac = existing !== null && pinnedIdentityAfterEdit({ ...existing, pinned_identity: "x" }, draftOf()) !== null;
+    olderMacIgnored.hidden = !(existing?.srp_seen && sameMac && olderMac.input.checked);
     tunnelNote.classList.toggle("notice-warn", !tunnel.input.checked);
     tunnelNote.textContent = tunnel.input.checked
       ? "On the Mac, turn on both Screen Sharing and Remote Login (System Settings > General > Sharing). The screen and your password travel inside the encrypted SSH connection."
@@ -200,6 +214,9 @@ export async function openEditor(
     sync();
   });
   tunnel.input.addEventListener("change", sync);
+  olderMac.input.addEventListener("change", sync);
+  host.input.addEventListener("input", sync);
+  port.input.addEventListener("input", sync);
   sync();
   for (const element of [type, host.input, port.input, username.input, domain.input, tunnel.input, sshPort.input]) {
     element.addEventListener("input", updateClearWarning);

@@ -1,7 +1,7 @@
 // One session tab: the connect flow, the toolbar, the remote screen and the failure panels.
 import { confirmDialog, isDialogOpen, openDialog } from "../dialog";
 import { button, h } from "../dom";
-import { DIRECT_MAC_SUMMARY, describeError, messageOf, toSessionError, vncSecurityProblem } from "../errors";
+import { DIRECT_MAC_SUMMARY, describeError, messageOf, passwordRequiredNote, toSessionError, vncSecurityProblem } from "../errors";
 import { formatFingerprint, identityCheckSteps, identityKindOf } from "../fingerprint";
 import type { ChannelMessage, Connection, IdentityKind, IdentityMismatch, SessionError, SessionEvent, SessionInput } from "../ipc";
 import { copyLogButton } from "../logs";
@@ -307,7 +307,7 @@ export class SessionView {
       if (attempt !== this.attempt) return;
       const error = toSessionError(raw);
       if (error.kind === "password_required") {
-        await this.promptPassword(options.trust, options.trust ? TRUST_NOTE : null, true);
+        await this.promptPassword(options.trust, options.trust ? TRUST_NOTE : passwordRequiredNote(error), true);
       } else {
         this.setState("closed");
         this.showError(error);
@@ -459,7 +459,7 @@ export class SessionView {
 
   /** The lock's details: how the session is protected, and the identity of the machine. */
   private async showSecurity(): Promise<void> {
-    const lock = lockState(this.security);
+    const lock = lockState(this.security, this.currentTrust !== null);
     if (!lock) return;
     const body = h("div", { class: "form" });
     body.append(
@@ -485,7 +485,7 @@ export class SessionView {
   }
 
   private updateSecurityButton(): void {
-    const lock = lockState(this.security);
+    const lock = lockState(this.security, this.currentTrust !== null);
     this.securityButton.hidden = !lock || this.state !== "connected";
     if (!lock) return;
     this.securityButton.replaceChildren(lockIcon(lock.level), h("span", { text: lock.label }));
@@ -655,10 +655,9 @@ export class SessionView {
         copyLog,
       ];
     } else if (
-      error.kind === "security" &&
       this.connection.protocol === "vnc" &&
       !this.connection.ssh_tunnel &&
-      vncSecurityProblem(error.detail) !== null
+      (error.kind === "no_verified_sign_in" || (error.kind === "security" && vncSecurityProblem(error.detail) !== null))
     ) {
       buttons = [
         ok,

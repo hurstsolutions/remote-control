@@ -45,6 +45,7 @@ use std::pin::Pin;
 use std::task::{ready, Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing::{debug, trace, warn};
+use zeroize::Zeroize;
 
 const BLOCK: usize = 16;
 /// SHA-1 integrity hash at the end of every record's plaintext.
@@ -69,10 +70,18 @@ const fn filler_len(body_len: usize) -> usize {
 const MIN_CIPHERTEXT: usize = BODY_LEN + filler_len(0) + TRAILER;
 
 /// The AES-128 key and IV installed by a rekey. Same starting values for both directions.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// Wiped when dropped.
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct Keys {
     pub key: [u8; BLOCK],
     pub iv: [u8; BLOCK],
+}
+
+impl Drop for Keys {
+    fn drop(&mut self) {
+        self.key.zeroize();
+        self.iv.zeroize();
+    }
 }
 
 impl std::fmt::Debug for Keys {
@@ -122,7 +131,7 @@ struct Cbc {
 }
 
 impl Cbc {
-    fn new(keys: Keys) -> Self {
+    fn new(keys: &Keys) -> Self {
         Cbc { cipher: Aes128::new(&keys.key.into()), chain: keys.iv, seq: 0 }
     }
 
@@ -196,6 +205,9 @@ struct Writer {
     /// Framed ciphertext not yet handed to the socket, from `out_pos`.
     out: Vec<u8>,
     out_pos: usize,
+    /// The last ciphertext block of our first record. Both directions start from the same key
+    /// and IV, so a server record 0 that ends in it is our own record reflected back.
+    first_sent: Option<[u8; BLOCK]>,
 }
 
 impl Writer {
@@ -213,6 +225,9 @@ impl Writer {
         let hash = self.cbc.trailer(&self.out[start..]);
         self.out.extend_from_slice(&hash);
         self.cbc.encrypt(&mut self.out[start..]);
+        if seq == 0 {
+            self.first_sent = Some(self.cbc.chain);
+        }
         trace!(seq, body = body.len(), ciphertext = total, "record layer: sent record");
     }
 
@@ -327,14 +342,14 @@ impl<S> RecordStream<S> {
         RecordStream {
             inner,
             rd: Reader {
-                cbc: Cbc::new(keys),
+                cbc: Cbc::new(&keys),
                 staging: Vec::new(),
                 filled: 0,
                 phase: Phase::Len,
                 body: 0..0,
                 failed: false,
             },
-            wr: Writer { cbc: Cbc::new(keys), pending: Vec::new(), out: Vec::new(), out_pos: 0 },
+            wr: Writer { cbc: Cbc::new(&keys), pending: Vec::new(), out: Vec::new(), out_pos: 0, first_sent: None },
         }
     }
 }
@@ -409,6 +424,16 @@ impl<S: AsyncRead + Unpin> AsyncRead for RecordStream<S> {
                                 return Poll::Ready(Err(e));
                             }
                         };
+                        if rd.cbc.seq == 1 && me.wr.first_sent == Some(rd.cbc.chain) {
+                            // Any later reflected record would need this one reflected first.
+                            rd.failed = true;
+                            rd.body = 0..0;
+                            warn!("record layer: the server's first record is our own first record sent back");
+                            return Poll::Ready(Err(record_error(
+                                io::ErrorKind::InvalidData,
+                                "the first encrypted record from the server is a copy of our own (reflected)",
+                            )));
+                        }
                         rd.filled = 0;
                         rd.phase = Phase::Len;
                     }
@@ -480,9 +505,13 @@ mod tests {
         Keys { key: *b"0123456789abcdef", iv: *b"fedcba9876543210" }
     }
 
+    fn writer() -> Writer {
+        Writer { cbc: Cbc::new(&keys()), pending: Vec::new(), out: Vec::new(), out_pos: 0, first_sent: None }
+    }
+
     /// Frame `msgs` as the client would and return the wire bytes.
     fn frame_all(msgs: &[&[u8]]) -> Vec<u8> {
-        let mut w = Writer { cbc: Cbc::new(keys()), pending: Vec::new(), out: Vec::new(), out_pos: 0 };
+        let mut w = writer();
         for m in msgs {
             w.frame(m);
         }
@@ -579,7 +608,7 @@ mod tests {
 
     #[tokio::test]
     async fn sequence_number_is_in_the_hash() {
-        let mut w = Writer { cbc: Cbc::new(keys()), pending: Vec::new(), out: Vec::new(), out_pos: 0 };
+        let mut w = writer();
         w.frame(b"first");
         w.cbc.seq = 0; // a sender that counts wrong
         w.frame(b"second");
@@ -678,7 +707,7 @@ mod tests {
         b.read_to_end(&mut wire).await.unwrap();
 
         // Decrypt record by record with an independent reader over the client's direction.
-        let mut cbc = Cbc::new(keys());
+        let mut cbc = Cbc::new(&keys());
         let mut bodies = Vec::new();
         let mut at = 0;
         while at < wire.len() {
@@ -692,6 +721,34 @@ mod tests {
             at += 2 + len;
         }
         assert_eq!(bodies, vec![pointer.to_vec(), key.to_vec(), vec![3, 1, 0, 0, 0, 0, 0, 4, 0, 3]]);
+    }
+
+    /// Security audit round 2: both directions start from the same key and IV, so our own
+    /// records sent back would pass the integrity check. They are refused.
+    #[tokio::test]
+    async fn reflected_records_are_refused() {
+        let (a, mut b) = tokio::io::duplex(1 << 16);
+        let mut rs = RecordStream::new(a, keys());
+        let spf = [0u8; 20]; // SetPixelFormat (also a valid-looking FramebufferUpdate start)
+        rs.write_all(&spf).await.unwrap();
+        rs.flush().await.unwrap();
+        let mut wire = vec![0u8; 2 + 32 + 16];
+        b.read_exact(&mut wire).await.unwrap();
+        b.write_all(&wire).await.unwrap();
+        let mut got = [0u8; 1];
+        let err = rs.read_exact(&mut got).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("reflected"), "{err}");
+        assert_eq!(got, [0]);
+        // A genuine server record 0 (different plaintext) is accepted.
+        let (a, mut b) = tokio::io::duplex(1 << 16);
+        let mut rs = RecordStream::new(a, keys());
+        rs.write_all(&spf).await.unwrap();
+        rs.flush().await.unwrap();
+        b.write_all(&frame_all(&[b"server says hi"])).await.unwrap();
+        let mut got = [0u8; 14];
+        rs.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"server says hi");
     }
 
     #[tokio::test]

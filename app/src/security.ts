@@ -50,8 +50,11 @@ function isAppleEncryption(method: string): boolean {
   return method.startsWith(METHOD_APPLE);
 }
 
-/** The lock for a session's layers, or null before the backend reported any. */
-export function lockState(layers: readonly SecurityLayer[]): LockState | null {
+/**
+ * The lock for a session's layers, or null before the backend reported any. `newlyTrusted`: this
+ * session accepted a changed identity just now (the backend then never reports it as verified).
+ */
+export function lockState(layers: readonly SecurityLayer[], newlyTrusted = false): LockState | null {
   const best = bestLayer(layers);
   if (!best) return null;
   const method = best.method;
@@ -63,6 +66,19 @@ export function lockState(layers: readonly SecurityLayer[]): LockState | null {
       headline: "This session is not encrypted",
       method,
       paragraphs: ["Anyone on the network can see the screen and everything you type."],
+    };
+  }
+  if (newlyTrusted && pinsIdentity(method)) {
+    return {
+      level: "unverified",
+      label: "Encrypted",
+      tooltip: "Encrypted. You accepted this computer's new identity just now, so it was not checked against an earlier one.",
+      headline: "Encrypted, new identity accepted",
+      method,
+      paragraphs: [
+        "The session is encrypted. You accepted this computer's new identity just now, so there was nothing earlier to check it against: it is only as trustworthy as the check you did before accepting it.",
+        "It has now been saved, and you will be warned before signing in if it changes again.",
+      ],
     };
   }
   if (best.server_verified) {

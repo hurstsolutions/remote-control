@@ -197,6 +197,7 @@ async fn connect(
     let should_upgrade = negotiate(&mut framed, &mut connector, config.nla).await?;
 
     let (tcp, leftover) = framed.into_inner();
+    check_no_plaintext_leftover(&leftover)?;
     let (tls, cert_der) = tls::upgrade(tcp, &config.host)
         .await
         .map_err(|e| SessionError::new(ErrorKind::Security, format!("TLS handshake failed: {e}")))?;
@@ -242,7 +243,7 @@ async fn connect(
 
     let upgraded = ironrdp_tokio::mark_as_upgraded(should_upgrade, &mut connector);
     let boxed: Box<dyn Stream> = Box::new(tls);
-    let mut framed = TokioFramed::new_with_leftover(boxed, leftover);
+    let mut framed = TokioFramed::new(boxed);
 
     status(events.clone(), "Signing in").await;
     let connection = ironrdp_tokio::connect_finalize(
@@ -258,6 +259,24 @@ async fn connect(
     .map_err(|e| connector_error("sign-in", &e))?;
 
     Ok((connection, framed))
+}
+
+/// Bytes that arrived after the X.224 Connection Confirm but before the TLS handshake are
+/// unauthenticated cleartext; a man in the middle could use them to inject data that would be
+/// read as if it came through TLS. A real server sends nothing until our ClientHello.
+fn check_no_plaintext_leftover(leftover: &[u8]) -> Result<(), SessionError> {
+    if leftover.is_empty() {
+        return Ok(());
+    }
+    warn!(bytes = leftover.len(), "unexpected cleartext after the X.224 Connection Confirm");
+    Err(SessionError::new(
+        ErrorKind::Security,
+        format!(
+            "the server sent {} unexpected byte(s) in cleartext after the security negotiation, before TLS \
+             started; refusing to continue (this can mean someone is tampering with the connection)",
+            leftover.len()
+        ),
+    ))
 }
 
 /// How the session is protected, reported once the certificate passed the pin check. A pin
@@ -881,6 +900,12 @@ mod tests {
         for selected in [SecurityProtocol::SSL, SecurityProtocol::empty()] {
             assert_eq!(check_nla_selected(selected).unwrap_err().kind, ErrorKind::Security);
         }
+    }
+
+    #[test]
+    fn plaintext_leftover_before_tls_is_refused() {
+        assert!(check_no_plaintext_leftover(&[]).is_ok());
+        assert_eq!(check_no_plaintext_leftover(&[0x16, 3, 3]).unwrap_err().kind, ErrorKind::Security);
     }
 
     #[test]

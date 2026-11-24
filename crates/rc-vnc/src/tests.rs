@@ -9,7 +9,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 const T: Duration = Duration::from_secs(10);
 
 fn config(user: Option<&str>, pass: Option<&str>) -> VncConfig {
-    VncConfig { username: user.map(Into::into), password: pass.map(Into::into), ..Default::default() }
+    VncConfig { username: user.map(Into::into), password: pass.map(|p| p.to_owned().into()), ..Default::default() }
 }
 
 /// Start a client; returns the server end of the pipe, the front-end handle and the task.

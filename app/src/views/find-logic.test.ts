@@ -6,6 +6,8 @@ import {
   allNames,
   estimateDuration,
   filterHosts,
+  nameMatchWarning,
+  nameOnlyMatches,
   parseCidr,
   prefillConnection,
   progressText,
@@ -93,15 +95,30 @@ describe("results", () => {
     expect(allNames(nameless)).toEqual([]);
   });
 
-  it("matches saved connections by address or name", () => {
+  it("counts a saved connection only by address; a name alone is a warning", () => {
     const byIp = { ...blankConnection("rdp"), name: "A", host: "10.0.0.10" };
     const byName = { ...blankConnection("vnc"), name: "B", host: "studio-mac.local." };
     const byShortName = { ...blankConnection("vnc"), name: "C", host: "Studio-Mac" };
     const other = { ...blankConnection("rdp"), name: "D", host: "10.0.0.100" };
     const all = [byIp, byName, byShortName, other];
     expect(savedMatches(windows, all)).toEqual([byIp]);
-    expect(savedMatches(mac, all)).toEqual([byName, byShortName]);
+    expect(savedMatches(mac, all)).toEqual([]);
     expect(savedMatches(nameless, all)).toEqual([]);
+    expect(nameOnlyMatches(mac, all).map((m) => m.connection)).toEqual([byName, byShortName]);
+    expect(nameOnlyMatches(windows, all)).toEqual([]);
+    expect(nameMatchWarning(nameOnlyMatches(mac, all)[0]!)).toBe('Name matches saved "B", but the address isn\'t confirmed');
+  });
+
+  it("warns when a machine announces the name of a saved one at another address", () => {
+    const saved = { ...blankConnection("rdp"), name: "Payroll PC", host: "10.0.0.50" };
+    const named = { ...blankConnection("rdp"), name: "Office", host: "desktop-test01" };
+    const impostor = host("10.0.0.66", { rdp: 3389, name: "10.0.0.50", names: { ...windows.names, rdp_certificate: "10.0.0.50" } });
+    expect(savedMatches(impostor, [saved])).toEqual([]);
+    const [match] = nameOnlyMatches(impostor, [saved]);
+    expect(match?.differentAddress).toBe(true);
+    expect(nameMatchWarning(match!)).toBe('Name matches saved "Payroll PC" but at a different address');
+    // A saved host name (not an address) matching an announced name: not confirmed either way.
+    expect(nameOnlyMatches(windows, [named])[0]?.differentAddress).toBe(false);
   });
 
   it("formats progress", () => {
@@ -116,6 +133,8 @@ describe("prefill", () => {
     expect(addableProtocols(windows)).toEqual(["rdp"]);
     const c = prefillConnection(windows, "rdp");
     expect(c).toMatchObject({ id: "", protocol: "rdp", host: "10.0.0.10", port: 3389, name: "DESKTOP-TEST01", username: "", pinned_identity: null });
+    expect(c.share_clipboard).toBe(false);
+    expect(prefillConnection(mac, "vnc").share_clipboard).toBe(false);
   });
 
   it("fills a Mac with the SSH tunnel on when Remote Login answered", () => {
@@ -128,6 +147,18 @@ describe("prefill", () => {
   it("never pins anything from a scan", () => {
     const withCert = { ...windows, rdp_certificate_sha256: "ab".repeat(32) };
     expect(prefillConnection(withCert, "rdp").pinned_identity).toBeNull();
+  });
+
+  it("never copies a saved connection's name verbatim", () => {
+    const saved = [{ ...blankConnection("rdp"), name: "desktop-test01", host: "10.0.0.50" }];
+    expect(suggestedName(windows, "rdp", saved)).toBe("DESKTOP-TEST01 (10.0.0.10)");
+    expect(prefillConnection(windows, "rdp", saved).name).toBe("DESKTOP-TEST01 (10.0.0.10)");
+    const byHost = [{ ...blankConnection("vnc"), name: "Mac", host: "Studio Mac" }];
+    expect(suggestedName(mac, "vnc", byHost)).toBe("Studio Mac (10.0.0.9)");
+    expect(suggestedName(windows, "rdp", [])).toBe("DESKTOP-TEST01");
+    const byFqdn = [{ ...blankConnection("rdp"), name: "Office", host: "desktop-test01.corp.example" }];
+    expect(suggestedName(windows, "rdp", byFqdn)).toBe("DESKTOP-TEST01 (10.0.0.10)");
+    expect(suggestedName(nameless, "vnc", [{ ...blankConnection("vnc"), name: "10.0.0.200", host: "10.0.0.200" }])).toBe("10.0.0.200");
   });
 
   it("suggests short names", () => {

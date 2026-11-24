@@ -5,6 +5,14 @@ use crate::error::{Result, VncError};
 use aes::cipher::{BlockCipherEncrypt, KeyInit};
 use md5::{Digest, Md5};
 use num_bigint::BigUint;
+use zeroize::Zeroizing;
+
+/// Smallest Diffie-Hellman prime accepted for type 30, in bits. Older Macs used a 1024-bit
+/// group; macOS 26 sends RFC 5054's 4096-bit group.
+pub(crate) const MIN_ARD_BITS: u64 = 1024;
+/// Largest Diffie-Hellman prime accepted for type 30, in bytes (4096 bits, what macOS sends).
+/// Bounds the allocation and the modular exponentiation a hostile server can ask for.
+pub(crate) const MAX_ARD_KEY: usize = 512;
 
 /// Classic VNC authentication response.
 ///
@@ -66,19 +74,32 @@ pub(crate) fn ard_response_with(
 ) -> Result<ArdResponse> {
     let key_len = prime.len();
     let p = BigUint::from_bytes_be(prime);
-    if p <= BigUint::from(2u8) {
-        return Err(VncError::Protocol("Apple auth: server sent an invalid Diffie-Hellman prime".into()));
+    let one = BigUint::from(1u8);
+    if key_len > MAX_ARD_KEY || p.bits() < MIN_ARD_BITS {
+        return Err(VncError::Security(format!(
+            "Apple auth: the server's Diffie-Hellman prime is {} bits (accepted: {MIN_ARD_BITS} to {})",
+            p.bits(),
+            MAX_ARD_KEY * 8
+        )));
     }
+    let p_minus_1 = &p - &one;
     let g = BigUint::from(generator);
+    if g < BigUint::from(2u8) || g >= p_minus_1 {
+        return Err(VncError::Security(format!("Apple auth: the server sent an invalid generator ({generator})")));
+    }
     let server_pub = BigUint::from_bytes_be(server_pub);
+    // 0, 1 and p-1 (and anything out of range) make the shared secret guessable.
+    if server_pub <= one || server_pub >= p_minus_1 {
+        return Err(VncError::Security("Apple auth: the server sent a degenerate Diffie-Hellman public key".into()));
+    }
     let private = BigUint::from_bytes_be(private);
 
     let public = g.modpow(&private, &p);
     let shared = server_pub.modpow(&private, &p);
 
     // AES-128 key = MD5 of the shared secret, left-padded with zeros to the key length.
-    let shared_bytes = left_pad(&shared.to_bytes_be(), key_len);
-    let aes_key: [u8; 16] = Md5::digest(&shared_bytes).into();
+    let shared_bytes = Zeroizing::new(left_pad(&Zeroizing::new(shared.to_bytes_be()), key_len));
+    let aes_key = Zeroizing::new(<[u8; 16]>::from(Md5::digest(shared_bytes.as_slice())));
 
     let mut block = filler;
     let user_trunc = put_cstr(&mut block[..64], username);
@@ -91,7 +112,7 @@ pub(crate) fn ard_response_with(
         );
     }
 
-    let cipher = aes::Aes128::new(&aes_key.into());
+    let cipher = aes::Aes128::new(&(*aes_key).into());
     for chunk in block.chunks_exact_mut(16) {
         let chunk: &mut [u8; 16] = chunk.try_into().expect("16-byte chunk");
         cipher.encrypt_block(chunk.into());
@@ -106,7 +127,7 @@ pub(crate) fn ard_response_with(
 /// What type 30 sends, and the key it leaves behind.
 pub(crate) struct ArdResponse {
     pub message: Vec<u8>,
-    pub wrap_key: [u8; 16],
+    pub wrap_key: Zeroizing<[u8; 16]>,
 }
 
 /// Apple Remote Desktop (type 30) response using OS randomness.
@@ -117,7 +138,7 @@ pub(crate) fn ard_response(
     username: &str,
     password: &str,
 ) -> Result<ArdResponse> {
-    let mut private = vec![0u8; prime.len()];
+    let mut private = Zeroizing::new(vec![0u8; prime.len().min(MAX_ARD_KEY)]);
     let mut filler = [0u8; 128];
     getrandom::fill(&mut private)
         .and_then(|_| getrandom::fill(&mut filler))
@@ -213,7 +234,7 @@ pub(crate) mod tests {
             ard_response(2, &server.prime, &server.public_key(), "alice", "s3cret pw").unwrap();
         assert_eq!(resp.len(), 128 + 128);
         assert_eq!(server.decrypt(&resp), ("alice".to_string(), "s3cret pw".to_string()));
-        assert_eq!(wrap_key, server.wrap_key(&resp));
+        assert_eq!(*wrap_key, server.wrap_key(&resp));
     }
 
     #[test]
@@ -236,22 +257,30 @@ pub(crate) mod tests {
 
     #[test]
     fn ard_plaintext_layout_and_short_shared_secret() {
-        // Tiny group so the shared secret is shorter than the key length and must be
-        // left-padded before hashing: p = 0x0000_0000_0000_FFF1 (65521, prime) in 8 bytes, g = 2.
-        let prime = [0, 0, 0, 0, 0, 0, 0xFF, 0xF1];
-        let p = BigUint::from(65521u32);
-        let server_priv = BigUint::from(1234u32);
-        let server_pub = left_pad(&BigUint::from(2u8).modpow(&server_priv, &p).to_bytes_be(), 8);
+        // A client private key whose shared secret has a leading zero byte, so it must be
+        // left-padded to the key length before hashing (about one in 256 keys).
+        let prime = unhex(PRIME_1024);
+        let p = BigUint::from_bytes_be(&prime);
+        let server_priv = BigUint::from(0x1234_5678u32);
+        let server_pub = left_pad(&BigUint::from(2u8).modpow(&server_priv, &p).to_bytes_be(), 128);
+        let client_priv = (1u32..)
+            .map(|i| BigUint::from(i) * BigUint::from(0x9e37_79b9u32))
+            .find(|a| {
+                let shared = BigUint::from_bytes_be(&server_pub).modpow(a, &p);
+                shared.to_bytes_be().len() < 128
+            })
+            .unwrap()
+            .to_bytes_be();
         let filler: [u8; 128] = core::array::from_fn(|i| 0x80 | i as u8);
         let ArdResponse { message: resp, wrap_key } =
-            ard_response_with(2, &prime, &server_pub, "bob", "pw", &[0x03, 0xE9], filler).unwrap();
-        assert_eq!(resp.len(), 128 + 8);
+            ard_response_with(2, &prime, &server_pub, "bob", "pw", &client_priv, filler).unwrap();
+        assert_eq!(resp.len(), 128 + 128);
         let client_pub = BigUint::from_bytes_be(&resp[128..]);
-        assert_eq!(client_pub, BigUint::from(2u8).modpow(&BigUint::from(1001u32), &p));
-        let shared = left_pad(&client_pub.modpow(&server_priv, &p).to_bytes_be(), 8);
-        assert_eq!(&shared[..6], &[0; 6]);
+        assert_eq!(client_pub, BigUint::from(2u8).modpow(&BigUint::from_bytes_be(&client_priv), &p));
+        let shared = left_pad(&client_pub.modpow(&server_priv, &p).to_bytes_be(), 128);
+        assert_eq!(shared[0], 0);
         let key: [u8; 16] = Md5::digest(&shared).into();
-        assert_eq!(wrap_key, key);
+        assert_eq!(*wrap_key, key);
         let cipher = aes::Aes128::new(&key.into());
         let mut plain = resp[..128].to_vec();
         for chunk in plain.chunks_exact_mut(16) {
@@ -264,8 +293,32 @@ pub(crate) mod tests {
         assert_eq!(&plain[67..], &filler[67..]);
     }
 
+    /// Security audit round 2: small primes, degenerate generators and public keys are refused
+    /// before anything is sent.
     #[test]
-    fn ard_rejects_bad_prime() {
-        assert!(ard_response_with(2, &[0, 0], &[0, 5], "a", "b", &[3], [0; 128]).is_err());
+    fn ard_rejects_weak_parameters() {
+        let prime = unhex(PRIME_1024);
+        let p = BigUint::from_bytes_be(&prime);
+        let good_pub = left_pad(&BigUint::from(2u8).modpow(&BigUint::from(99u8), &p).to_bytes_be(), 128);
+        let try_it = |g: u16, prime: &[u8], public: &[u8]| ard_response_with(g, prime, public, "a", "b", &[3], [0; 128]);
+        assert!(try_it(2, &prime, &good_pub).is_ok());
+        let refused = |r: Result<ArdResponse>| matches!(r, Err(VncError::Security(_)));
+        // Primes: tiny, 1023 bits (top byte 0x7f.. after a shift), over 4096 bits.
+        assert!(refused(try_it(2, &[0, 0], &[0, 5])));
+        assert!(refused(try_it(2, &[0, 0, 0, 0, 0, 0, 0xFF, 0xF1], &[0, 0, 0, 0, 0, 0, 0, 5])));
+        let short: Vec<u8> = (BigUint::from_bytes_be(&prime) >> 1u32).to_bytes_be();
+        assert!(refused(try_it(2, &left_pad(&short, 128), &good_pub)));
+        assert!(refused(try_it(2, &[0xff; MAX_ARD_KEY + 1], &[2; MAX_ARD_KEY + 1])));
+        // Generators: 0, 1, and p-1 does not fit a u16, so a tiny prime is not needed for it.
+        assert!(refused(try_it(0, &prime, &good_pub)));
+        assert!(refused(try_it(1, &prime, &good_pub)));
+        // Public keys: 0, 1, p-1, p, above p.
+        let p_minus_1 = left_pad(&(&p - BigUint::from(1u8)).to_bytes_be(), 128);
+        for public in [vec![0u8; 128], left_pad(&[1], 128), p_minus_1, prime.clone(), vec![0xff; 128]] {
+            assert!(refused(try_it(2, &prime, &public)));
+        }
+        // The largest accepted prime: 4096 bits.
+        let n4096 = [0xffu8; MAX_ARD_KEY];
+        assert!(try_it(5, &n4096, &left_pad(&[7], MAX_ARD_KEY)).is_ok());
     }
 }

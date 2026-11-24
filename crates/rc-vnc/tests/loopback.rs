@@ -569,7 +569,7 @@ async fn run_case(sec: Sec, enc: Enc) -> Vec<u8> {
     });
     let config = VncConfig {
         username: (sec == Sec::Ard).then(|| "mockuser".to_string()),
-        password: (sec != Sec::None).then(|| "p@ss wörd".to_string()),
+        password: (sec != Sec::None).then(|| "p@ss wörd".to_string().into()),
         ..Default::default()
     };
     let (io, mut handle) = session_channels();
@@ -666,7 +666,7 @@ async fn expect_failure(sec: Sec, config: VncConfig) -> rc_types::SessionError {
 
 #[tokio::test]
 async fn wrong_vnc_password() {
-    let cfg = VncConfig { password: Some("wrong".into()), ..Default::default() };
+    let cfg = VncConfig { password: Some(String::from("wrong").into()), ..Default::default() };
     let err = expect_failure(Sec::Vnc, cfg).await;
     assert_eq!(err.kind, ErrorKind::AuthFailed);
     assert!(err.detail.contains("Authentication failed (mock)"), "{}", err.detail);
@@ -674,7 +674,7 @@ async fn wrong_vnc_password() {
 
 #[tokio::test]
 async fn wrong_apple_password() {
-    let cfg = VncConfig { username: Some("mockuser".into()), password: Some("wrong".into()), ..Default::default() };
+    let cfg = VncConfig { username: Some("mockuser".into()), password: Some(String::from("wrong").into()), ..Default::default() };
     let err = expect_failure(Sec::Ard, cfg).await;
     assert_eq!(err.kind, ErrorKind::AuthFailed);
     assert!(err.detail.contains("Authentication failed (mock)"), "{}", err.detail);
@@ -789,6 +789,27 @@ struct AppleOpts {
     offer_srp: bool,
     /// The client is expected to pick 36 when offered (it does unless SRP is turned off).
     expect_srp: bool,
+    /// Send a wrong SRP proof M2 (an impostor that got the password check past somehow).
+    bad_m2: bool,
+}
+
+/// RFC 5054 Appendix A, 4096-bit group (generator 5).
+const SRP_N_4096: &str = concat!(
+    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DD",
+    "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED",
+    "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F",
+    "83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3B",
+    "E39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA0510",
+    "15728E5A8AAAC42DAD33170D04507A33A85521ABDF1CBA64ECFB850458DBEF0A8AEA71575D060C7DB3970F85A6E1E4C7",
+    "ABF5AE8CDB0933D71E8C94E04A25619DCEE3D2261AD2EE6BF12FFA06D98A0864D87602733EC86A64521F2B18177B200C",
+    "BBE117577A615D6C770988C0BAD946E208E24FA074E5AB3143DB5BFCE0FD108E4B82D120A92108011A723C12A787E6D7",
+    "88719A10BDBA5B2699C327186AF4E23C1A946834B6150BDA2583E9CA2AD44CE8DBBBC2DB04DE8EF92E8EFC141FBECAA6",
+    "287C59474E6BC05D99B2964FA090C3A2233BA186515BE7ED1F612970CEE2D7AFB81BDD762170481CD0069127D5B05AA9",
+    "93B4EA988D8FDDC186FFB7DC90A6C08F4DF435C934063199FFFFFFFFFFFFFFFF",
+);
+
+fn unhex(s: &str) -> Vec<u8> {
+    (0..s.len() / 2).map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap()).collect()
 }
 
 /// A 4096-bit modulus (2^4096 - 1) with generator 5: the size macOS sends. Not a prime, which
@@ -836,9 +857,10 @@ fn sha512(parts: &[&[u8]]) -> Vec<u8> {
 /// Type 36 (SRP-6a, SHA-512, PBKDF2) on the mock Mac, the server's half written from the
 /// formulas: v = g^x, B = k*v + g^b, S = (A * v^u)^b. Returns the wrap key SHA-256(K)[..16],
 /// or None after refusing the proof.
-async fn srp_server(s: &mut TcpStream, user: &str, pass: &str) -> Option<[u8; 16]> {
+async fn srp_server(s: &mut TcpStream, user: &str, pass: &str, bad_m2: bool) -> Option<[u8; 16]> {
     let len = APPLE_KEY_LEN;
-    let n_bytes = vec![0xffu8; len];
+    let n_bytes = unhex(SRP_N_4096);
+    assert_eq!(n_bytes.len(), len);
     let n = BigUint::from_bytes_be(&n_bytes);
     let g = BigUint::from(5u8);
     let pad = |v: &BigUint| pad_left(v.to_bytes_be(), len);
@@ -899,7 +921,10 @@ async fn srp_server(s: &mut TcpStream, user: &str, pass: &str) -> Option<[u8; 16
         return None;
     }
     // Message 4: M2, server random, "", u32 0.
-    let m2 = sha512(&[a_bytes, m1, &key]);
+    let mut m2 = sha512(&[a_bytes, m1, &key]);
+    if bad_m2 {
+        m2[10] ^= 1;
+    }
     let mut m = vec![64u8];
     m.extend(m2);
     m.push(16);
@@ -908,6 +933,9 @@ async fn srp_server(s: &mut TcpStream, user: &str, pass: &str) -> Option<[u8; 16
     let mut framed = (m.len() as u32).to_be_bytes().to_vec();
     framed.extend(m);
     s.write_all(&framed).await.unwrap();
+    if bad_m2 {
+        return None;
+    }
     let digest: [u8; 32] = sha2::Sha256::digest(&key).into();
     Some(digest[..16].try_into().unwrap())
 }
@@ -924,7 +952,7 @@ async fn serve_apple(mut s: TcpStream, enc: Enc, user: &str, pass: &str, opts: A
     let chosen = s.read_u8().await.unwrap();
     assert_eq!(chosen, if opts.offer_srp && opts.expect_srp { 36 } else { 30 });
     let wrap = if chosen == 36 {
-        match srp_server(&mut s, user, pass).await {
+        match srp_server(&mut s, user, pass, opts.bad_m2).await {
             Some(w) => w,
             None => return Vec::new(),
         }
@@ -1048,10 +1076,12 @@ async fn run_apple(enc: Enc, opts: AppleOpts, input: Vec<SessionInput>) -> Apple
         serve_apple(s, enc, "mockuser", "p@ss wörd", opts).await
     });
     let config =
-        VncConfig { username: Some("mockuser".into()), password: Some("p@ss wörd".into()), ..Default::default() };
+        VncConfig { username: Some("mockuser".into()), password: Some(String::from("p@ss wörd").into()), ..Default::default() };
+    // Type 30 under Required needs the explicit opt-in; SRP must work without it.
     let options = VncOptions::default()
         .with_encryption(EncryptionPolicy::Required)
-        .with_srp(!opts_srp_off(&opts_copy));
+        .with_srp(!opts_srp_off(&opts_copy))
+        .with_allow_unverified_sign_in(!(opts_copy.offer_srp && opts_copy.expect_srp));
     let (io, mut handle) = session_channels();
     let client =
         tokio::spawn(async move { rc_vnc::connect_and_run_with_options("127.0.0.1", port, config, options, io).await });
@@ -1144,8 +1174,9 @@ async fn apple_tampered_record_is_rejected() {
         let (s, _) = listener.accept().await.unwrap();
         serve_apple(s, Enc::Raw, "u", "p", AppleOpts { tamper: true, ..Default::default() }).await
     });
-    let config = VncConfig { username: Some("u".into()), password: Some("p".into()), ..Default::default() };
-    let options = VncOptions::default().with_encryption(EncryptionPolicy::Required);
+    let config = VncConfig { username: Some("u".into()), password: Some(String::from("p").into()), ..Default::default() };
+    let options =
+        VncOptions::default().with_encryption(EncryptionPolicy::Required).with_allow_unverified_sign_in(true);
     let (io, mut handle) = session_channels();
     let client =
         tokio::spawn(async move { rc_vnc::connect_and_run_with_options("127.0.0.1", port, config, options, io).await });
@@ -1153,6 +1184,9 @@ async fn apple_tampered_record_is_rejected() {
         match tokio::time::timeout(T, handle.events.recv()).await.expect("timed out") {
             Some(SessionEvent::Closed { error }) => break error.expect("expected an error"),
             Some(SessionEvent::Frame { .. }) => panic!("no pixels from a tampered record"),
+            // Connected and the security report wait for the first record's integrity check.
+            Some(SessionEvent::Connected { .. }) => panic!("must not connect before a record verified"),
+            Some(ev @ SessionEvent::Security { .. }) => panic!("must not report security yet: {ev:?}"),
             Some(_) => {}
             None => panic!("no Closed event"),
         }
@@ -1199,8 +1233,8 @@ async fn offer_only(
 #[tokio::test]
 async fn required_refuses_none_and_vnc_password() {
     let required = || VncOptions::default().with_encryption(EncryptionPolicy::Required);
-    let mac = || VncConfig { username: Some("u".into()), password: Some("p".into()), ..Default::default() };
-    let pw_only = || VncConfig { password: Some("p".into()), ..Default::default() };
+    let mac = || VncConfig { username: Some("u".into()), password: Some(String::from("p").into()), ..Default::default() };
+    let pw_only = || VncConfig { password: Some(String::from("p").into()), ..Default::default() };
     for types in [&[1u8][..], &[2], &[2, 1]] {
         for config in [mac(), pw_only()] {
             let (err, sent) = offer_only(b"RFB 003.889\n", types, config, required()).await;
@@ -1223,7 +1257,7 @@ async fn required_refuses_none_and_vnc_password() {
 // ---------------------------------------------------------------------------------------------
 
 fn creds() -> VncConfig {
-    VncConfig { username: Some("alice".into()), password: Some("MacPassw0rd!".into()), ..Default::default() }
+    VncConfig { username: Some("alice".into()), password: Some(String::from("MacPassw0rd!").into()), ..Default::default() }
 }
 
 #[tokio::test]
@@ -1381,7 +1415,7 @@ async fn apple_srp_wrong_password_is_an_auth_failure() {
         let opts = AppleOpts { offer_srp: true, expect_srp: true, ..Default::default() };
         serve_apple(s, Enc::Raw, "u", "right", opts).await
     });
-    let config = VncConfig { username: Some("u".into()), password: Some("wrong".into()), ..Default::default() };
+    let config = VncConfig { username: Some("u".into()), password: Some(String::from("wrong").into()), ..Default::default() };
     let options = VncOptions::default().with_encryption(EncryptionPolicy::Required);
     let (io, mut handle) = session_channels();
     let client =
@@ -1396,6 +1430,59 @@ async fn apple_srp_wrong_password_is_an_auth_failure() {
     };
     assert_eq!(err.kind, ErrorKind::AuthFailed, "{}", err.detail);
     assert!(err.detail.contains("SRP"), "{}", err.detail);
+    client.await.unwrap();
+    server.await.unwrap();
+}
+
+/// Security audit round 2: a man in the middle strips SRP (36) from the Mac's list to force
+/// type 30, an unauthenticated Diffie-Hellman exchange that would hand it the password.
+#[tokio::test]
+async fn required_refuses_srp_stripped_from_the_list() {
+    let required = || VncOptions::default().with_encryption(EncryptionPolicy::Required);
+    for types in [&[30u8][..], &[30, 33, 35]] {
+        let (err, sent) = offer_only(b"RFB 003.889\n", types, creds(), required()).await;
+        assert_eq!(err.kind, ErrorKind::Security, "{types:?}: {}", err.detail);
+        assert!(rc_vnc::is_srp_not_offered(&err), "{}", err.detail);
+        assert!(err.detail.starts_with(rc_vnc::SRP_NOT_OFFERED), "{}", err.detail);
+        // Nothing chosen, no credentials sent.
+        assert_eq!(sent, b"RFB 003.889\n");
+    }
+    // SRP turned off (the escape hatch) also needs the opt-in now, with its own message.
+    let (err, sent) = offer_only(b"RFB 003.889\n", &[30, 33, 36, 35], creds(), required().with_srp(false)).await;
+    assert_eq!(err.kind, ErrorKind::Security, "{}", err.detail);
+    assert!(!rc_vnc::is_srp_not_offered(&err), "{}", err.detail);
+    assert!(err.detail.contains("turned off"), "{}", err.detail);
+    assert_eq!(sent, b"RFB 003.889\n");
+}
+
+/// Security audit round 2: a wrong M2 used to be logged and the session still reported as
+/// verified. Now it ends the connection before ClientInit.
+#[tokio::test]
+async fn apple_srp_wrong_server_proof_is_refused() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let (s, _) = listener.accept().await.unwrap();
+        let opts = AppleOpts { offer_srp: true, expect_srp: true, bad_m2: true, ..Default::default() };
+        serve_apple(s, Enc::Raw, "u", "right", opts).await
+    });
+    let config =
+        VncConfig { username: Some("u".into()), password: Some(String::from("right").into()), ..Default::default() };
+    let options = VncOptions::default().with_encryption(EncryptionPolicy::Required);
+    let (io, mut handle) = session_channels();
+    let client =
+        tokio::spawn(async move { rc_vnc::connect_and_run_with_options("127.0.0.1", port, config, options, io).await });
+    let err = loop {
+        match tokio::time::timeout(T, handle.events.recv()).await.expect("timed out") {
+            Some(SessionEvent::Closed { error }) => break error.expect("expected an error"),
+            Some(SessionEvent::Connected { .. }) => panic!("must not connect"),
+            Some(ev @ SessionEvent::Security { .. }) => panic!("must not report security: {ev:?}"),
+            Some(_) => {}
+            None => panic!("no Closed event"),
+        }
+    };
+    assert_eq!(err.kind, ErrorKind::Security, "{}", err.detail);
+    assert!(err.detail.contains("M2"), "{}", err.detail);
     client.await.unwrap();
     server.await.unwrap();
 }

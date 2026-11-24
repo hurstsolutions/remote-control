@@ -23,6 +23,8 @@ export function blankConnection(protocol: Protocol = "rdp"): Connection {
     ssh_port: DEFAULT_SSH_PORT,
     pinned_identity: null,
     share_clipboard: true,
+    allow_older_mac_sign_in: false,
+    srp_seen: false,
   };
 }
 

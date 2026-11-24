@@ -36,6 +36,15 @@ pub struct Connection {
     /// existed keep sharing.
     #[serde(default = "yes")]
     pub share_clipboard: bool,
+    /// Mac without the SSH tunnel: let a Mac that does not offer Apple's verified (SRP) sign-in
+    /// sign in the older way (encrypted, but the Mac is not verified). Off by default.
+    #[serde(default)]
+    pub allow_older_mac_sign_in: bool,
+    /// This Mac has signed in with SRP before, so `allow_older_mac_sign_in` is ignored for it.
+    /// Set by the backend after such a sign-in; like the pin, never taken from the UI and dropped
+    /// when the connection is pointed at another machine.
+    #[serde(default)]
+    pub srp_seen: bool,
 }
 
 impl Connection {
@@ -116,6 +125,14 @@ impl Store {
         Ok(())
     }
 
+    pub fn set_srp_seen(&mut self, id: &str) -> Result<(), String> {
+        if let Some(connection) = self.connections.iter_mut().find(|c| c.id == id) {
+            connection.srp_seen = true;
+            self.save()?;
+        }
+        Ok(())
+    }
+
     fn save(&self) -> Result<(), String> {
         let json = serde_json::to_vec_pretty(&self.connections).map_err(|e| e.to_string())?;
         private_fs::write_atomic(&self.path, &json)
@@ -140,6 +157,8 @@ mod tests {
             ssh_port: 22,
             pinned_identity: None,
             share_clipboard: true,
+            allow_older_mac_sign_in: false,
+            srp_seen: false,
         }
     }
 
@@ -154,6 +173,7 @@ mod tests {
         store.upsert(sample("a")).unwrap();
         store.upsert(sample("b")).unwrap();
         store.set_pin("a", Some("abc".into())).unwrap();
+        store.set_srp_seen("a").unwrap();
         store.remove("b").unwrap();
 
         #[cfg(unix)]
@@ -167,6 +187,7 @@ mod tests {
         let reloaded = Store::load(path);
         assert_eq!(reloaded.list().len(), 1);
         assert_eq!(reloaded.get("a").unwrap().pinned_identity.as_deref(), Some("abc"));
+        assert!(reloaded.get("a").unwrap().srp_seen);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -175,6 +196,7 @@ mod tests {
         let json = r#"[{"id":"x","name":"Mac","protocol":"vnc","host":"mac.local","port":5900}]"#;
         let list: Vec<Connection> = serde_json::from_str(json).unwrap();
         assert!(list[0].ssh_tunnel && list[0].nla && list[0].share_clipboard);
+        assert!(!list[0].allow_older_mac_sign_in && !list[0].srp_seen);
         assert_eq!(list[0].ssh_port, 22);
     }
 

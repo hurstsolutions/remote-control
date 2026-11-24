@@ -77,10 +77,14 @@ fn kind_name(kind: ErrorKind) -> &'static str {
     }
 }
 
+/// UI-only kind: a direct Mac connection refused because the Mac did not offer Apple's verified
+/// (SRP) sign-in (`rc_vnc::is_srp_not_offered`). Someone may be interfering, or it is an older Mac.
+const NO_VERIFIED_SIGN_IN: &str = "no_verified_sign_in";
+
 impl From<&SessionError> for UiError {
     fn from(error: &SessionError) -> Self {
         Self {
-            kind: kind_name(error.kind),
+            kind: if rc_vnc::is_srp_not_offered(error) { NO_VERIFIED_SIGN_IN } else { kind_name(error.kind) },
             detail: error.detail.clone(),
             identity: error.identity.clone(),
         }
@@ -111,6 +115,8 @@ struct SavedConnection {
 #[derive(Debug, PartialEq, Eq)]
 struct SaveDecision {
     pinned_identity: Option<String>,
+    /// Like the pin: what the backend learned about this machine, kept only for the same target.
+    srp_seen: bool,
     /// Delete any keychain entry under this id before saving.
     clear_password: bool,
 }
@@ -123,6 +129,7 @@ fn decide_save(existing: Option<&Connection>, incoming: &Connection) -> SaveDeci
             let same_target = existing.same_target(incoming);
             SaveDecision {
                 pinned_identity: if same_target { existing.pinned_identity.clone() } else { None },
+                srp_seen: same_target && existing.srp_seen,
                 clear_password: !same_target || !existing.same_account(incoming),
             }
         }
@@ -130,14 +137,42 @@ fn decide_save(existing: Option<&Connection>, incoming: &Connection) -> SaveDeci
         // earlier connection with that id is picked up.
         None => SaveDecision {
             pinned_identity: None,
+            srp_seen: false,
             clear_password: !incoming.id.is_empty(),
         },
     }
 }
 
+/// Remove the saved password before the connection is pointed elsewhere, and make sure it is
+/// really gone: only "no entry" afterwards counts, a keychain error does not. Returns whether a
+/// password was removed.
+fn clear_saved_password(
+    delete: impl FnOnce() -> Result<bool, String>,
+    still_there: impl FnOnce() -> Result<bool, String>,
+) -> Result<bool, UiError> {
+    let refuse = |why: String| {
+        UiError::other(format!(
+            "The address or username changed, but the saved password could not be removed from the keychain ({why}). \
+             Remove it with \"Forget saved password\" and try again."
+        ))
+    };
+    let deleted = delete().map_err(refuse)?;
+    match still_there() {
+        Ok(false) => Ok(deleted),
+        Ok(true) => Err(refuse("it is still there".into())),
+        Err(e) => Err(refuse(e)),
+    }
+}
+
+/// A connection name from the UI: no control characters, nothing invisible or text-reordering
+/// (bidi overrides, zero-width characters).
+fn clean_name(text: &str) -> String {
+    text.chars().filter(|c| !rc_discover::is_unsafe_char(*c)).collect::<String>().trim().to_owned()
+}
+
 #[tauri::command]
 fn save_connection(state: State<'_, AppState>, mut connection: Connection) -> Result<SavedConnection, UiError> {
-    connection.name = connection.name.trim().to_owned();
+    connection.name = clean_name(&connection.name);
     connection.host = connection.host.trim().to_owned();
     connection.username = connection.username.trim().to_owned();
     connection.domain = connection.domain.trim().to_owned();
@@ -154,15 +189,11 @@ fn save_connection(state: State<'_, AppState>, mut connection: Connection) -> Re
         connection.id = uuid::Uuid::new_v4().to_string();
     }
     connection.pinned_identity = decision.pinned_identity;
+    connection.srp_seen = decision.srp_seen;
     // Delete before saving, and refuse to save the new target while the old password is still
-    // there: `connect` would otherwise send it to the new address.
-    let deleted = decision.clear_password && secrets::delete(&connection.id);
-    if decision.clear_password && secrets::get(&connection.id).is_some() {
-        return Err(UiError::other(
-            "The address or username changed, but the saved password could not be removed from the keychain. \
-             Remove it with \"Forget saved password\" and try again.",
-        ));
-    }
+    // there. (`connect` also refuses a password bound to another target.)
+    let deleted = decision.clear_password
+        && clear_saved_password(|| secrets::delete(&connection.id), || secrets::exists(&connection.id))?;
     let password_cleared = deleted && existing.is_some();
     if password_cleared {
         info!(id = %connection.id, "saved password removed: the connection now points at another address or account");
@@ -176,18 +207,22 @@ fn save_connection(state: State<'_, AppState>, mut connection: Connection) -> Re
 
 #[tauri::command]
 fn delete_connection(state: State<'_, AppState>, id: String) -> Result<(), UiError> {
-    let _ = secrets::delete(&id);
+    // A password left behind is harmless: it is bound to this connection's target, and a new
+    // connection never reuses the id without clearing it first.
+    if let Err(error) = secrets::delete(&id) {
+        warn!(%id, %error, "saved password not removed with its connection");
+    }
     lock(&state.store).remove(&id).map_err(UiError::other)
 }
 
 #[tauri::command]
-fn has_saved_password(id: String) -> bool {
-    secrets::get(&id).is_some()
+fn has_saved_password(id: String) -> Result<bool, UiError> {
+    secrets::exists(&id).map_err(UiError::other)
 }
 
 #[tauri::command]
-fn forget_password(id: String) {
-    let _ = secrets::delete(&id);
+fn forget_password(id: String) -> Result<(), UiError> {
+    secrets::delete(&id).map(|_| ()).map_err(UiError::other)
 }
 
 // ── Sessions ─────────────────────────────────────────────────────────────────
@@ -201,10 +236,22 @@ struct ConnectArgs {
     height: u16,
     scale_factor: u32,
     trust_new_identity: bool,
-    /// With `trust_new_identity`: the fingerprint the user reviewed. Only that identity is
-    /// accepted; `None` accepts whatever the server presents.
+    /// With `trust_new_identity`: the fingerprint the user reviewed (required). Only that
+    /// identity is accepted.
     #[serde(default)]
     new_identity: Option<String>,
+}
+
+/// The pin to check this connect against: the reviewed new identity when trusting one (which
+/// must be given: there is no "accept whatever is presented"), else the saved pin.
+fn pin_for_connect(args: &ConnectArgs, saved: Option<&str>) -> Result<Option<String>, UiError> {
+    if !args.trust_new_identity {
+        return Ok(saved.map(str::to_owned));
+    }
+    match args.new_identity.as_deref() {
+        Some(f) if f.len() == 64 && f.bytes().all(|b| b.is_ascii_hexdigit()) => Ok(Some(f.to_ascii_lowercase())),
+        _ => Err(UiError::other("Trusting a new identity needs the fingerprint that was reviewed.")),
+    }
 }
 
 impl std::fmt::Debug for ConnectArgs {
@@ -226,7 +273,7 @@ impl std::fmt::Debug for ConnectArgs {
 fn choose_password(
     typed: Option<String>,
     trust_new_identity: bool,
-    saved: impl FnOnce() -> Option<String>,
+    saved: impl FnOnce() -> Result<Option<String>, UiError>,
 ) -> Result<String, UiError> {
     if let Some(password) = typed.filter(|p| !p.is_empty()) {
         return Ok(password);
@@ -237,7 +284,34 @@ fn choose_password(
             "Enter the password to connect to a computer with a new identity. The saved password is not used.",
         ));
     }
-    saved().ok_or_else(|| UiError::new("password_required", "No password is saved for this connection."))
+    saved()?.ok_or_else(|| UiError::new("password_required", "No password is saved for this connection."))
+}
+
+/// The saved password for `connection`, only if it was saved for this very machine and account.
+/// Anything else asks for the password: a keychain error, or a password bound to another target
+/// (removed on the spot).
+fn saved_password(connection: &Connection) -> Result<Option<String>, UiError> {
+    match secrets::get(&connection.id, &secrets::Binding::of(connection)) {
+        Ok(secrets::Saved::Found(password)) => Ok(Some(password)),
+        Ok(secrets::Saved::Missing) => Ok(None),
+        Ok(secrets::Saved::WrongTarget) => {
+            warn!(id = %connection.id, "saved password belongs to another address or account; removing it");
+            if let Err(error) = secrets::delete(&connection.id) {
+                warn!(%error, "cannot remove the mismatched saved password");
+            }
+            Err(UiError::new(
+                "password_required",
+                "The saved password was for a different address or account, so it was removed and not sent. Enter the password.",
+            ))
+        }
+        Err(error) => {
+            warn!(%error, "cannot read the saved password");
+            Err(UiError::new(
+                "password_required",
+                format!("The saved password could not be read from the keychain ({error}). Enter the password."),
+            ))
+        }
+    }
 }
 
 #[tauri::command]
@@ -251,15 +325,10 @@ fn connect(
         .get(&args.id)
         .ok_or_else(|| UiError::other("This connection no longer exists."))?;
 
+    let pinned = pin_for_connect(&args, connection.pinned_identity.as_deref())?;
     let typed_password = args.password.clone().filter(|p| !p.is_empty());
-    let password = choose_password(typed_password.clone(), args.trust_new_identity, || {
-        secrets::get(&connection.id)
-    })?;
-    let pinned = if args.trust_new_identity {
-        args.new_identity.clone().map(|f| f.to_ascii_lowercase())
-    } else {
-        connection.pinned_identity.clone()
-    };
+    let password =
+        choose_password(typed_password.clone(), args.trust_new_identity, || saved_password(&connection))?;
 
     let session_id = uuid::Uuid::new_v4().to_string();
     info!(
@@ -316,6 +385,7 @@ fn connect(
         trust_new_identity: args.trust_new_identity,
         target: connection,
         seen_identity: None,
+        srp_verified: false,
         // Only a password the user just typed needs saving, and only once it has worked.
         password_to_save: typed_password.filter(|_| args.save_password),
         channel: events,
@@ -329,13 +399,27 @@ fn connect(
 /// Screen Sharing or not happen at all. Inside the SSH tunnel VNC adds nothing: SSH already
 /// encrypts and authenticates the session, and Apple's encryption on top would only risk
 /// incompatibilities.
-fn vnc_options(ssh_tunnel: bool, srp: bool) -> rc_vnc::VncOptions {
+///
+/// Direct connections also require Apple's verified (SRP) sign-in, unless `allow_unverified` lets
+/// a Mac without it sign in the older way (encrypted, Mac not verified).
+fn vnc_options(ssh_tunnel: bool, srp: bool, allow_unverified: bool) -> rc_vnc::VncOptions {
     let encryption = if ssh_tunnel {
         rc_vnc::EncryptionPolicy::Off
     } else {
         rc_vnc::EncryptionPolicy::Required
     };
-    rc_vnc::VncOptions::default().with_encryption(encryption).with_srp(srp)
+    rc_vnc::VncOptions::default()
+        .with_encryption(encryption)
+        .with_srp(srp)
+        .with_allow_unverified_sign_in(allow_unverified)
+}
+
+/// Whether a direct Mac connection may fall back to Apple's older, unverified sign-in. Only when
+/// the user allowed it for this connection and this Mac has never signed in with SRP: a Mac that
+/// did SRP before and suddenly does not is treated as someone interfering. The `RC_VNC_SRP=off`
+/// troubleshooting knob asks for the older sign-in outright.
+fn allow_unverified_sign_in(connection: &Connection, srp: bool) -> bool {
+    !srp || (connection.allow_older_mac_sign_in && !connection.srp_seen)
 }
 
 /// Troubleshooting knob: `RC_VNC_SRP=off` (or `0`, `false`, `no`) makes direct Mac connections
@@ -356,7 +440,7 @@ fn tunnel_security(pinned: Option<&str>) -> SessionEvent {
 async fn run_vnc(connection: Connection, password: String, pinned: Option<String>, io: SessionIo) {
     let config = rc_vnc::VncConfig {
         username: Some(connection.username.clone()).filter(|u| !u.is_empty()),
-        password: Some(password.clone()),
+        password: Some(password.clone().into()),
         shared: true,
         view_only: false,
     };
@@ -364,9 +448,18 @@ async fn run_vnc(connection: Connection, password: String, pinned: Option<String
     if !srp {
         warn!("{SRP_ENV} turns SRP off: a direct connection will be encrypted, but the Mac will not be verified");
     }
-    let options = vnc_options(connection.ssh_tunnel, srp);
+    let allow_unverified = allow_unverified_sign_in(&connection, srp);
+    let options = vnc_options(connection.ssh_tunnel, srp, allow_unverified);
     if !connection.ssh_tunnel {
-        info!(encryption = ?options.encryption, srp, "VNC without an SSH tunnel: Apple Screen Sharing encryption is required");
+        if connection.allow_older_mac_sign_in && connection.srp_seen {
+            info!("older Mac sign-in is allowed for this connection, but ignored: this Mac has signed in with SRP before");
+        }
+        info!(
+            encryption = ?options.encryption,
+            srp,
+            allow_unverified,
+            "VNC without an SSH tunnel: Apple Screen Sharing encryption is required"
+        );
         rc_vnc::connect_and_run_with_options(&connection.host, connection.port, config, options, io).await;
         return;
     }
@@ -420,6 +513,8 @@ struct Pump {
     trust_new_identity: bool,
     /// The identity the server proved, kept until the sign-in succeeds.
     seen_identity: Option<String>,
+    /// The Mac signed in with SRP (verified) in this session; remembered once the sign-in succeeds.
+    srp_verified: bool,
     password_to_save: Option<String>,
     channel: Channel<InvokeResponseBody>,
 }
@@ -443,6 +538,22 @@ fn pin_after_sign_in(
         // Only an explicit "trust new identity" replaces a pin.
         Some(_) if trust_new_identity => Some(seen.to_owned()),
         Some(_) => None,
+    }
+}
+
+/// Whether to remember that this Mac does SRP: it just did, and the connection still points at it.
+fn srp_seen_after_sign_in(current: Option<&Connection>, target: &Connection, srp_verified: bool) -> bool {
+    srp_verified && current.is_some_and(|c| c.same_target(target) && !c.srp_seen)
+}
+
+/// A session that is trusting a new identity checks it against the identity the user just
+/// accepted, not one saved from an earlier connection: never report that as verified.
+fn security_for_session(event: SessionEvent, trust_new_identity: bool) -> SessionEvent {
+    match event {
+        SessionEvent::Security { encrypted, server_verified: true, method } if trust_new_identity => {
+            SessionEvent::Security { encrypted, server_verified: false, method }
+        }
+        other => other,
     }
 }
 
@@ -498,6 +609,7 @@ impl Pump {
                     true
                 }
                 other => {
+                    let other = security_for_session(other, self.trust_new_identity);
                     let notice = self.side_effects(&other);
                     let forwarded = match to_json(other) {
                         Some(json) => self.send_json(json),
@@ -535,6 +647,12 @@ impl Pump {
                 self.seen_identity = Some(sha256.clone());
                 None
             }
+            SessionEvent::Security { .. } => {
+                if rc_vnc::VncSecurity::from_event(event) == Some(rc_vnc::VncSecurity::EncryptedVerified) {
+                    self.srp_verified = true;
+                }
+                None
+            }
             SessionEvent::Connected { .. } => self.signed_in(),
             _ => None,
         }
@@ -560,6 +678,12 @@ impl Pump {
             } else if self.seen_identity.is_some() && !current.as_ref().is_some_and(|c| c.same_target(&self.target)) {
                 warn!(session = %self.session_id, "connection was changed while signing in; server identity not saved");
             }
+            if srp_seen_after_sign_in(current.as_ref(), &self.target, self.srp_verified) {
+                info!(session = %self.session_id, "this Mac signs in with SRP; the older sign-in is no longer allowed for it");
+                if let Err(e) = store.set_srp_seen(&id) {
+                    error!(error = %e, "cannot save that the Mac signs in with SRP");
+                }
+            }
             may_save_password(current.as_ref(), &self.target)
         };
         let password = self.password_to_save.take()?;
@@ -567,7 +691,7 @@ impl Pump {
             warn!(session = %self.session_id, "connection was changed while signing in; password not saved");
             return None;
         }
-        match secrets::set(&id, &password) {
+        match secrets::set(&id, &password, &secrets::Binding::of(&self.target)) {
             Ok(()) => None,
             Err(e) => {
                 warn!(error = %e, "password not saved");
@@ -840,13 +964,26 @@ mod tests {
 
     #[test]
     fn direct_mac_connections_require_encryption_and_tunnelled_ones_leave_it_to_ssh() {
-        let direct = vnc_options(false, true);
+        let direct = vnc_options(false, true, false);
         assert_eq!(direct.encryption, rc_vnc::EncryptionPolicy::Required);
         assert!(direct.srp);
-        let tunnelled = vnc_options(true, true);
+        assert!(!direct.allow_unverified_sign_in);
+        assert!(vnc_options(false, true, true).allow_unverified_sign_in);
+        let tunnelled = vnc_options(true, true, false);
         assert_eq!(tunnelled.encryption, rc_vnc::EncryptionPolicy::Off);
-        assert!(!vnc_options(false, false).srp);
-        assert_eq!(vnc_options(false, false).encryption, rc_vnc::EncryptionPolicy::Required);
+        assert!(!vnc_options(false, false, true).srp);
+        assert_eq!(vnc_options(false, false, true).encryption, rc_vnc::EncryptionPolicy::Required);
+    }
+
+    #[test]
+    fn older_mac_sign_in_needs_the_setting_and_no_srp_history() {
+        let mac = Connection { protocol: Protocol::Vnc, ssh_tunnel: false, pinned_identity: None, ..conn("m") };
+        assert!(!allow_unverified_sign_in(&mac, true), "off by default");
+        let allowed = Connection { allow_older_mac_sign_in: true, ..mac.clone() };
+        assert!(allow_unverified_sign_in(&allowed, true));
+        let seen = Connection { srp_seen: true, ..allowed.clone() };
+        assert!(!allow_unverified_sign_in(&seen, true), "a Mac that did SRP before never falls back");
+        assert!(allow_unverified_sign_in(&mac, false), "the RC_VNC_SRP=off knob asks for the older sign-in");
     }
 
     #[test]
@@ -896,6 +1033,17 @@ mod tests {
     }
 
     #[test]
+    fn a_mac_without_verified_sign_in_gets_its_own_kind() {
+        let refused = SessionError::new(ErrorKind::Security, format!("{}; Offered: [30]", rc_vnc::SRP_NOT_OFFERED));
+        assert_eq!(UiError::from(&refused).kind, "no_verified_sign_in");
+        // The RC_VNC_SRP=off refusal and other security errors stay "security".
+        let srp_off = SessionError::new(ErrorKind::Security, "SRP sign-in (Apple's verified sign-in) is turned off for this connection");
+        assert_eq!(UiError::from(&srp_off).kind, "security");
+        let other = SessionError::new(ErrorKind::Other, rc_vnc::SRP_NOT_OFFERED);
+        assert_eq!(UiError::from(&other).kind, "other");
+    }
+
+    #[test]
     fn input_from_the_ui_deserializes() {
         let input: SessionInput =
             serde_json::from_str(r#"{"type":"pointer_button","button":"left","down":true,"x":5,"y":6}"#).unwrap();
@@ -924,6 +1072,8 @@ mod tests {
             ssh_port: 22,
             pinned_identity: Some("aa".repeat(32)),
             share_clipboard: true,
+            allow_older_mac_sign_in: false,
+            srp_seen: false,
         }
     }
 
@@ -932,7 +1082,15 @@ mod tests {
         let existing = conn("a");
         let incoming = Connection { name: "Renamed".into(), pinned_identity: None, share_clipboard: false, ..existing.clone() };
         let decision = decide_save(Some(&existing), &incoming);
-        assert_eq!(decision, SaveDecision { pinned_identity: existing.pinned_identity.clone(), clear_password: false });
+        assert_eq!(
+            decision,
+            SaveDecision { pinned_identity: existing.pinned_identity.clone(), srp_seen: false, clear_password: false }
+        );
+        // What the backend learned about the Mac stays too, whatever the caller sends.
+        let mac = Connection { protocol: Protocol::Vnc, ssh_tunnel: false, srp_seen: true, ..existing.clone() };
+        let edited = Connection { name: "Mac".into(), srp_seen: false, allow_older_mac_sign_in: true, ..mac.clone() };
+        assert!(decide_save(Some(&mac), &edited).srp_seen);
+        assert!(!decide_save(None, &Connection { srp_seen: true, ..conn("new") }).srp_seen, "never taken from the caller");
     }
 
     #[test]
@@ -946,7 +1104,9 @@ mod tests {
             Connection { ssh_port: 2222, ..existing.clone() },
         ] {
             let decision = decide_save(Some(&existing), &incoming);
-            assert_eq!(decision, SaveDecision { pinned_identity: None, clear_password: true }, "{incoming:?}");
+            assert_eq!(decision, SaveDecision { pinned_identity: None, srp_seen: false, clear_password: true }, "{incoming:?}");
+            let seen = Connection { srp_seen: true, ..existing.clone() };
+            assert!(!decide_save(Some(&seen), &incoming).srp_seen, "retargeting forgets SRP: {incoming:?}");
         }
     }
 
@@ -967,10 +1127,10 @@ mod tests {
     fn the_callers_pin_is_never_kept() {
         // A brand-new connection.
         let incoming = Connection { id: String::new(), ..conn("") };
-        assert_eq!(decide_save(None, &incoming), SaveDecision { pinned_identity: None, clear_password: false });
+        assert_eq!(decide_save(None, &incoming), SaveDecision { pinned_identity: None, srp_seen: false, clear_password: false });
         // An id that does not exist: no pin from the caller, and no stale password under that id.
         let unknown = conn("not-saved");
-        assert_eq!(decide_save(None, &unknown), SaveDecision { pinned_identity: None, clear_password: true });
+        assert_eq!(decide_save(None, &unknown), SaveDecision { pinned_identity: None, srp_seen: false, clear_password: true });
         // An existing connection: the stored pin wins over whatever the caller sent.
         let existing = Connection { pinned_identity: None, ..conn("a") };
         let incoming = Connection { pinned_identity: Some("bb".repeat(32)), ..existing.clone() };
@@ -979,7 +1139,7 @@ mod tests {
 
     #[test]
     fn trusting_a_new_identity_needs_a_typed_password() {
-        let saved = || Some("saved".to_owned());
+        let saved = || Ok(Some("saved".to_owned()));
         assert_eq!(choose_password(None, false, saved).unwrap(), "saved");
         assert_eq!(choose_password(Some("typed".into()), false, saved).unwrap(), "typed");
         assert_eq!(choose_password(Some("typed".into()), true, saved).unwrap(), "typed");
@@ -987,7 +1147,10 @@ mod tests {
         assert_eq!(error.kind, "password_required");
         let error = choose_password(Some(String::new()), true, || panic!("the keychain must not be read")).unwrap_err();
         assert_eq!(error.kind, "password_required");
-        assert_eq!(choose_password(None, false, || None).unwrap_err().kind, "password_required");
+        assert_eq!(choose_password(None, false, || Ok(None)).unwrap_err().kind, "password_required");
+        // A keychain problem (or a password for another target) is never "carry on without one".
+        let error = choose_password(None, false, || Err(UiError::new("password_required", "keychain locked"))).unwrap_err();
+        assert_eq!((error.kind, error.detail.as_str()), ("password_required", "keychain locked"));
     }
 
     #[test]
@@ -1067,5 +1230,70 @@ mod tests {
         let json = serde_json::to_value(SavedConnection { connection: conn("a"), password_cleared: true }).unwrap();
         assert_eq!(json["password_cleared"], true);
         assert_eq!(json["connection"]["share_clipboard"], true);
+    }
+
+    #[test]
+    fn a_password_is_cleared_only_when_the_keychain_says_it_is_gone() {
+        assert!(clear_saved_password(|| Ok(true), || Ok(false)).unwrap());
+        assert!(!clear_saved_password(|| Ok(false), || Ok(false)).unwrap(), "nothing to remove is fine");
+        let error = clear_saved_password(|| Err("locked".into()), || panic!("not read after a failed delete")).unwrap_err();
+        assert!(error.detail.contains("locked"), "{}", error.detail);
+        assert!(clear_saved_password(|| Ok(true), || Ok(true)).is_err(), "still there");
+        assert!(clear_saved_password(|| Ok(true), || Err("no keychain".into())).is_err(), "an unreadable keychain is not gone");
+    }
+
+    #[test]
+    fn names_lose_hidden_and_reordering_characters() {
+        assert_eq!(clean_name("  Office\u{202E}CP\u{200B}\u{2066} Mac\u{FEFF}\u{7} "), "OfficeCP Mac");
+        assert_eq!(clean_name("Café 💻"), "Café 💻");
+    }
+
+    #[test]
+    fn trusting_a_new_identity_needs_the_reviewed_fingerprint() {
+        let args = |trust: bool, new_identity: Option<String>| ConnectArgs {
+            id: "a".into(),
+            password: Some("pw".into()),
+            save_password: false,
+            width: 800,
+            height: 600,
+            scale_factor: 100,
+            trust_new_identity: trust,
+            new_identity,
+        };
+        let saved = "aa".repeat(32);
+        assert_eq!(pin_for_connect(&args(false, None), Some(&saved)).unwrap(), Some(saved.clone()));
+        assert_eq!(pin_for_connect(&args(false, None), None).unwrap(), None);
+        let reviewed = "BB".repeat(32);
+        assert_eq!(pin_for_connect(&args(true, Some(reviewed)), Some(&saved)).unwrap(), Some("bb".repeat(32)));
+        for bad in [None, Some(String::new()), Some("bb".repeat(31)), Some("zz".repeat(32))] {
+            assert!(pin_for_connect(&args(true, bad.clone()), Some(&saved)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_newly_trusted_identity_is_never_reported_as_verified() {
+        let check = |event: SessionEvent, verified: bool| match event {
+            SessionEvent::Security { server_verified, encrypted, .. } => {
+                assert!(encrypted);
+                assert_eq!(server_verified, verified);
+            }
+            other => panic!("{other:?}"),
+        };
+        check(security_for_session(SessionEvent::security(true, true, "SSH tunnel"), true), false);
+        check(security_for_session(SessionEvent::security(true, true, "SSH tunnel"), false), true);
+        check(security_for_session(SessionEvent::security(true, true, "TLS + NLA"), true), false);
+        assert!(matches!(security_for_session(SessionEvent::Bell, true), SessionEvent::Bell));
+    }
+
+    #[test]
+    fn srp_is_remembered_only_for_the_same_mac() {
+        let mac = Connection { protocol: Protocol::Vnc, ssh_tunnel: false, pinned_identity: None, ..conn("m") };
+        assert!(srp_seen_after_sign_in(Some(&mac), &mac, true));
+        assert!(!srp_seen_after_sign_in(Some(&mac), &mac, false), "no SRP this time");
+        assert!(!srp_seen_after_sign_in(None, &mac, true), "deleted while signing in");
+        let moved = Connection { host: "10.0.0.77".into(), ..mac.clone() };
+        assert!(!srp_seen_after_sign_in(Some(&moved), &mac, true), "edited to another Mac while signing in");
+        let already = Connection { srp_seen: true, ..mac.clone() };
+        assert!(!srp_seen_after_sign_in(Some(&already), &mac, true), "already saved: no write");
     }
 }

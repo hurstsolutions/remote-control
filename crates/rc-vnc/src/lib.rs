@@ -9,7 +9,12 @@
 //! * Apple Screen Sharing's encrypted session (AES-128-CBC record layer with SHA-1 integrity),
 //!   selected by [`EncryptionPolicy`] in [`VncOptions`]. Just before `Connected` the session
 //!   emits one `SessionEvent::Security` describing VNC's own protection
-//!   ([`VncSecurity::to_event`]); [`VncSecurity::from_event`] maps it back.
+//!   ([`VncSecurity::to_event`]); [`VncSecurity::from_event`] maps it back. In an encrypted
+//!   session both are sent only after the Mac's first encrypted message has passed its
+//!   integrity check, which confirms the key the sign-in produced.
+//! * Under [`EncryptionPolicy::Required`] only the verified sign-in (SRP) is used unless
+//!   [`VncOptions::allow_unverified_sign_in`] is set; SRP accepts only the RFC 5054 groups and
+//!   checks the Mac's proof.
 //! * Encodings: Raw, CopyRect, RRE, Hextile, Zlib, ZRLE, Tight (including JPEG); pseudo-encodings
 //!   Cursor, DesktopSize, ExtendedDesktopSize, LastRect.
 //!
@@ -49,6 +54,7 @@ use std::panic::AssertUnwindSafe;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::{error, info, warn};
+use zeroize::Zeroizing;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -57,7 +63,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct VncConfig {
     /// Needed for Apple (macOS account) authentication.
     pub username: Option<String>,
-    pub password: Option<String>,
+    /// Wiped from memory when dropped (`Some(password.into())` from a `String`).
+    pub password: Option<Zeroizing<String>>,
     /// RFB shared flag: leave other viewers connected. Default true.
     pub shared: bool,
     /// Drop all pointer, keyboard, clipboard and resize input.
@@ -85,16 +92,21 @@ impl std::fmt::Debug for VncConfig {
 /// Whether the session must be encrypted by the VNC protocol itself.
 ///
 /// Only Apple Screen Sharing (macOS, RFB 003.889) can encrypt a VNC session here; it does so
-/// after signing in with a macOS username and password (security type 30).
+/// after signing in with a macOS username and password (security type 36 SRP, or type 30).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EncryptionPolicy {
     /// Encrypt or do not connect. For direct connections (no SSH tunnel). Refuses servers that
     /// are not Apple Screen Sharing, and refuses security types None (1) and VNC password (2)
     /// even if the server offers them: a man in the middle could otherwise strip the other
     /// types from the list and read the session. Never falls back to cleartext.
+    ///
+    /// Also requires the verified sign-in (SRP, type 36): Apple's type 30 is refused unless
+    /// [`VncOptions::allow_unverified_sign_in`] is set, whether the Mac did not offer type 36
+    /// (see [`SRP_NOT_OFFERED`]) or SRP is turned off with [`VncOptions::srp`].
     Required,
     /// Encrypt when the server is a Mac and a macOS username and password are available;
-    /// otherwise continue unencrypted (with a warning in the log). Once encryption setup has
+    /// otherwise continue unencrypted (with a warning in the log). Uses SRP when offered and
+    /// falls back to type 30 without asking (`allow_unverified_sign_in` is ignored). Once encryption setup has
     /// started, a failure ends the session; it is never silently downgraded. For use inside an
     /// SSH tunnel, where the tunnel already protects the session.
     Preferred,
@@ -114,18 +126,41 @@ pub struct VncOptions {
     /// For encrypted sessions, sign in with SRP (security type 36) when the Mac offers it,
     /// which also verifies the Mac's identity. Default true. Turning it off falls back to
     /// type 30 (encrypted, Mac not verified); meant only as an escape hatch while SRP is new.
+    /// Under [`EncryptionPolicy::Required`] that fallback also needs `allow_unverified_sign_in`.
     pub srp: bool,
+    /// Under [`EncryptionPolicy::Required`], allow Apple's type 30 sign-in when SRP is not used
+    /// (the Mac did not offer type 36, or `srp` is false). Type 30 encrypts the session but
+    /// cannot verify the Mac: a man in the middle can strip type 36 from the Mac's list and then
+    /// learn the password. Default false: such a connection fails with a `Security` error, whose
+    /// detail starts with [`SRP_NOT_OFFERED`] when the Mac did not offer SRP. No effect under
+    /// `Preferred` or `Off`.
+    pub allow_unverified_sign_in: bool,
 }
 
 impl Default for VncOptions {
     fn default() -> Self {
-        VncOptions { encryption: EncryptionPolicy::default(), srp: true }
+        VncOptions { encryption: EncryptionPolicy::default(), srp: true, allow_unverified_sign_in: false }
     }
+}
+
+/// Start of the `SessionError::detail` (kind `Security`) when encryption is required, SRP is
+/// enabled, and the Mac's security list has no SRP (type 36) but type 30: either a man in the
+/// middle edited the list, or an older Mac. See [`is_srp_not_offered`].
+pub const SRP_NOT_OFFERED: &str = "the Mac didn't offer SRP sign-in (Apple's verified sign-in)";
+
+/// Whether `error` is the [`SRP_NOT_OFFERED`] refusal (so a front end can offer
+/// [`VncOptions::allow_unverified_sign_in`] after a warning).
+pub fn is_srp_not_offered(error: &SessionError) -> bool {
+    error.kind == ErrorKind::Security && error.detail.starts_with(SRP_NOT_OFFERED)
 }
 
 impl VncOptions {
     pub fn with_srp(mut self, srp: bool) -> Self {
         self.srp = srp;
+        self
+    }
+    pub fn with_allow_unverified_sign_in(mut self, allow: bool) -> Self {
+        self.allow_unverified_sign_in = allow;
         self
     }
     pub fn with_encryption(mut self, encryption: EncryptionPolicy) -> Self {
@@ -145,7 +180,8 @@ pub enum VncSecurity {
     /// eavesdropping only. An active man in the middle can impersonate the Mac and learn the
     /// password.
     EncryptedUnverified,
-    /// Encrypted, and the Mac proved it knows the account's password verifier (SRP, type 36):
+    /// Encrypted, and the Mac proved it knows the account's password verifier (SRP, type 36,
+    /// its proof M2 checked) and the first encrypted message from it passed its integrity check:
     /// protects against eavesdropping and impersonation.
     EncryptedVerified,
 }

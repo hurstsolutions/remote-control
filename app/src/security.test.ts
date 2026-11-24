@@ -50,4 +50,18 @@ describe("lockState", () => {
     expect(lockState([tunnel, vnc])?.method).toBe("SSH tunnel");
     expect(lockState([layer(true, false, "SSH tunnel"), vnc])?.level).toBe("unverified");
   });
+
+  it("says so when the identity was accepted just now, even if a layer claims verified", () => {
+    for (const verified of [false, true]) {
+      for (const method of ["SSH tunnel", "TLS + NLA"]) {
+        const lock = lockState([layer(true, verified, method), layer(false, false, "VNC, unencrypted")], true);
+        expect(lock?.level).toBe("unverified");
+        expect(lock?.headline).toBe("Encrypted, new identity accepted");
+        expect(lock?.paragraphs.join(" ")).toContain("accepted this computer's new identity just now");
+        expect(lock?.paragraphs.join(" ")).not.toContain("first connection");
+      }
+    }
+    // Apple's SRP proves the Mac by itself; accepting a pin does not change that.
+    expect(lockState([layer(true, true, "Apple Screen Sharing encryption, SRP sign-in")], true)?.level).toBe("verified");
+  });
 });

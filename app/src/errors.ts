@@ -6,7 +6,8 @@ export interface ErrorText {
   hints: string[];
 }
 
-type Target = Pick<Connection, "host" | "protocol" | "ssh_tunnel" | "name">;
+type Target = Pick<Connection, "host" | "protocol" | "ssh_tunnel" | "name"> &
+  Partial<Pick<Connection, "allow_older_mac_sign_in" | "srp_seen">>;
 
 const KINDS: readonly ErrorKind[] = [
   "unreachable",
@@ -14,6 +15,7 @@ const KINDS: readonly ErrorKind[] = [
   "auth_failed",
   "unsupported",
   "security",
+  "no_verified_sign_in",
   "identity_changed",
   "protocol",
   "disconnected",
@@ -23,7 +25,13 @@ const KINDS: readonly ErrorKind[] = [
 
 /** What connecting to a Mac without SSH means, for the editor and the "Connect without SSH" confirmation. */
 export const DIRECT_MAC_SUMMARY =
-  "Without SSH, Screen Sharing encrypts the session itself, and the app won't connect unencrypted. Newer Macs that support Apple's SRP sign-in are also verified. With other Macs, someone actively intercepting the connection could impersonate the Mac and capture your password. SSH (Remote Login) is the most thoroughly protected option.";
+  "Without SSH, Screen Sharing encrypts the session itself, and the app won't connect unencrypted. It also requires Apple's verified sign-in, which proves it's really your Mac; a Mac that doesn't offer it is refused unless you allow older Macs for this connection. SSH (Remote Login) is the most thoroughly protected option.";
+/** The editor's warning next to "Allow older Macs without verified sign-in". */
+export const OLDER_MAC_WARNING =
+  "Only for an older Mac on a network you trust. Without verified sign-in, someone intercepting the network could pretend to be the Mac and capture your password.";
+/** The editor's note when the setting is on but this Mac has used verified sign-in before. */
+export const OLDER_MAC_IGNORED =
+  "This Mac has used verified sign-in before, so the app will not fall back to the older sign-in for it, even with this setting on.";
 /** The risk of an encrypted but unverified Mac session (Apple's older sign-in). */
 export const DIRECT_MAC_RISK =
   "This Mac's sign-in can't prove it is really your Mac: someone actively intercepting the connection could impersonate it and capture your password.";
@@ -41,6 +49,29 @@ export function vncSecurityProblem(detail: string): VncSecurityProblem | null {
   if (/encrypted session failed|integrity check/i.test(detail)) return "integrity";
   if (/could not be encrypted/i.test(detail)) return "not_encrypted";
   return null;
+}
+
+/** Kind "no_verified_sign_in": the Mac didn't offer Apple's verified sign-in. */
+function noVerifiedSignInText(host: string, target: Target): ErrorText {
+  const hints = [
+    "The app requires Apple's verified sign-in for Screen Sharing without SSH, because it proves it's really your Mac. Your password was not sent.",
+    "Either someone on the network is interfering with the connection, or this is an older Mac, or a Mac with that sign-in turned off.",
+  ];
+  if (target.srp_seen) {
+    hints.push(
+      "This Mac used verified sign-in before, so a sudden change is suspicious. Don't connect without SSH until you know why.",
+      USE_SSH_HINT,
+    );
+    if (target.allow_older_mac_sign_in) {
+      hints.push('"Allow older Macs without verified sign-in" is on for this connection, but it is ignored for a Mac that used verified sign-in before.');
+    }
+  } else {
+    hints.push(
+      `The safe option: ${USE_SSH_HINT}`,
+      'Only if you trust this network: edit the connection and tick "Allow older Macs without verified sign-in". Someone intercepting the network could then capture your password.',
+    );
+  }
+  return { headline: `${host} didn't offer verified sign-in`, hints };
 }
 
 function vncSecurityText(problem: VncSecurityProblem, host: string): ErrorText {
@@ -98,7 +129,7 @@ export function describeError(error: SessionError, target: Target): ErrorText {
         hints: [
           "This app sends Screen Sharing through an encrypted SSH connection to the Mac (Remote Login), and the Mac refused or did not answer it. That usually means Remote Login is turned off.",
           "For the best protection: on the Mac, turn on Remote Login (System Settings > General > Sharing > Remote Login), then click Reconnect.",
-          "Or click Connect without SSH to use Screen Sharing directly. The session is still encrypted, but unless the Mac supports Apple's newer sign-in, someone actively intercepting the connection could impersonate the Mac and capture your password.",
+          "Or click Connect without SSH to use Screen Sharing directly. The session is still encrypted, and the app requires Apple's verified sign-in, which newer Macs offer.",
           "If Remote Login is already on, check that the Mac is awake and on the same network.",
         ],
       };
@@ -134,6 +165,8 @@ export function describeError(error: SessionError, target: Target): ErrorText {
         ],
       };
     }
+    case "no_verified_sign_in":
+      return noVerifiedSignInText(host, target);
     case "unsupported":
       return {
         headline: `${host} needs something this app does not support`,
@@ -171,6 +204,14 @@ export function describeError(error: SessionError, target: Target): ErrorText {
         hints: ["Try reconnecting. If it keeps happening, copy the log and send it along with what you were doing."],
       };
   }
+}
+
+/**
+ * The note to show in the password prompt for a "password_required" error: the backend's reason
+ * when a saved password was refused or unreadable, nothing for the plain "none saved" case.
+ */
+export function passwordRequiredNote(error: SessionError): string | null {
+  return /keychain|removed/i.test(error.detail) ? error.detail : null;
 }
 
 /** Turn whatever a rejected call produced into a SessionError. */

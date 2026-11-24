@@ -1,5 +1,5 @@
-//! Apple Screen Sharing's SRP sign-in (security type 36): SRP-6a over the server's group
-//! (RFC 5054 4096-bit, g = 5 on current macOS), SHA-512, password stretched with
+//! Apple Screen Sharing's SRP sign-in (security type 36): SRP-6a over an RFC 5054 group (only
+//! those are accepted; macOS sends the 4096-bit group, g = 5), SHA-512, password stretched with
 //! PBKDF2-HMAC-SHA512. Unlike type 30, the Mac has to prove it knows the account's password
 //! verifier, so a man in the middle cannot impersonate it or learn the password.
 //!
@@ -32,14 +32,107 @@
 use crate::error::{Result, VncError};
 use num_bigint::BigUint;
 use sha2::{Digest, Sha256, Sha512};
+use subtle::ConstantTimeEq;
+use zeroize::Zeroizing;
 
 /// Largest SRP message we accept from the server.
 pub(crate) const MAX_MESSAGE: u32 = 64 * 1024;
-/// PBKDF2 iteration cap: a hostile server must not be able to stall us for minutes.
-pub(crate) const MAX_ITERATIONS: u64 = 5_000_000;
-/// Smallest group we accept (bytes of N). macOS uses 512.
-const MIN_N: usize = 128;
-const MAX_N: usize = 1024;
+/// PBKDF2 iteration cap: a hostile server must not be able to stall us. At this cap the
+/// stretch takes well under a second or two; it is checked before the work starts.
+pub(crate) const MAX_ITERATIONS: u64 = 1_000_000;
+
+// The only groups accepted: RFC 5054 Appendix A, 3072 bits and up, copied from the RFC text
+// (checked against the RFC's own formula and SHA-256 digests in the tests). The server picks
+// N and g, so anything else must be refused: a crafted group can make S predictable without
+// the password (e.g. N = 2^1024, B = 2, an even k gives S = 0), which would let an impostor
+// pass as a verified Mac. macOS sends the 4096-bit group with g = 5.
+/// RFC 5054 Appendix A, 3072-bit group (generator 5).
+const RFC5054_3072: &str = concat!(
+    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DD",
+    "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED",
+    "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F",
+    "83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3B",
+    "E39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA0510",
+    "15728E5A8AAAC42DAD33170D04507A33A85521ABDF1CBA64ECFB850458DBEF0A8AEA71575D060C7DB3970F85A6E1E4C7",
+    "ABF5AE8CDB0933D71E8C94E04A25619DCEE3D2261AD2EE6BF12FFA06D98A0864D87602733EC86A64521F2B18177B200C",
+    "BBE117577A615D6C770988C0BAD946E208E24FA074E5AB3143DB5BFCE0FD108E4B82D120A93AD2CAFFFFFFFFFFFFFFFF",
+);
+/// RFC 5054 Appendix A, 4096-bit group (generator 5).
+const RFC5054_4096: &str = concat!(
+    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DD",
+    "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED",
+    "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F",
+    "83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3B",
+    "E39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA0510",
+    "15728E5A8AAAC42DAD33170D04507A33A85521ABDF1CBA64ECFB850458DBEF0A8AEA71575D060C7DB3970F85A6E1E4C7",
+    "ABF5AE8CDB0933D71E8C94E04A25619DCEE3D2261AD2EE6BF12FFA06D98A0864D87602733EC86A64521F2B18177B200C",
+    "BBE117577A615D6C770988C0BAD946E208E24FA074E5AB3143DB5BFCE0FD108E4B82D120A92108011A723C12A787E6D7",
+    "88719A10BDBA5B2699C327186AF4E23C1A946834B6150BDA2583E9CA2AD44CE8DBBBC2DB04DE8EF92E8EFC141FBECAA6",
+    "287C59474E6BC05D99B2964FA090C3A2233BA186515BE7ED1F612970CEE2D7AFB81BDD762170481CD0069127D5B05AA9",
+    "93B4EA988D8FDDC186FFB7DC90A6C08F4DF435C934063199FFFFFFFFFFFFFFFF",
+);
+/// RFC 5054 Appendix A, 6144-bit group (generator 5).
+const RFC5054_6144: &str = concat!(
+    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DD",
+    "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED",
+    "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F",
+    "83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3B",
+    "E39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA0510",
+    "15728E5A8AAAC42DAD33170D04507A33A85521ABDF1CBA64ECFB850458DBEF0A8AEA71575D060C7DB3970F85A6E1E4C7",
+    "ABF5AE8CDB0933D71E8C94E04A25619DCEE3D2261AD2EE6BF12FFA06D98A0864D87602733EC86A64521F2B18177B200C",
+    "BBE117577A615D6C770988C0BAD946E208E24FA074E5AB3143DB5BFCE0FD108E4B82D120A92108011A723C12A787E6D7",
+    "88719A10BDBA5B2699C327186AF4E23C1A946834B6150BDA2583E9CA2AD44CE8DBBBC2DB04DE8EF92E8EFC141FBECAA6",
+    "287C59474E6BC05D99B2964FA090C3A2233BA186515BE7ED1F612970CEE2D7AFB81BDD762170481CD0069127D5B05AA9",
+    "93B4EA988D8FDDC186FFB7DC90A6C08F4DF435C93402849236C3FAB4D27C7026C1D4DCB2602646DEC9751E763DBA37BD",
+    "F8FF9406AD9E530EE5DB382F413001AEB06A53ED9027D831179727B0865A8918DA3EDBEBCF9B14ED44CE6CBACED4BB1B",
+    "DB7F1447E6CC254B332051512BD7AF426FB8F401378CD2BF5983CA01C64B92ECF032EA15D1721D03F482D7CE6E74FEF6",
+    "D55E702F46980C82B5A84031900B1C9E59E7C97FBEC7E8F323A97A7E36CC88BE0F1D45B7FF585AC54BD407B22B4154AA",
+    "CC8F6D7EBF48E1D814CC5ED20F8037E0A79715EEF29BE32806A1D58BB7C5DA76F550AA3D8A1FBFF0EB19CCB1A313D55C",
+    "DA56C9EC2EF29632387FE8D76E3C0468043E8F663F4860EE12BF2D5B0B7474D6E694F91E6DCC4024FFFFFFFFFFFFFFFF",
+);
+/// RFC 5054 Appendix A, 8192-bit group (generator 19).
+const RFC5054_8192: &str = concat!(
+    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DD",
+    "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED",
+    "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F",
+    "83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3B",
+    "E39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA0510",
+    "15728E5A8AAAC42DAD33170D04507A33A85521ABDF1CBA64ECFB850458DBEF0A8AEA71575D060C7DB3970F85A6E1E4C7",
+    "ABF5AE8CDB0933D71E8C94E04A25619DCEE3D2261AD2EE6BF12FFA06D98A0864D87602733EC86A64521F2B18177B200C",
+    "BBE117577A615D6C770988C0BAD946E208E24FA074E5AB3143DB5BFCE0FD108E4B82D120A92108011A723C12A787E6D7",
+    "88719A10BDBA5B2699C327186AF4E23C1A946834B6150BDA2583E9CA2AD44CE8DBBBC2DB04DE8EF92E8EFC141FBECAA6",
+    "287C59474E6BC05D99B2964FA090C3A2233BA186515BE7ED1F612970CEE2D7AFB81BDD762170481CD0069127D5B05AA9",
+    "93B4EA988D8FDDC186FFB7DC90A6C08F4DF435C93402849236C3FAB4D27C7026C1D4DCB2602646DEC9751E763DBA37BD",
+    "F8FF9406AD9E530EE5DB382F413001AEB06A53ED9027D831179727B0865A8918DA3EDBEBCF9B14ED44CE6CBACED4BB1B",
+    "DB7F1447E6CC254B332051512BD7AF426FB8F401378CD2BF5983CA01C64B92ECF032EA15D1721D03F482D7CE6E74FEF6",
+    "D55E702F46980C82B5A84031900B1C9E59E7C97FBEC7E8F323A97A7E36CC88BE0F1D45B7FF585AC54BD407B22B4154AA",
+    "CC8F6D7EBF48E1D814CC5ED20F8037E0A79715EEF29BE32806A1D58BB7C5DA76F550AA3D8A1FBFF0EB19CCB1A313D55C",
+    "DA56C9EC2EF29632387FE8D76E3C0468043E8F663F4860EE12BF2D5B0B7474D6E694F91E6DBE115974A3926F12FEE5E4",
+    "38777CB6A932DF8CD8BEC4D073B931BA3BC832B68D9DD300741FA7BF8AFC47ED2576F6936BA424663AAB639C5AE4F568",
+    "3423B4742BF1C978238F16CBE39D652DE3FDB8BEFC848AD922222E04A4037C0713EB57A81A23F0C73473FC646CEA306B",
+    "4BCBC8862F8385DDFA9D4B7FA2C087E879683303ED5BDD3A062B3CF5B3A278A66D2A13F83F44F82DDF310EE074AB6A36",
+    "4597E899A0255DC164F31CC50846851DF9AB48195DED7EA1B1D510BD7EE74D73FAF36BC31ECFA268359046F4EB879F92",
+    "4009438B481C6CD7889A002ED5EE382BC9190DA6FC026E479558E4475677E9AA9E3050E2765694DFC81F56E880B96E71",
+    "60C980DD98EDD3DFFFFFFFFFFFFFFFFF",
+);
+
+/// (N as hex, g) of every accepted group, smallest first.
+const GROUPS: [(&str, u8); 4] = [(RFC5054_3072, 5), (RFC5054_4096, 5), (RFC5054_6144, 5), (RFC5054_8192, 19)];
+
+fn hex_eq(bytes: &[u8], hex: &str) -> bool {
+    bytes.len() * 2 == hex.len()
+        && bytes.iter().zip(hex.as_bytes().chunks_exact(2)).all(|(b, h)| {
+            std::str::from_utf8(h).ok().and_then(|h| u8::from_str_radix(h, 16).ok()) == Some(*b)
+        })
+}
+
+/// The bit size of the RFC 5054 group (N, g) is, if it is one we accept. `g` may carry
+/// leading zero bytes; `N` must be exactly the group's bytes.
+fn known_group(n: &[u8], g: &[u8]) -> Option<usize> {
+    let g_start = g.iter().position(|&b| b != 0).unwrap_or(g.len());
+    let g = &g[g_start..];
+    GROUPS.iter().find(|(hex, gen)| g == [*gen] && hex_eq(n, hex)).map(|(hex, _)| hex.len() * 4)
+}
 
 /// The server's challenge (message 2).
 #[derive(Debug, Clone)]
@@ -56,8 +149,15 @@ pub(crate) struct Challenge {
 pub(crate) struct Proof {
     pub a_padded: Vec<u8>,
     pub m1: Vec<u8>,
-    pub expected_m2: Vec<u8>,
-    pub wrap_key: [u8; 16],
+    expected_m2: Vec<u8>,
+    pub wrap_key: Zeroizing<[u8; 16]>,
+}
+
+impl Proof {
+    /// Whether the server's M2 is the expected one (constant time).
+    pub(crate) fn server_proof_matches(&self, m2: &[u8]) -> bool {
+        m2.len() == self.expected_m2.len() && bool::from(m2.ct_eq(&self.expected_m2))
+    }
 }
 
 struct Cursor<'a>(&'a [u8]);
@@ -169,12 +269,19 @@ fn h(parts: &[&[u8]]) -> Vec<u8> {
     d.finalize().to_vec()
 }
 
-/// Run the client side of SRP-6a with a caller-supplied private exponent (for tests).
-pub(crate) fn client_proof_with(ch: &Challenge, password: &str, a_private: &[u8]) -> Result<Proof> {
-    let len = ch.n.len();
-    if !(MIN_N..=MAX_N).contains(&len) {
-        return Err(VncError::Security(format!("SRP: the server's group is {} bits; refusing it", len * 8)));
-    }
+/// Refuse a challenge before any expensive work: only the RFC 5054 groups, a bounded PBKDF2
+/// iteration count, and a usable B. Called before the PBKDF2 work is handed to a blocking
+/// thread (which cannot be cancelled once started), and again by [`client_proof_with`].
+pub(crate) fn check_challenge(ch: &Challenge) -> Result<()> {
+    let Some(_bits) = known_group(&ch.n, &ch.g) else {
+        let g = BigUint::from_bytes_be(&ch.g);
+        return Err(VncError::Security(format!(
+            "the Mac offered an unknown SRP group ({} bits, generator {g}); only the RFC 5054 groups of 3072 to \
+             8192 bits are accepted, because a server-chosen group can let an impostor pass the sign-in without \
+             the password",
+            ch.n.len() * 8
+        )));
+    };
     if ch.iterations == 0 || ch.iterations > MAX_ITERATIONS {
         return Err(VncError::Security(format!(
             "SRP: the server asks for {} PBKDF2 iterations (accepted: 1 to {MAX_ITERATIONS})",
@@ -182,21 +289,28 @@ pub(crate) fn client_proof_with(ch: &Challenge, password: &str, a_private: &[u8]
         )));
     }
     let n = BigUint::from_bytes_be(&ch.n);
+    let b = BigUint::from_bytes_be(&ch.b);
+    if b >= n || b == BigUint::from(0u8) {
+        return Err(VncError::Security("SRP: the server sent an invalid public value B (not in 1..N-1)".into()));
+    }
+    Ok(())
+}
+
+/// Run the client side of SRP-6a with a caller-supplied private exponent (for tests).
+pub(crate) fn client_proof_with(ch: &Challenge, password: &str, a_private: &[u8]) -> Result<Proof> {
+    check_challenge(ch)?;
+    let len = ch.n.len();
+    let n = BigUint::from_bytes_be(&ch.n);
     let g = BigUint::from_bytes_be(&ch.g);
     let b = BigUint::from_bytes_be(&ch.b);
     let zero = BigUint::from(0u8);
-    if n.bits() < (len as u64 - 1) * 8 || g < BigUint::from(2u8) || g >= n {
-        return Err(VncError::Security("SRP: the server sent invalid group parameters".into()));
-    }
-    if &b % &n == zero {
-        return Err(VncError::Security("SRP: the server sent an invalid public value (B mod N = 0)".into()));
-    }
     let g_pad = pad(&g, len);
     let b_pad = pad(&b, len);
 
-    let mut stretched = [0u8; 128];
-    pbkdf2::pbkdf2_hmac::<Sha512>(password.as_bytes(), &ch.salt, ch.iterations as u32, &mut stretched);
-    let x = BigUint::from_bytes_be(&h(&[&ch.salt, &h(&[b":", &stretched])]));
+    let mut stretched = Zeroizing::new([0u8; 128]);
+    pbkdf2::pbkdf2_hmac::<Sha512>(password.as_bytes(), &ch.salt, ch.iterations as u32, stretched.as_mut());
+    let inner = Zeroizing::new(h(&[b":", stretched.as_ref()]));
+    let x = BigUint::from_bytes_be(&Zeroizing::new(h(&[&ch.salt, &inner])));
     let k = BigUint::from_bytes_be(&h(&[&ch.n, &g_pad]));
 
     let a = BigUint::from_bytes_be(a_private);
@@ -211,36 +325,38 @@ pub(crate) fn client_proof_with(ch: &Challenge, password: &str, a_private: &[u8]
     }
     let gx = g.modpow(&x, &n);
     let kgx = (&k * &gx) % &n;
-    let base = ((&b % &n) + &n - kgx) % &n;
+    let base = (&b + &n - kgx) % &n;
     let s = base.modpow(&(&a + &u * &x), &n);
-    let key = h(&[&pad(&s, len)]);
+    let key = Zeroizing::new(h(&[&Zeroizing::new(pad(&s, len))]));
 
     let hn = h(&[&ch.n]);
     let hg = h(&[&g_pad]);
     let xor: Vec<u8> = hn.iter().zip(&hg).map(|(p, q)| p ^ q).collect();
     let m1 = h(&[&xor, &h(&[b""]), &ch.salt, &a_pad, &b_pad, &key]);
     let expected_m2 = h(&[&a_pad, &m1, &key]);
-    let wrap: [u8; 32] = Sha256::digest(&key).into();
-    let wrap_key: [u8; 16] = wrap[..16].try_into().expect("16 bytes");
+    let wrap = Zeroizing::new(<[u8; 32]>::from(Sha256::digest(key.as_slice())));
+    let mut wrap_key = Zeroizing::new([0u8; 16]);
+    wrap_key.copy_from_slice(&wrap[..16]);
     Ok(Proof { a_padded: a_pad, m1, expected_m2, wrap_key })
 }
 
 /// [`client_proof_with`] using a random 64-byte private exponent.
 pub(crate) fn client_proof(ch: &Challenge, password: &str) -> Result<Proof> {
-    let mut a = [0u8; 64];
-    getrandom::fill(&mut a).map_err(|e| VncError::Other(format!("could not get random bytes from the OS: {e}")))?;
-    client_proof_with(ch, password, &a)
+    let mut a = Zeroizing::new([0u8; 64]);
+    getrandom::fill(a.as_mut())
+        .map_err(|e| VncError::Other(format!("could not get random bytes from the OS: {e}")))?;
+    client_proof_with(ch, password, a.as_ref())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::tests::{hex, unhex, PRIME_1024};
+    use crate::auth::tests::{hex, unhex};
 
     /// Inputs of the known-answer vector (see `KAT_*`).
     fn kat_challenge() -> Challenge {
         Challenge {
-            n: unhex(PRIME_1024),
+            n: unhex(RFC5054_4096),
             g: vec![5],
             salt: (0..32u8).collect(),
             b: unhex(KAT_B),
@@ -250,18 +366,44 @@ mod tests {
     }
 
     /// Computed independently in Python (hashlib + pow, no Rust involved) from the formulas in
-    /// the module docs: N = the 1024-bit RFC 2409 prime, g = 5, salt = 00..1f, password
-    /// "p@ss wörd", 1000 iterations, server private b = 0x77 * 40 bytes, client private
-    /// a = 0x42 * 64 bytes. B = k*g^x + g^b mod N.
-    const KAT_B: &str =
-        "7513ebacaf237f8f5d4715489ba863f37d985cb429ed5d63da245317a9f7a707065dcb314cc81021ccc31c47900a7b5c45498a7f676f065a8c722f0705144cc2f790635ee0b7756a048e2e72aa7d00c61ea0360f683342acfc6349093528f88c47f52bdd340f944967a3010af6b915a8438575877072e060ba1c846e57e0382a";
-    const KAT_A: &str =
-        "d693cdefe674752dc0d413437decc5e7735aa34b856df74ce0f3085ca6db1c9feac6e3fa955a1fb99e945fc7884d99af5e75d363f222801fa3c11dfd50300fef5c586766ef5d5bc689d7d8ddf9ad5362cad2568053b02b10b2ba907ab6fe34866913991ed3da286c49ecabad16d387b2728048e66b00273f5ffe856a99d21d9c";
-    const KAT_M1: &str =
-        "6e45696ba2a6980bdb2e9e083e11a27ec2124303e3e74cb5c32b328583ecd341666c872ab691a590a5376f670ab3bfeb9b7234361c70030f0bd39cf2f79ac0d5";
-    const KAT_M2: &str =
-        "164fcda4c37eb9dda8b5ddab1561f9a150e2dfc05682a0471453552230175f8e142127172b0213baa0d901202c16abd6a9f5ebd4cf323ee1b37b5a4e81555be4";
-    const KAT_WRAP: &str = "d1f42949940ffbbd1f3d7864e5febd68";
+    /// the module docs: N = the RFC 5054 4096-bit group (as macOS uses), g = 5, salt = 00..1f,
+    /// password "p@ss wörd", 1000 iterations, server private b = 0x77 * 40 bytes, client
+    /// private a = 0x42 * 64 bytes. B = k*g^x + g^b mod N.
+    const KAT_B: &str = concat!(
+        "2a5caaba40edbcedee8b7f70bcbcc64d46e562ed2f8ebc00762d184915abcccad536ec5d4cc53764aebbb208059de654",
+        "f7466638430fc01e927948ad87309aa48e92bd1b29db4216a9ab78f9be5df2d19de76f6a60a9175659c5bc03ebffbe72",
+        "b232b0e4caea451f6d06dc6fccad50cb173274e9daddc0daf6fcaacd86b86dcd0b65b754d82e450a4415768b429ee480",
+        "5c6340f4d00e90c5f0be42e337955b7e392dbf71c4ced6dc2a679fd241e7206ab12a732e44f3d6f6f089834a70e9b5ac",
+        "5b97add53b5916e8f9c4108609de6afb0b452bb61e1f89e90a85282a1e35bd76630422cdf174c49e3354fb826c8819a6",
+        "4598e028da796bed20d2e99d56a72b0fe9e5f01a81cc93b97b5c57680c35f2463776e5a7bc65224e1680af8820d5b545",
+        "e5c44d0012d6113f541cb2f33e73bb4d50e0fa52adcf7b6cdadd19ffc121fb8eba55a333359a14db582a827da576e846",
+        "0f00e0d23ea41930fa35a6c4fc20e1038d88f0106e3275e9598cfbc74f2dd22a6b7670f1cdc6724eee4585524d883800",
+        "6413a627c597fbb8dd5f56bbc837be0bfca9bb47b894ba8f4b731accba4e0f954ca1dd19b6a56de87ba15e977b0ba936",
+        "57217abd522af0490c8f6c263aa9a06c5c127592dad3fc3354d8612b550867466af3a90ce0a3e7aaeb1a8eec8096e69a",
+        "073fee7c81104ca09301b65b6540376bb9b4fb21fec04a92797373f4fc885ebe",
+    );
+    const KAT_A: &str = concat!(
+        "af5892469acba05a1410b36321b748d6579e615c409fe8583ac9ec42a79ac5f5d58d93e6a804423f3292da72e8c33e43",
+        "9bf7025ae83922f316577183543d161ea1a1faf59ad336b26a5f4c5722820d3e4ffecbc8abbe01e77b9ac7cd53b7f897",
+        "cdad157d813401d0a402a8f262e23861738801ae776f3b2de8e3e0ed714714fd0458b4c5743228631168ea82b6ed6ee0",
+        "5cbb574b1fbe36a082a041803d8da90b0bc6aedb280c66e70477823d38f5c601d3ea230765bb19b2b8c198c4b70a2b52",
+        "b02453fb7550022ab193fb713f4d758f72983710f92989ea457a03ae78780e519e3c17a429b47aca8f6140fff9546452",
+        "21919aae05c44f1604965acbd8c9eddc1afe1ffb3165cbcdd8264247b8f44718903bb2275f7f3aeee99580f90a8a7c92",
+        "6a0f8468e367dc215f15f0bd1cee25e607d33fe3b91a6881f37037bc41abd1201b0a8a1ce5687b2bdf4adf908bfdcc64",
+        "4dd5823bb2842705cbea2d42489fa7745d0c061bb254ff8f8d57ca77062e76989667cab87ad40ed8e17261095230f091",
+        "602df886b335067196aa9996543c41b6a81352c191e889898d5c9170e228e0668f178f1b7ccd3e278935dbe635f10bd1",
+        "b9f0e23275e9fe1f9cd04bc3a108d0d77c5b4b55728b15f9058e1d7883f54174d27b827e05e33c360caa5ef4a3a4e146",
+        "f2f63e0d588b29f0bbc80737e75d4410d39d06f6a1153c0709c121ae41bfda39",
+    );
+    const KAT_M1: &str = concat!(
+        "de4deda1cb00f531ac0971317fa50d9116aaf3ff0a25db8ee94cee6c33f741475d1c3292676a27615eeed855d270b554",
+        "6400c592d4de2a618919f877c4ef2a40",
+    );
+    const KAT_M2: &str = concat!(
+        "312dfe754b9a16c0a9a0835dfa677203b69d73b97331fb40e2562043b15353dff700405c2dafcd120cceffad1cf0f366",
+        "bca8d9dae33d3ff6043bb63a636153a7",
+    );
+    const KAT_WRAP: &str = "09d312f308f8608dc79196e2213bcf6a";
 
     #[test]
     fn known_answer_vector() {
@@ -269,7 +411,12 @@ mod tests {
         assert_eq!(hex(&p.a_padded), KAT_A);
         assert_eq!(hex(&p.m1), KAT_M1);
         assert_eq!(hex(&p.expected_m2), KAT_M2);
-        assert_eq!(hex(&p.wrap_key), KAT_WRAP);
+        assert!(p.server_proof_matches(&unhex(KAT_M2)));
+        let mut bad = unhex(KAT_M2);
+        bad[63] ^= 1;
+        assert!(!p.server_proof_matches(&bad));
+        assert!(!p.server_proof_matches(&bad[..32]));
+        assert_eq!(hex(p.wrap_key.as_ref()), KAT_WRAP);
         // A different password gives a different proof.
         let q = client_proof_with(&kat_challenge(), "wrong", &[0x42; 64]).unwrap();
         assert_ne!(p.m1, q.m1);
@@ -299,14 +446,103 @@ mod tests {
 
     #[test]
     fn hostile_parameters_are_refused() {
+        let refused = |ch: &Challenge| matches!(client_proof_with(ch, "p", &[1; 64]), Err(VncError::Security(_)));
         let mut ch = kat_challenge();
         ch.iterations = MAX_ITERATIONS + 1;
-        assert!(matches!(client_proof_with(&ch, "p", &[1; 64]), Err(VncError::Security(_))));
+        assert!(refused(&ch));
         let mut ch = kat_challenge();
-        ch.b = ch.n.clone(); // B = N, so B mod N = 0
-        assert!(matches!(client_proof_with(&ch, "p", &[1; 64]), Err(VncError::Security(_))));
+        ch.iterations = 0;
+        assert!(refused(&ch));
+        for b in [vec![0u8], unhex(RFC5054_4096), vec![0xff; 513]] {
+            let mut ch = kat_challenge();
+            ch.b = b; // B = 0, B = N, B > N
+            assert!(refused(&ch));
+        }
         let mut ch = kat_challenge();
         ch.n = vec![0xff; 32]; // 256-bit group
-        assert!(matches!(client_proof_with(&ch, "p", &[1; 64]), Err(VncError::Security(_))));
+        assert!(refused(&ch));
+    }
+
+    /// SHA-256 of each group's big-endian bytes, computed in Python from the hex in the RFC 5054
+    /// text (rfc-editor.org/rfc/rfc5054.txt, Appendix A). The same script checked every hex
+    /// value against the RFC's formula 2^n - 2^(n-64) - 1 + 2^64 * ([2^(n-130) pi] + offset)
+    /// and that N and (N-1)/2 are (probable) primes.
+    #[test]
+    fn group_constants_match_rfc_5054() {
+        let digests = [
+            (RFC5054_3072, 3072, "48cf8b092fbce4359d9871abf74f98e25b6163379eaa15cd9087e800c6d1c55c"),
+            (RFC5054_4096, 4096, "4ee95187682bcb230ad26a95205f6920e84708f6251b3894329b09ec23919e33"),
+            (RFC5054_6144, 6144, "d1bfe6d0925ce7e4da262b62861514a7755e35831e429f343e7b864848657efd"),
+            (RFC5054_8192, 8192, "39ab4feab950a3128fb71accb9fc3965d857012e081998a85996e3ea8b3c3bcf"),
+        ];
+        for (n, bits, digest) in digests {
+            let bytes = unhex(n);
+            assert_eq!(bytes.len() * 8, bits);
+            assert_eq!(hex(&Sha256::digest(&bytes)), digest, "{bits}-bit group");
+        }
+        assert_eq!(GROUPS.map(|(_, g)| g), [5, 5, 5, 19]);
+    }
+
+    #[test]
+    fn only_rfc_5054_groups_are_accepted() {
+        let with = |n: Vec<u8>, g: Vec<u8>| Challenge { n, g, ..kat_challenge() };
+        for (hex_n, g) in GROUPS {
+            let mut ch = with(unhex(hex_n), vec![g]);
+            ch.b = vec![2];
+            assert!(check_challenge(&ch).is_ok(), "{} bits", hex_n.len() * 4);
+            ch.g = vec![0, g]; // the same g with a leading zero byte
+            assert!(check_challenge(&ch).is_ok());
+        }
+        let unknown = |ch: &Challenge| match check_challenge(ch) {
+            Err(VncError::Security(m)) => m.starts_with("the Mac offered an unknown SRP group"),
+            _ => false,
+        };
+        let n4096 = unhex(RFC5054_4096);
+        assert!(unknown(&with(n4096.clone(), vec![2]))); // right N, wrong g
+        assert!(unknown(&with(unhex(RFC5054_8192), vec![5]))); // the 8192-bit group's g is 19
+        let mut flipped = n4096.clone();
+        flipped[300] ^= 0x10;
+        assert!(unknown(&with(flipped, vec![5])));
+        let mut padded = vec![0];
+        padded.extend_from_slice(&n4096);
+        assert!(unknown(&with(padded, vec![5])));
+        assert!(unknown(&with(vec![0xff; 512], vec![5]))); // 2^4096 - 1
+        assert!(unknown(&with(unhex(crate::auth::tests::PRIME_1024), vec![2])));
+    }
+
+    /// Security audit round 2: an impostor without the password picked N = 2^1024, an odd g
+    /// that makes k even, and B = 2, so S = 0 and the wrap key was the same for every
+    /// password; it could then compute M2 and pass as a verified Mac. The group is now refused
+    /// before anything is computed or sent.
+    #[test]
+    fn impostor_group_is_refused() {
+        let len = 129;
+        let mut n = vec![0u8; len];
+        n[0] = 1;
+        let mut g = 3u32;
+        let g_pad = loop {
+            let g_pad = pad(&BigUint::from(g), len);
+            if h(&[&n, &g_pad])[63] & 1 == 0 {
+                break g_pad;
+            }
+            g += 2;
+        };
+        let ch = Challenge {
+            n,
+            g: BigUint::from(g).to_bytes_be(),
+            salt: vec![0x11; 16],
+            b: vec![2],
+            iterations: 1000,
+            options: b"x".to_vec(),
+        };
+        // The old checks (size, top byte, 2 <= g < N, B mod N != 0) all passed for this group.
+        assert_eq!(g_pad.len(), len);
+        for pw in ["correct horse battery staple", "hunter2"] {
+            match client_proof(&ch, pw) {
+                Err(VncError::Security(m)) => assert!(m.starts_with("the Mac offered an unknown SRP group"), "{m}"),
+                Err(e) => panic!("wrong error {e:?}"),
+                Ok(_) => panic!("the impostor group was accepted"),
+            }
+        }
     }
 }

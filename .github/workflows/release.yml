@@ -82,6 +82,11 @@ jobs:
         if: steps.want.outputs.run == 'true'
         working-directory: app
         run: npm ci --ignore-scripts
+      - name: Remove stale bundles
+        if: steps.want.outputs.run == 'true'
+        shell: bash
+        # The restored cache may hold installers from an earlier build; only this build's go out.
+        run: rm -rf target/*/release/bundle target/release/bundle
       - name: Build
         if: steps.want.outputs.run == 'true'
         working-directory: app
@@ -144,7 +149,7 @@ jobs:
           TITLE: ${{ github.ref_type == 'tag' && github.ref_name || format('Test build {0}', github.run_number) }}
         run: |
           set -euo pipefail
-          notes="Unsigned test build. See the Asana task for install steps.
+          notes="Unsigned test build: macOS and Windows warn before opening unsigned apps.
 
           SHA256SUMS.txt lists the SHA-256 checksum of every file in this release; see \"Verifying downloads\" in the README."
           gh release create "$TAG" ./* \

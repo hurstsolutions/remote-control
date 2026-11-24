@@ -56,10 +56,12 @@ pub async fn ssh(mut tcp: TcpStream, limit: Duration) -> Option<String> {
     tokio::time::timeout(limit, read).await.ok().flatten()
 }
 
+/// The first complete line starting with "SSH-". Bytes after the last line ending are a line still
+/// arriving and are not looked at yet.
 fn ssh_line(buffer: &[u8]) -> Option<String> {
-    buffer
+    let complete = &buffer[..buffer.iter().rposition(|&b| b == b'\n')?];
+    complete
         .split(|&b| b == b'\n')
-        .filter(|_| buffer.contains(&b'\n'))
         .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
         .find(|line| line.starts_with(b"SSH-"))
         .map(|line| String::from_utf8_lossy(&line[..line.len().min(255)]).into_owned())
@@ -83,5 +85,9 @@ mod tests {
         assert_eq!(ssh_line(b"SSH-2.0-OpenSSH_9.6\r\n").as_deref(), Some("SSH-2.0-OpenSSH_9.6"));
         assert_eq!(ssh_line(b"hello\r\nSSH-2.0-x\n").as_deref(), Some("SSH-2.0-x"));
         assert_eq!(ssh_line(b"SSH-2.0-incomplete"), None);
+        // A complete line before it does not make the partial one count.
+        assert_eq!(ssh_line(b"hello\r\nSSH-2.0-partial"), None);
+        assert_eq!(ssh_line(b"hello\r\nSSH-2.0-partial\r\n").as_deref(), Some("SSH-2.0-partial"));
+        assert_eq!(ssh_line(b"SSH-2.0-a\nSSH-2.0-b").as_deref(), Some("SSH-2.0-a"));
     }
 }

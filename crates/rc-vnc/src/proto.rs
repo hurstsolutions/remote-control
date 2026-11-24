@@ -5,11 +5,12 @@ use crate::auth;
 use crate::srp;
 use crate::error::{proto, Result, VncError};
 use crate::record::Keys;
-use crate::{EncryptionPolicy, VncConfig, VncOptions};
+use crate::{EncryptionPolicy, VncConfig, VncOptions, SRP_NOT_OFFERED};
 use rc_types::SessionEvent;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+use zeroize::Zeroizing;
 
 pub(crate) const STAGE_VERSION: &str = "protocol version exchange";
 pub(crate) const STAGE_SECURITY: &str = "security type negotiation";
@@ -26,8 +27,6 @@ pub(crate) const SEC_SRP: u8 = 36;
 
 const MAX_REASON: u32 = 64 * 1024;
 const MAX_NAME: u32 = 1024 * 1024;
-/// Largest Diffie-Hellman key we accept for Apple auth (macOS uses 128 bytes).
-const MAX_ARD_KEY: usize = 1024;
 
 pub(crate) fn security_type_name(t: u8) -> &'static str {
     match t {
@@ -161,6 +160,32 @@ fn has_user(config: &VncConfig) -> bool {
     config.username.as_deref().is_some_and(|u| !u.is_empty())
 }
 
+fn password(config: &VncConfig) -> &str {
+    config.password.as_ref().map_or("", |p| p.as_str())
+}
+
+/// Under `Required`, type 30 would be used instead of SRP. Refused unless the caller allowed
+/// an unverified sign-in: a man in the middle can strip 36 from the list, and type 30 is an
+/// unauthenticated Diffie-Hellman exchange that hands it the password.
+fn unverified_refused(offered: &[u8], srp: bool) -> VncError {
+    if offered.contains(&SEC_SRP) && !srp {
+        VncError::Security(format!(
+            "SRP sign-in (Apple's verified sign-in) is turned off for this connection, and the Mac's other \
+             encrypted sign-in (type 30) cannot verify the Mac's identity, so it is refused while encryption is \
+             required. Turn SRP back on, or allow unverified sign-in for this connection. Offered: [{}]",
+            describe_types(offered)
+        ))
+    } else {
+        VncError::Security(format!(
+            "{SRP_NOT_OFFERED}; this can mean someone is interfering with the connection, or an older Mac. \
+             Apple's older sign-in (type 30) does not verify the Mac, and an impostor could learn the password \
+             through it, so it is refused. Use an SSH tunnel, or allow unverified sign-in for this connection if \
+             the network is trusted. Offered: [{}]",
+            describe_types(offered)
+        ))
+    }
+}
+
 /// The explanation added when encryption is required and the server would allow a cleartext
 /// login.
 const DOWNGRADE_NOTE: &str = "Security types None (1) and VNC password (2) are refused while encryption is \
@@ -168,7 +193,13 @@ const DOWNGRADE_NOTE: &str = "Security types None (1) and VNC password (2) are r
      from the server's list to force them. Use an SSH tunnel, or turn the encryption requirement off for this \
      connection if the network is trusted.";
 
-fn pick_security(offered: &[u8], config: &VncConfig, policy: EncryptionPolicy, srp: bool) -> Result<u8> {
+fn pick_security(
+    offered: &[u8],
+    config: &VncConfig,
+    policy: EncryptionPolicy,
+    srp: bool,
+    allow_unverified: bool,
+) -> Result<u8> {
     let has = |t: u8| offered.contains(&t);
     let have_user = has_user(config);
     let have_pass = config.password.is_some();
@@ -179,7 +210,7 @@ fn pick_security(offered: &[u8], config: &VncConfig, policy: EncryptionPolicy, s
     }
     if policy == EncryptionPolicy::Required {
         // Types 36 (SRP, above) and 30 lead to an encrypted session.
-        if has(SEC_ARD) || use_srp {
+        if has(SEC_ARD) || has(SEC_SRP) {
             if !have_user {
                 return Err(VncError::Auth(format!(
                     "an encrypted session needs a macOS username and password (Apple authentication), but no \
@@ -190,7 +221,14 @@ fn pick_security(offered: &[u8], config: &VncConfig, policy: EncryptionPolicy, s
             if !have_pass {
                 return Err(VncError::Auth("the server needs a password for this macOS account, but none was supplied".into()));
             }
-            return Ok(if use_srp { SEC_SRP } else { SEC_ARD });
+            if use_srp {
+                return Ok(SEC_SRP);
+            }
+            if !allow_unverified || !has(SEC_ARD) {
+                return Err(unverified_refused(offered, srp));
+            }
+            warn!("encryption is required, but signing in with type 30: the Mac's identity will not be verified");
+            return Ok(SEC_ARD);
         }
         let weak = has(SEC_NONE) || has(SEC_VNC);
         return Err(VncError::Security(format!(
@@ -360,7 +398,8 @@ where
         }
         // The policy matters only when we are speaking Apple's revision to encrypt.
         let effective = if version == Version::Apple889 { policy } else { EncryptionPolicy::Off };
-        let chosen = pick_security(&offered, config, effective, options.srp).inspect_err(|e| {
+        let chosen =
+            pick_security(&offered, config, effective, options.srp, options.allow_unverified_sign_in).inspect_err(|e| {
             warn!(offered = %describe_types(&offered), "cannot pick a security type: {e}");
         })?;
         info!(
@@ -378,7 +417,7 @@ where
 
     // ---- Authentication ----
     *stage = STAGE_AUTH;
-    let mut wrap_key: Option<[u8; 16]> = None;
+    let mut wrap_key: Option<Zeroizing<[u8; 16]>> = None;
     let mut server_verified = false;
     match chosen {
         SEC_NONE => {}
@@ -386,7 +425,7 @@ where
             status(events, "Authenticating (VNC password)").await?;
             let mut challenge = [0u8; 16];
             s.read_exact(&mut challenge).await?;
-            let password = config.password.as_deref().unwrap_or("");
+            let password = password(config);
             if password.len() > 8 {
                 info!("VNC password is longer than 8 bytes; only the first 8 are used by the protocol");
             }
@@ -398,8 +437,11 @@ where
             let generator = s.read_u16().await?;
             let key_len = s.read_u16().await? as usize;
             info!(generator, key_len, "Apple auth: Diffie-Hellman parameters");
-            if key_len == 0 || key_len > MAX_ARD_KEY {
-                return proto(format!("Apple auth: implausible key length {key_len}"));
+            if key_len == 0 || key_len > auth::MAX_ARD_KEY {
+                return Err(VncError::Security(format!(
+                    "Apple auth: the server's Diffie-Hellman key length is {key_len} bytes (accepted: up to {})",
+                    auth::MAX_ARD_KEY
+                )));
             }
             let mut prime = vec![0u8; key_len];
             s.read_exact(&mut prime).await?;
@@ -410,7 +452,7 @@ where
                 &prime,
                 &server_pub,
                 config.username.as_deref().unwrap_or(""),
-                config.password.as_deref().unwrap_or(""),
+                password(config),
             )?;
             debug!(response_len = response.message.len(), "Apple auth: sending encrypted credentials and public key");
             s.write_all(&response.message).await?;
@@ -436,7 +478,11 @@ where
                 options = %String::from_utf8_lossy(&challenge.options),
                 "SRP: challenge"
             );
-            let password = config.password.clone().unwrap_or_default();
+            // Refuse unknown groups and oversized iteration counts before starting PBKDF2: a
+            // blocking task cannot be cancelled, so if the handshake is abandoned (closed, timed
+            // out) it runs to completion anyway, at most MAX_ITERATIONS rounds (about a second).
+            srp::check_challenge(&challenge).inspect_err(|e| warn!("SRP: refusing the challenge: {e}"))?;
+            let password = Zeroizing::new(password(config).to_owned());
             let ch = challenge.clone();
             // PBKDF2 with tens of thousands of iterations: keep it off the async workers.
             let proof = tokio::task::spawn_blocking(move || srp::client_proof(&ch, &password))
@@ -466,15 +512,16 @@ where
             s.read_exact(&mut fin).await?;
             debug!(len, "SRP: received the server proof");
             let m2 = srp::parse_final(&fin)?;
-            if m2 == proof.expected_m2 {
-                debug!("SRP: the Mac's proof M2 is correct; the Mac knows the password verifier");
-            } else {
-                // Either our M2 formula differs from Apple's, or this is not the Mac. An impostor
-                // without the verifier cannot know K, so it cannot produce the rekey wrapped under
-                // SHA-256(K) or a single valid record: the record layer's first integrity check
-                // closes the session before anything is shown or typed in clear.
-                warn!(m2_len = m2.len(), "SRP: the Mac's proof M2 does not match the expected value; relying on the record layer to confirm the key");
+            if !proof.server_proof_matches(&m2) {
+                warn!(m2_len = m2.len(), "SRP: the Mac's proof M2 is wrong");
+                return Err(VncError::Security(
+                    "the Mac's SRP proof (M2) is wrong: whoever answered does not know this account's password \
+                     verifier, so it may not be the Mac you meant to reach. The connection was closed before \
+                     anything was shown or typed"
+                        .into(),
+                ));
             }
+            debug!("SRP: the Mac's proof M2 is correct; the Mac knows the password verifier");
             wrap_key = Some(proof.wrap_key);
             server_verified = true;
         }
@@ -594,13 +641,14 @@ where
         s.flush().await?;
         debug!("encryption setup: waiting for the Mac's rekey");
         keys = Some(apple::await_rekey(s, &wrap_key).await?);
+        drop(wrap_key);
         info!("encryption setup: record layer active (AES-128-CBC, SHA-1 integrity)");
     }
     Ok(Handshake {
         init: ServerInit { width, height, name },
+        server_verified: server_verified && keys.is_some(),
         keys,
         apple: version == Version::Apple889,
-        server_verified: server_verified && keys.is_some(),
     })
 }
 
@@ -625,11 +673,16 @@ mod tests {
     use super::*;
 
     fn cfg(user: Option<&str>, pass: Option<&str>) -> VncConfig {
-        VncConfig { username: user.map(Into::into), password: pass.map(Into::into), shared: true, view_only: false }
+        VncConfig {
+            username: user.map(Into::into),
+            password: pass.map(|p| p.to_owned().into()),
+            shared: true,
+            view_only: false,
+        }
     }
 
     fn pick(offered: &[u8], config: &VncConfig) -> Result<u8> {
-        pick_security(offered, config, EncryptionPolicy::Off, true)
+        pick_security(offered, config, EncryptionPolicy::Off, true, false)
     }
 
     #[test]
@@ -637,13 +690,53 @@ mod tests {
         let full = cfg(Some("u"), Some("p"));
         let mac = [30, 33, 36, 35];
         for policy in [EncryptionPolicy::Required, EncryptionPolicy::Preferred] {
-            assert_eq!(pick_security(&mac, &full, policy, true).unwrap(), 36);
-            assert_eq!(pick_security(&mac, &full, policy, false).unwrap(), 30);
-            assert_eq!(pick_security(&[36], &full, policy, true).unwrap(), 36);
+            for allow in [false, true] {
+                assert_eq!(pick_security(&mac, &full, policy, true, allow).unwrap(), 36);
+                assert_eq!(pick_security(&[36], &full, policy, true, allow).unwrap(), 36);
+            }
+        }
+        // SRP turned off: type 30 under Preferred; under Required only when allowed.
+        assert_eq!(pick_security(&mac, &full, EncryptionPolicy::Preferred, false, false).unwrap(), 30);
+        assert_eq!(pick_security(&mac, &full, EncryptionPolicy::Required, false, true).unwrap(), 30);
+        match pick_security(&mac, &full, EncryptionPolicy::Required, false, false) {
+            Err(VncError::Security(m)) => {
+                assert!(m.contains("SRP sign-in (Apple's verified sign-in) is turned off"), "{m}");
+                assert!(!m.starts_with(SRP_NOT_OFFERED), "{m}");
+            }
+            other => panic!("{other:?}"),
         }
         // Never in an unencrypted (Off) session: behaviour there is unchanged.
-        assert_eq!(pick_security(&mac, &full, EncryptionPolicy::Off, true).unwrap(), 30);
-        assert!(pick_security(&[36], &full, EncryptionPolicy::Required, false).is_err());
+        for allow in [false, true] {
+            assert_eq!(pick_security(&mac, &full, EncryptionPolicy::Off, true, allow).unwrap(), 30);
+        }
+        for allow in [false, true] {
+            assert!(pick_security(&[36], &full, EncryptionPolicy::Required, false, allow).is_err());
+        }
+    }
+
+    /// Security audit round 2: a man in the middle rewrites the Mac's list [30, 33, 36, 35] to
+    /// [30]; type 30 is unauthenticated Diffie-Hellman, so it would learn the password.
+    #[test]
+    fn required_refuses_srp_to_type_30_downgrade() {
+        let full = cfg(Some("u"), Some("p"));
+        for offered in [&[30u8][..], &[30, 33, 35], &[30, 33, 35, 2], &[30, 1]] {
+            match pick_security(offered, &full, EncryptionPolicy::Required, true, false) {
+                Err(VncError::Security(m)) => {
+                    assert!(m.starts_with(SRP_NOT_OFFERED), "{m}");
+                    assert!(m.contains("someone is interfering with the connection, or an older Mac"), "{m}");
+                }
+                other => panic!("{offered:?}: {other:?}"),
+            }
+            assert_eq!(pick_security(offered, &full, EncryptionPolicy::Required, true, true).unwrap(), 30);
+            // Inside an SSH tunnel (Off) and with Preferred, unchanged.
+            assert_eq!(pick_security(offered, &full, EncryptionPolicy::Off, true, false).unwrap(), 30);
+            assert_eq!(pick_security(offered, &full, EncryptionPolicy::Preferred, true, false).unwrap(), 30);
+        }
+        // Missing credentials are still reported as such first.
+        assert!(matches!(
+            pick_security(&[30], &cfg(None, Some("p")), EncryptionPolicy::Required, true, false),
+            Err(VncError::Auth(_))
+        ));
     }
 
     #[test]
@@ -685,7 +778,7 @@ mod tests {
         let mac = cfg(Some("alice"), Some("p"));
         for offered in [&[1u8][..], &[2], &[2, 1], &[33, 35, 2], &[35, 1]] {
             for policy in [EncryptionPolicy::Off, EncryptionPolicy::Preferred, EncryptionPolicy::Required] {
-                match pick_security(offered, &mac, policy, true) {
+                match pick_security(offered, &mac, policy, true, false) {
                     Err(VncError::Security(m)) => assert!(m.contains("None (1)") && m.contains("(2)"), "{m}"),
                     other => panic!("{offered:?} {policy:?}: {other:?}"),
                 }
@@ -698,10 +791,10 @@ mod tests {
 
     #[test]
     fn required_policy_refuses_weak_types() {
-        let req = |offered: &[u8], c: &VncConfig| pick_security(offered, c, EncryptionPolicy::Required, true);
+        let req = |offered: &[u8], c: &VncConfig| pick_security(offered, c, EncryptionPolicy::Required, true, false);
         let full = cfg(Some("u"), Some("p"));
         assert_eq!(req(&[30, 33, 36, 35, 2], &full).unwrap(), 36);
-        assert_eq!(req(&[30, 33, 35, 2], &full).unwrap(), 30);
+        assert_eq!(pick_security(&[30, 33, 35, 2], &full, EncryptionPolicy::Required, true, true).unwrap(), 30);
         for offered in [&[1u8][..], &[2], &[2, 1], &[33, 35, 2]] {
             match req(offered, &full) {
                 Err(VncError::Security(m)) => {
@@ -721,7 +814,8 @@ mod tests {
             other => panic!("{other:?}"),
         }
         // Preferred keeps the old preferences.
-        let pref = |offered: &[u8], c: &VncConfig| pick_security(offered, c, EncryptionPolicy::Preferred, true);
+        let pref =
+            |offered: &[u8], c: &VncConfig| pick_security(offered, c, EncryptionPolicy::Preferred, true, false);
         assert_eq!(pref(&[30, 2], &full).unwrap(), 30);
         assert_eq!(pref(&[33, 2], &cfg(None, Some("p"))).unwrap(), 2);
         assert!(matches!(pref(&[33, 2], &full), Err(VncError::Security(_))));

@@ -142,7 +142,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Vnc { common, port, no_ssh, ssh_port, pin, encryption, no_srp } => {
             let config = rc_vnc::VncConfig {
                 username: Some(common.user.clone()).filter(|u| !u.is_empty()),
-                password: Some(common.password.clone()).filter(|p| !p.is_empty()),
+                password: Some(common.password.clone()).filter(|p| !p.is_empty()).map(Into::into),
                 shared: true,
                 view_only: false,
             };

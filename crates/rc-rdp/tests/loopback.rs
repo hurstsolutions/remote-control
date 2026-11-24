@@ -443,6 +443,11 @@ struct MockLog {
 /// One-shot mock: answer the X.224 Connection Request with `confirm`, then either accept TLS with
 /// `tls` or just listen, and record what the client sends next.
 fn start_mock(confirm: [u8; 19], tls: Option<Arc<rustls::ServerConfig>>) -> (u16, tokio::task::JoinHandle<MockLog>) {
+    start_mock_with(confirm.to_vec(), tls)
+}
+
+/// [`start_mock`] with arbitrary bytes for the Connection Confirm (sent in one write).
+fn start_mock_with(confirm: Vec<u8>, tls: Option<Arc<rustls::ServerConfig>>) -> (u16, tokio::task::JoinHandle<MockLog>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -589,4 +594,28 @@ async fn nla_downgrade_to_plain_tls_is_refused() {
     let log = mock.await.unwrap();
     // Not even a TLS ClientHello, let alone credentials or a Client Info PDU.
     assert!(log.after_confirm.is_empty(), "client sent {} bytes after the downgrade", log.after_confirm.len());
+}
+
+/// Security audit round 2: bytes after the Connection Confirm, before TLS, are cleartext a man in
+/// the middle could inject; they used to be fed into the TLS-protected stream. Refused now.
+#[tokio::test(flavor = "multi_thread")]
+async fn cleartext_after_connection_confirm_is_refused() {
+    let real = rcgen::generate_simple_self_signed(vec!["windows-pc".to_owned()]).unwrap();
+    let der = real.cert.der().clone();
+    let tls = server_config(&[&rustls::version::TLS13], der.clone(), load_key(real.signing_key.serialize_der()));
+    let mut confirm = CONFIRM_HYBRID.to_vec();
+    // An injected X.224 data TPKT right behind the Confirm, in the same TCP segment.
+    confirm.extend_from_slice(&[3, 0, 0, 9, 2, 0xf0, 0x80, 0x7f, 0x65]);
+    let (port, mock) = start_mock_with(confirm, Some(tls));
+    let mut cfg = config_for(port, true);
+    cfg.pinned_cert_sha256 = Some(sha256_hex(&der));
+    let seen = run_to_close(cfg).await;
+
+    let error = seen.closed.expect("session must close").expect("with an error");
+    assert_eq!(error.kind, ErrorKind::Security, "detail: {}", error.detail);
+    assert!(error.detail.contains("cleartext"), "detail: {}", error.detail);
+    assert!(seen.connected.is_none());
+    let log = mock.await.unwrap();
+    assert!(!log.tls_ok, "the client must not start TLS");
+    assert!(log.after_confirm.is_empty(), "nothing may be sent after the injected bytes");
 }

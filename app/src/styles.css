@@ -511,6 +511,10 @@ input {
   font-size: 12px;
 }
 
+.field-hint.field-warn {
+  color: var(--warn-text);
+}
+
 .field-error {
   color: var(--danger);
   font-size: 12px;
@@ -1021,6 +1025,12 @@ body.fullscreen .session-top:focus-within {
 
 .saved-tag {
   background: var(--surface-2);
+}
+
+.saved-tag.name-only {
+  background: var(--warn-bg);
+  color: var(--warn-text);
+  white-space: normal;
 }
 
 .results-note {

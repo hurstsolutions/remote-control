@@ -24,8 +24,23 @@ const FAILURES: ErrorKind[] = ["unreachable", "auth_failed", "security", "identi
 const NEW_CERT_ID = "mock-new-cert";
 /** A Mac whose SSH host key changed since it was pinned. */
 const NEW_KEY_ID = "mock-new-key";
-/** A Mac without SSH whose Screen Sharing lacks Apple's SRP sign-in: encrypted, not verified. */
+/**
+ * A Mac without SSH whose Screen Sharing doesn't offer Apple's verified (SRP) sign-in: refused
+ * until "Allow older Macs without verified sign-in" is ticked, then encrypted but not verified.
+ */
 const OLDER_MAC_ID = "mock-older-mac";
+/**
+ * A Mac without SSH that signed in with SRP before and now doesn't offer it (what someone
+ * interfering would cause): refused even though the older sign-in is allowed for it.
+ */
+const SRP_GONE_ID = "mock-srp-gone";
+/** Macs that don't offer SRP (now). */
+const NO_SRP_IDS = new Set([OLDER_MAC_ID, SRP_GONE_ID]);
+/** rc_vnc::SRP_NOT_OFFERED and the text after it. */
+const NO_SRP_DETAIL =
+  "the Mac didn't offer SRP sign-in (Apple's verified sign-in); this can mean someone is interfering with the connection, or an older Mac. Apple's older sign-in (type 30) does not verify the Mac, and an impostor could learn the password through it, so it is refused. Use an SSH tunnel, or allow unverified sign-in for this connection if the network is trusted. Offered: [30 (Apple Remote Desktop)]";
+/** Adding this subnet makes the mock scan answer on every address and stop with "too many". */
+const EVERYWHERE_CIDR = "10.0.9.0/24";
 /** A VNC server that cannot encrypt: fails without the SSH tunnel. */
 const NO_ENCRYPTION_ID = "mock-no-encryption";
 const OLD_IDENTITY = "aa".repeat(32);
@@ -53,6 +68,8 @@ const connections: Connection[] = [
     ssh_port: 22,
     pinned_identity: null,
     share_clipboard: true,
+    allow_older_mac_sign_in: false,
+    srp_seen: false,
   },
   {
     id: "mock-mac",
@@ -67,6 +84,8 @@ const connections: Connection[] = [
     ssh_port: 22,
     pinned_identity: null,
     share_clipboard: true,
+    allow_older_mac_sign_in: false,
+    srp_seen: false,
   },
   {
     id: FAILING_ID,
@@ -81,6 +100,8 @@ const connections: Connection[] = [
     ssh_port: 22,
     pinned_identity: null,
     share_clipboard: true,
+    allow_older_mac_sign_in: false,
+    srp_seen: false,
   },
   {
     id: NO_SSH_ID,
@@ -95,6 +116,8 @@ const connections: Connection[] = [
     ssh_port: 22,
     pinned_identity: null,
     share_clipboard: true,
+    allow_older_mac_sign_in: false,
+    srp_seen: false,
   },
   {
     id: NEW_CERT_ID,
@@ -109,6 +132,8 @@ const connections: Connection[] = [
     ssh_port: 22,
     pinned_identity: OLD_IDENTITY,
     share_clipboard: true,
+    allow_older_mac_sign_in: false,
+    srp_seen: false,
   },
   {
     id: NEW_KEY_ID,
@@ -123,6 +148,8 @@ const connections: Connection[] = [
     ssh_port: 22,
     pinned_identity: OLD_IDENTITY,
     share_clipboard: false,
+    allow_older_mac_sign_in: false,
+    srp_seen: false,
   },
   {
     id: OLDER_MAC_ID,
@@ -137,6 +164,24 @@ const connections: Connection[] = [
     ssh_port: 22,
     pinned_identity: null,
     share_clipboard: true,
+    allow_older_mac_sign_in: false,
+    srp_seen: false,
+  },
+  {
+    id: SRP_GONE_ID,
+    name: "Mac that used verified sign-in before (sample)",
+    protocol: "vnc",
+    host: "10.0.0.46",
+    port: 5900,
+    username: "sam",
+    domain: "",
+    nla: true,
+    ssh_tunnel: false,
+    ssh_port: 22,
+    pinned_identity: null,
+    share_clipboard: true,
+    allow_older_mac_sign_in: true,
+    srp_seen: true,
   },
   {
     id: NO_ENCRYPTION_ID,
@@ -151,11 +196,13 @@ const connections: Connection[] = [
     ssh_port: 22,
     pinned_identity: null,
     share_clipboard: true,
+    allow_older_mac_sign_in: false,
+    srp_seen: false,
   },
 ];
 // The Mac samples, the failing sample and the changed-identity samples have a "saved" password;
 // the Windows sample asks.
-const savedPasswords = new Set<string>(["mock-mac", NO_SSH_ID, FAILING_ID, NEW_CERT_ID, NEW_KEY_ID, OLDER_MAC_ID, NO_ENCRYPTION_ID]);
+const savedPasswords = new Set<string>(["mock-mac", NO_SSH_ID, FAILING_ID, NEW_CERT_ID, NEW_KEY_ID, OLDER_MAC_ID, SRP_GONE_ID, NO_ENCRYPTION_ID]);
 const sessions = new Map<string, MockSession>();
 const log: string[] = [];
 let nextId = 1;
@@ -411,18 +458,22 @@ function crosshairCursor(): SessionEvent {
   return { type: "cursor", kind: "bitmap", width: size, height: size, hot_x: 12, hot_y: 12, rgba_base64: btoa(binary) };
 }
 
-/** What the backend reports for a session that signs in; `pinned` = a pin was checked. */
-function mockSecurity(connection: Connection, pinned: boolean): SessionEvent[] {
+/**
+ * What the backend reports for a session that signs in; `pinned` = a pin was checked. A session
+ * that trusts a new identity is never reported as verified (lib.rs security_for_session).
+ */
+function mockSecurity(connection: Connection, pinned: boolean, trusting: boolean): SessionEvent[] {
+  const verified = pinned && !trusting;
   if (connection.protocol === "rdp") {
-    return [{ type: "security", encrypted: true, server_verified: pinned, method: connection.nla ? "TLS + NLA" : "TLS" }];
+    return [{ type: "security", encrypted: true, server_verified: verified, method: connection.nla ? "TLS + NLA" : "TLS" }];
   }
   if (connection.ssh_tunnel) {
     return [
-      { type: "security", encrypted: true, server_verified: pinned, method: "SSH tunnel" },
+      { type: "security", encrypted: true, server_verified: verified, method: "SSH tunnel" },
       { type: "security", encrypted: false, server_verified: false, method: "VNC, unencrypted" },
     ];
   }
-  return connection.id === OLDER_MAC_ID
+  return NO_SRP_IDS.has(connection.id)
     ? [{ type: "security", encrypted: true, server_verified: false, method: "Apple Screen Sharing encryption" }]
     : [{ type: "security", encrypted: true, server_verified: true, method: "Apple Screen Sharing encryption, SRP sign-in" }];
 }
@@ -465,6 +516,7 @@ function mockError(kind: ErrorKind, host: string): SessionError {
     disconnected: "connection reset by peer (os error 54)",
     other: "mock: an error with no particular kind",
     password_required: "no password supplied and none saved",
+    no_verified_sign_in: NO_SRP_DETAIL,
   };
   return { kind, detail: details[kind] };
 }
@@ -519,6 +571,9 @@ function fakeHost(base: string, offset: number): FoundHost | null {
       return { ...host, rdp: 3389, kind: "windows", name: '<img src=x onerror="window.__xss=1">', names: { ...host.names, rdp_certificate: '<img src=x onerror="window.__xss=1">' }, rdp_certificate_sha256: "9a".repeat(32) };
     case 120:
       return { ...host, vnc: 5900, name: null, rfb_version: "003.008" };
+    case 77:
+      // Announces the name of the saved "Office PC" sample from another address: a warning, not "Saved".
+      return { ...host, rdp: 3389, kind: "windows", name: "office-pc.local", names: { ...host.names, rdp_certificate: "office-pc.local" }, rdp_certificate_sha256: "4c".repeat(32) };
     default:
       return null;
   }
@@ -557,28 +612,40 @@ function mockStartScan(ids: string[], onEvent: (event: ScanEvent) => void): stri
     return sum + (parsed.ok ? parsed.value.hostCount : 0);
   }, 0);
   const found: FoundHost[] = [];
+  const everywhere = plan.some((s) => s.cidr === EVERYWHERE_CIDR);
   for (const s of plan) {
-    for (const offset of [10, 23, 42, 57, 88, 120]) {
+    if (s.cidr === EVERYWHERE_CIDR) {
+      // Something answering for every address: the scan stops itself past the report limit.
+      for (let offset = 1; offset < 255; offset++) found.push({ ...blankHost(`10.0.9.${offset}`), rdp: 3389, kind: "windows" });
+      continue;
+    }
+    for (const offset of [10, 23, 42, 57, 77, 88, 120]) {
       const host = fakeHost(s.cidr, offset);
       if (host) found.push(host);
     }
   }
+  /** Stand-in for ScanOptions::max_reported_hosts. */
+  const reportLimit = 120;
   const id = `mock-scan-${nextId++}`;
   const steps = 20;
   let step = 0;
   let reported = 0;
-  const finish = (cancelled: boolean) => {
+  const finish = (cancelled: boolean, tooMany = false) => {
     window.clearInterval(scanTimer);
     activeScan = null;
-    const done = cancelled ? Math.round((total * step) / steps) : total;
-    note(`scan ${id} ${cancelled ? "cancelled" : "finished"}`);
+    const done = cancelled || tooMany ? Math.round((total * step) / steps) : total;
+    note(`scan ${id} ${tooMany ? "stopped: too many answers" : cancelled ? "cancelled" : "finished"}`);
     onEvent({ type: "progress", done, total, found: reported });
-    onEvent({ type: "finished", cancelled, done, total, found: reported });
+    onEvent({ type: "finished", cancelled, too_many: tooMany, done, total, found: reported });
   };
   scanTimer = window.setInterval(() => {
     step++;
     const due = Math.floor((found.length * step) / steps);
     while (reported < due) {
+      if (everywhere && reported >= reportLimit) {
+        finish(false, true);
+        return;
+      }
       const host = found[reported++];
       if (host) onEvent({ type: "host", host });
     }
@@ -601,6 +668,7 @@ const mockApi: Api = {
     const target = existing !== undefined && sameTarget(existing, saved);
     const account = existing !== undefined && existing.username === saved.username && existing.domain.toLowerCase() === saved.domain.toLowerCase();
     saved.pinned_identity = existing && target ? existing.pinned_identity : null;
+    saved.srp_seen = existing !== undefined && target && existing.srp_seen;
     let passwordCleared = false;
     if (connection.id !== "" && (!target || !account)) {
       passwordCleared = existing !== undefined && savedPasswords.has(saved.id);
@@ -627,6 +695,9 @@ const mockApi: Api = {
     await delay(null, 150);
     const connection = connections.find((c) => c.id === args.id);
     if (!connection) throw { kind: "other", detail: `no connection with id ${args.id}` } satisfies SessionError;
+    if (args.trust_new_identity && !args.new_identity) {
+      throw { kind: "other", detail: "Trusting a new identity needs the fingerprint that was reviewed." } satisfies SessionError;
+    }
     if (args.trust_new_identity && args.password === null) {
       // Like the backend: the saved password is never used to trust a new identity.
       note(`connect ${args.id}: trusting a new identity needs a typed password`);
@@ -649,6 +720,10 @@ const mockApi: Api = {
       failureIndex++;
     } else if (args.id === NO_SSH_ID && connection.ssh_tunnel) {
       failure = "tunnel_unavailable";
+    } else if (NO_SRP_IDS.has(args.id) && !connection.ssh_tunnel && !(connection.allow_older_mac_sign_in && !connection.srp_seen)) {
+      // As rc-vnc under EncryptionPolicy::Required without allow_unverified_sign_in.
+      failure = "no_verified_sign_in";
+      error = { kind: "no_verified_sign_in", detail: NO_SRP_DETAIL };
     } else if (args.id === NO_ENCRYPTION_ID && !connection.ssh_tunnel) {
       failure = "security";
       error = {
@@ -669,6 +744,7 @@ const mockApi: Api = {
       const current = connections.find((c) => c.id === snapshot.id);
       if (!current || !sameTarget(current, snapshot)) return null;
       if (pinsIdentity && (current.pinned_identity === null || args.trust_new_identity)) current.pinned_identity = presented;
+      if (connection.protocol === "vnc" && !connection.ssh_tunnel && !NO_SRP_IDS.has(connection.id)) current.srp_seen = true;
       if (args.password !== null && args.save_password) {
         if (args.password === KEYCHAIN_FAILS) {
           return "Signed in, but the password could not be saved in the keychain, so you will be asked for it next time. (mock: no keychain)";
@@ -677,7 +753,7 @@ const mockApi: Api = {
       }
       return null;
     };
-    const session = new MockSession(id, connection, onMessage, signedIn, mockSecurity(connection, pinsIdentity && expected !== null));
+    const session = new MockSession(id, connection, onMessage, signedIn, mockSecurity(connection, pinsIdentity && expected !== null, args.trust_new_identity));
     sessions.set(id, session);
     if (error) session.fail(error);
     else session.run(failure);

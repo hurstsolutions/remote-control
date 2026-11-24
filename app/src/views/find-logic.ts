@@ -158,15 +158,38 @@ function normalizeHost(host: string): string {
   return host.trim().toLowerCase().replace(/\.$/, "");
 }
 
-/** Saved connections that point at this machine (by IP or any of its names). */
+/**
+ * Saved connections that point at this machine's address. Only the address counts: the names a
+ * scan finds are whatever the machine (or anyone on the network) chose to announce.
+ */
 export function savedMatches(host: FoundHost, connections: Connection[]): Connection[] {
-  const keys = new Set([host.ip, ...allNames(host)].map(normalizeHost));
+  return connections.filter((c) => normalizeHost(c.host) === host.ip);
+}
+
+export interface NameMatch {
+  connection: Connection;
+  /** The saved connection uses an IP address, and it is not this one. */
+  differentAddress: boolean;
+}
+
+/** Saved connections whose host matches one of this machine's names, but not its address. */
+export function nameOnlyMatches(host: FoundHost, connections: Connection[]): NameMatch[] {
+  const keys = new Set(allNames(host).map(normalizeHost));
   // "studio-mac.local" also matches a saved "studio-mac".
   for (const name of allNames(host)) {
     const short = normalizeHost(name).split(".")[0];
     if (short && name.includes(".")) keys.add(short);
   }
-  return connections.filter((c) => keys.has(normalizeHost(c.host)));
+  return connections
+    .filter((c) => normalizeHost(c.host) !== host.ip && keys.has(normalizeHost(c.host)))
+    .map((connection) => ({ connection, differentAddress: parseIpv4(normalizeHost(connection.host)) !== null }));
+}
+
+/** The warning for a name-only match: the name may be announced by any machine. */
+export function nameMatchWarning(match: NameMatch): string {
+  return match.differentAddress
+    ? `Name matches saved "${match.connection.name}" but at a different address`
+    : `Name matches saved "${match.connection.name}", but the address isn't confirmed`;
 }
 
 /** The protocols the app can connect to this machine with. */
@@ -177,8 +200,23 @@ export function addableProtocols(host: FoundHost): Protocol[] {
   return out;
 }
 
-/** A friendly connection name: the computer name without domain, or the IP. */
-export function suggestedName(host: FoundHost, protocol: Protocol): string {
+/**
+ * A friendly connection name: the computer name without domain, or the IP. A name that a saved
+ * connection already has gets the address added, so an announced name can never produce a
+ * look-alike of a saved connection.
+ */
+export function suggestedName(host: FoundHost, protocol: Protocol, saved: Connection[] = []): string {
+  const name = announcedName(host, protocol);
+  if (name === host.ip) return name;
+  const key = name.trim().toLowerCase();
+  const taken = saved.some((c) => {
+    const host = normalizeHost(c.host);
+    return c.name.trim().toLowerCase() === key || host === key || (parseIpv4(host) === null && host.split(".")[0] === key);
+  });
+  return taken ? `${name} (${host.ip})` : name;
+}
+
+function announcedName(host: FoundHost, protocol: Protocol): string {
   const preferred =
     protocol === "vnc"
       ? (host.names.mdns_name ?? host.names.mdns_host ?? host.name)
@@ -189,11 +227,15 @@ export function suggestedName(host: FoundHost, protocol: Protocol): string {
   return /^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/.test(preferred) ? (preferred.split(".")[0] ?? preferred) : preferred;
 }
 
-/** A new connection pre-filled from a found machine. The user still enters the username. */
-export function prefillConnection(host: FoundHost, protocol: Protocol): Connection {
+/**
+ * A new connection pre-filled from a found machine. The user still enters the username. Nothing
+ * is known about the machine yet, so clipboard sharing starts off.
+ */
+export function prefillConnection(host: FoundHost, protocol: Protocol, saved: Connection[] = []): Connection {
   const connection = blankConnection(protocol);
-  connection.name = suggestedName(host, protocol);
+  connection.name = suggestedName(host, protocol, saved);
   connection.host = host.ip;
+  connection.share_clipboard = false;
   if (protocol === "rdp") {
     connection.port = host.rdp ?? connection.port;
   } else {

@@ -96,7 +96,7 @@ fn main() {
     while let Some(a) = args.next() {
         match a.as_str() {
             "--user" => config.username = args.next(),
-            "--password" => config.password = args.next(),
+            "--password" => config.password = args.next().map(Into::into),
             "--view-only" => config.view_only = true,
             "--encodings" => std::env::set_var("RC_VNC_ENCODINGS", args.next().expect("--encodings LIST")),
             _ if target.is_none() => target = Some(a),

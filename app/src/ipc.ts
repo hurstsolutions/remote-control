@@ -28,6 +28,16 @@ export interface Connection {
   pinned_identity: string | null;
   /** Pass clipboard text both ways during a session. Default true. */
   share_clipboard: boolean;
+  /**
+   * VNC without the SSH tunnel only: let a Mac that does not offer Apple's verified (SRP) sign-in
+   * sign in the older way (encrypted, but the Mac is not verified). Default false.
+   */
+  allow_older_mac_sign_in: boolean;
+  /**
+   * This Mac has signed in with SRP before, so allow_older_mac_sign_in is ignored for it. Set by
+   * the backend; it ignores what the UI sends and clears it when the address changes.
+   */
+  srp_seen: boolean;
 }
 
 /** What save_connection resolves with. */
@@ -48,6 +58,12 @@ export type ErrorKind =
   | "unsupported"
   /** A TLS or certificate problem other than a changed identity. No way to override it. */
   | "security"
+  /**
+   * Mac without the SSH tunnel: the Mac did not offer Apple's verified (SRP) sign-in, so the
+   * older, unverified one was refused (someone interfering, or an older Mac). The password was
+   * not sent. The connection's allow_older_mac_sign_in (ignored once srp_seen) lets it through.
+   */
+  | "no_verified_sign_in"
   /** The pinned identity no longer matches; `SessionError.identity` has both fingerprints. */
   | "identity_changed"
   | "protocol"
@@ -132,7 +148,10 @@ export interface ConnectArgs {
    * `password`: the saved one is never used (rejects with "password_required" otherwise).
    */
   trust_new_identity: boolean;
-  /** With trust_new_identity: the fingerprint the user reviewed; only that identity is accepted. */
+  /**
+   * With trust_new_identity: the fingerprint the user reviewed (required; the backend refuses
+   * to trust without it). Only that identity is accepted.
+   */
   new_identity: string | null;
 }
 
@@ -188,7 +207,8 @@ export interface FoundHost {
 export type ScanEvent =
   | { type: "progress"; done: number; total: number; found: number }
   | { type: "host"; host: FoundHost }
-  | { type: "finished"; cancelled: boolean; done: number; total: number; found: number };
+  /** `too_many`: the scan stopped itself because more machines answered than any real subnet has. */
+  | { type: "finished"; cancelled: boolean; too_many: boolean; done: number; total: number; found: number };
 
 export const api = {
   listConnections: () => invoke<Connection[]>("list_connections"),

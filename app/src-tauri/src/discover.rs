@@ -65,7 +65,7 @@ impl SubnetStore {
 }
 
 fn clean_label(label: &str) -> String {
-    let label: String = label.chars().filter(|c| !c.is_control()).take(MAX_LABEL_CHARS).collect();
+    let label: String = label.chars().filter(|c| !rc_discover::is_unsafe_char(*c)).take(MAX_LABEL_CHARS).collect();
     label.trim().to_owned()
 }
 
@@ -153,6 +153,8 @@ mod tests {
         assert_eq!(list[0].cidr, "10.0.0.0/24");
         assert!(!list[0].id.is_empty());
         assert_eq!(list[1].label, "ab");
+        let spoofed = validate(vec![Subnet { label: "Lab\u{202E}\u{200B}\u{2066} VLAN\u{FEFF}".into(), ..subnet("10.0.2.0/24") }]).unwrap();
+        assert_eq!(spoofed[0].label, "Lab VLAN");
         assert!(validate(vec![subnet("10.0.0.0/8")]).unwrap_err().contains("/16"));
         assert!(validate(vec![subnet("10.0.0.0/24"), subnet("10.0.0.1/24")]).unwrap_err().contains("twice"));
         assert!(validate(vec![subnet("fd00::/64")]).unwrap_err().contains("IPv6"));

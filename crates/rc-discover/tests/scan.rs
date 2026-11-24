@@ -8,7 +8,7 @@ use ironrdp_server::{
     DesktopSize, DisplayUpdate, KeyboardEvent, MouseEvent, RdpServer, RdpServerDisplay, RdpServerDisplayUpdates,
     RdpServerInputHandler, TlsIdentityCtx,
 };
-use rc_discover::{CancelToken, Host, HostKind, Ports, ScanEvent, ScanOptions};
+use rc_discover::{CancelToken, Host, HostKind, Ports, ScanEvent, ScanOptions, ScanSummary};
 use tokio::io::AsyncWriteExt as _;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
@@ -27,6 +27,22 @@ async fn greeter(greeting: &'static [u8]) -> u16 {
             tokio::spawn(async move {
                 let _ = stream.write_all(greeting).await;
                 tokio::time::sleep(Duration::from_millis(500)).await;
+            });
+        }
+    });
+    port
+}
+
+/// A TCP server that accepts every connection and holds it open without a word, like a proxy or
+/// firewall answering for every address.
+async fn silent_holder() -> u16 {
+    let listener = TcpListener::bind((LOCAL, 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                drop(stream);
             });
         }
     });
@@ -129,6 +145,15 @@ fn quiet_options(ports: Ports) -> ScanOptions {
 }
 
 async fn run_scan(targets: Vec<Ipv4Addr>, options: ScanOptions, cancel: CancelToken) -> (Vec<Host>, ScanEvent) {
+    let (hosts, finished, _) = run_scan_summary(targets, options, cancel).await;
+    (hosts, finished)
+}
+
+async fn run_scan_summary(
+    targets: Vec<Ipv4Addr>,
+    options: ScanOptions,
+    cancel: CancelToken,
+) -> (Vec<Host>, ScanEvent, ScanSummary) {
     let (tx, mut rx) = mpsc::channel(64);
     let scan = tokio::spawn(rc_discover::scan(targets, options, cancel, tx));
     let mut hosts = Vec::new();
@@ -140,8 +165,8 @@ async fn run_scan(targets: Vec<Ipv4Addr>, options: ScanOptions, cancel: CancelTo
             ScanEvent::Progress { done, total, .. } => assert!(done <= total),
         }
     }
-    scan.await.unwrap();
-    (hosts, last.expect("a Finished event"))
+    let summary = scan.await.unwrap();
+    (hosts, last.expect("a Finished event"), summary)
 }
 
 // ---- tests ----------------------------------------------------------------------------------
@@ -195,7 +220,7 @@ async fn finds_services_and_names_on_loopback() {
     }
     let total = targets.len();
     let (hosts, finished) = run_scan(targets, quiet_options(ports), CancelToken::default()).await;
-    assert_eq!(finished, ScanEvent::Finished { cancelled: false, done: total, total, found: 1 });
+    assert_eq!(finished, ScanEvent::Finished { cancelled: false, too_many: false, done: total, total, found: 1 });
     assert_eq!(hosts.len(), 1, "{hosts:?}");
     let host = &hosts[0];
     assert_eq!(host.ip, "127.0.0.1");
@@ -220,7 +245,7 @@ async fn closed_ports_find_nothing() {
     let ports = Ports { rdp: free(), vnc: free(), ssh: free(), mdns: free(), netbios: free() };
     let (hosts, finished) = run_scan(vec![LOCAL], quiet_options(ports), CancelToken::default()).await;
     assert!(hosts.is_empty());
-    assert_eq!(finished, ScanEvent::Finished { cancelled: false, done: 1, total: 1, found: 0 });
+    assert_eq!(finished, ScanEvent::Finished { cancelled: false, too_many: false, done: 1, total: 1, found: 0 });
 }
 
 #[tokio::test]
@@ -243,4 +268,57 @@ async fn cancel_stops_the_scan_and_the_rate_cap_holds() {
     // 60 connects per second at three per host: about 20 hosts a second, so about 10 in 0.5 s.
     assert!(done <= 20, "rate cap: {done} hosts in 0.5 s");
     assert!(hosts.len() <= done);
+}
+
+/// Small limits so the test is quick: 2 hosts probed and 2 described at once.
+fn tight_options(ports: Ports) -> ScanOptions {
+    ScanOptions {
+        max_in_flight: 6,
+        max_name_lookups: 2,
+        max_probes_per_sec: 100_000,
+        name_timeout: Duration::from_millis(150),
+        mdns: false,
+        netbios: false,
+        ..quiet_options(ports)
+    }
+}
+
+#[tokio::test]
+async fn open_sockets_stay_bounded_when_everything_answers() {
+    let a = silent_holder().await;
+    let b = silent_holder().await;
+    let ports = Ports { rdp: a, vnc: b, ssh: a, ..Ports::default() };
+    let options = tight_options(ports);
+    let bound = rc_discover::socket_bound(&options);
+    assert_eq!(bound, 3 * (2 + 2));
+
+    let count = 40;
+    let (hosts, finished, summary) = run_scan_summary(vec![LOCAL; count], options, CancelToken::default()).await;
+    assert_eq!(hosts.len(), count);
+    let ScanEvent::Finished { too_many, found, .. } = finished else { unreachable!() };
+    assert!(!too_many);
+    assert_eq!(found, count);
+    assert_eq!(summary.described, count);
+    assert!(summary.peak_sockets > 0);
+    assert!(summary.peak_sockets <= bound, "the scan held {} sockets; the bound is {bound}", summary.peak_sockets);
+}
+
+#[tokio::test]
+async fn too_many_answers_stop_the_scan_and_cap_the_lookups() {
+    let port = silent_holder().await;
+    let ports = Ports { rdp: port, vnc: port, ssh: port, ..Ports::default() };
+    let options = ScanOptions { max_described_hosts: 3, max_reported_hosts: 10, ..tight_options(ports) };
+    let bound = rc_discover::socket_bound(&options);
+    let (hosts, finished, summary) = run_scan_summary(vec![LOCAL; 200], options, CancelToken::default()).await;
+    let ScanEvent::Finished { cancelled, too_many, done, found, .. } = finished else { unreachable!() };
+    assert!(too_many, "the scan stopped itself");
+    assert!(!cancelled);
+    assert!(done < 200, "stopped early, after {done}");
+    assert_eq!(found, 10, "found is capped at the report limit");
+    assert!(hosts.len() <= 10, "{} hosts reported", hosts.len());
+    assert!(summary.too_many);
+    assert!(summary.described <= 3, "{} hosts described", summary.described);
+    // Machines past the lookup cap still show their open ports.
+    assert!(hosts.iter().all(|h| h.rdp == Some(port)));
+    assert!(summary.peak_sockets <= bound);
 }

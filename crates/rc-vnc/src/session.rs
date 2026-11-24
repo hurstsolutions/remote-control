@@ -15,7 +15,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
 
@@ -206,11 +206,9 @@ where
         (true, false) => crate::VncSecurity::EncryptedUnverified,
         (true, true) => crate::VncSecurity::EncryptedVerified,
     };
-    info!(?security, "{}", security.status_text());
     if !encrypted && options.encryption != crate::EncryptionPolicy::Off {
         warn!(policy = ?options.encryption, "the session is not encrypted by VNC (the server or sign-in did not allow it)");
     }
-    emit(events, security.to_event()).await?;
 
     let shared: SharedRef =
         Arc::new(Mutex::new(Shared { width: init.width, height: init.height, ..Default::default() }));
@@ -228,8 +226,6 @@ where
     wr.write_all(&hello).await?;
     wr.flush().await?;
 
-    emit(events, SessionEvent::Connected { width: init.width, height: init.height, name: init.name }).await?;
-
     let (out_tx, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let mut reader = Reader {
         rd: BufReader::with_capacity(64 * 1024, rd),
@@ -244,6 +240,41 @@ where
         apple: done.apple,
         cursors: HashMap::new(),
     };
+
+    if encrypted {
+        // Announce nothing until the Mac's first record has passed its integrity check: that
+        // proves it holds the key the sign-in produced (an impostor could not wrap it). The
+        // full update request above guarantees the Mac sends something.
+        *stage = hs::STAGE_ENCRYPTION;
+        debug!("encryption setup: waiting for the Mac's first encrypted message");
+        let first = tokio::time::timeout(HANDSHAKE_TIMEOUT, reader.rd.fill_buf());
+        tokio::select! {
+            r = first => match r {
+                Ok(Ok([])) => {
+                    return Err(VncError::Io(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "the Mac closed the connection before its first encrypted message",
+                    )))
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => {
+                    return Err(VncError::Security(format!(
+                        "the Mac sent no encrypted message within {} s of the encryption setup",
+                        HANDSHAKE_TIMEOUT.as_secs()
+                    )))
+                }
+            },
+            _ = wait_for_close(input) => return Err(VncError::UserClosed),
+            _ = events.closed() => return Err(VncError::Gone),
+        }
+        debug!("encryption setup: the Mac's first encrypted message passed its integrity check");
+        *stage = hs::STAGE_SESSION;
+    }
+
+    info!(?security, "{}", security.status_text());
+    emit(events, security.to_event()).await?;
+    emit(events, SessionEvent::Connected { width: init.width, height: init.height, name: init.name }).await?;
 
     tokio::select! {
         r = reader.run() => r,
