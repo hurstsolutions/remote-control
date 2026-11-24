@@ -12,7 +12,10 @@ import {
   allNames,
   estimateDuration,
   filterHosts,
+  hiddenToggleLabel,
+  isComputer,
   nameMatchWarning,
+  nameSource,
   nameOnlyMatches,
   parseCidr,
   prefillConnection,
@@ -20,6 +23,8 @@ import {
   savedMatches,
   serviceLabels,
   sortHosts,
+  upsertHost,
+  withoutSubnets,
   type SortKey,
 } from "./find-logic";
 
@@ -45,6 +50,8 @@ export class FindView {
   private sortKey: SortKey = "ip";
   private ascending = true;
   private scanning = false;
+  /** Show devices that are not Windows PCs or Macs. Off whenever the view opens. */
+  private showAll = false;
   private scanId: string | null = null;
   /** Bumped per scan, so events of an earlier scan are ignored. */
   private generation = 0;
@@ -60,6 +67,8 @@ export class FindView {
   private readonly progress: HTMLProgressElement;
   private readonly status: HTMLElement;
   private readonly filter: HTMLInputElement;
+  private readonly showAllCheck: HTMLInputElement;
+  private readonly showAllLabel: HTMLElement;
   private readonly resultsBody: HTMLTableSectionElement;
   private readonly resultsNote: HTMLElement;
   private readonly sortButtons: Record<SortKey, HTMLButtonElement>;
@@ -69,7 +78,7 @@ export class FindView {
     this.problem = h("p", { class: "notice notice-error", attrs: { role: "alert" } });
     this.problem.hidden = true;
     this.subnetList = h("div", { class: "connection-list subnet-list", attrs: { role: "list", "aria-label": "Subnets" } });
-    this.scanButton = button("Scan", () => void this.scan(), { kind: "primary" });
+    this.scanButton = button("Scan all", () => void this.scan(this.chosen()), { kind: "primary" });
     this.cancelButton = button("Cancel scan", () => void this.cancel());
     this.cancelButton.hidden = true;
     this.progress = h("progress", { class: "scan-progress", attrs: { max: "1", value: "0", "aria-label": "Scan progress" } });
@@ -80,6 +89,13 @@ export class FindView {
       attrs: { type: "search", placeholder: "Filter by address, name or service", "aria-label": "Filter results", spellcheck: "false" },
     });
     this.filter.addEventListener("input", () => this.renderResults());
+    this.showAllCheck = h("input", { attrs: { type: "checkbox" } });
+    this.showAllCheck.checked = false;
+    this.showAllCheck.addEventListener("change", () => {
+      this.showAll = this.showAllCheck.checked;
+      this.renderResults();
+    });
+    this.showAllLabel = h("span", { text: hiddenToggleLabel(0) });
     this.resultsBody = h("tbody");
     this.resultsNote = h("p", { class: "muted results-note" });
 
@@ -107,12 +123,13 @@ export class FindView {
           class: "notice",
           text:
             "Scanning checks each address in the chosen subnets for Remote Desktop (port 3389), Screen Sharing (5900) and Remote Login / SSH (22). " +
+            "To find their names, it also asks the computers it finds for their file sharing (445), NetBIOS (137) and Bonjour (5353) names. " +
             "It never sends a username or password, but network security tools may notice it and flag it as a port scan. Only scan networks you are allowed to.",
         }),
         this.problem,
         this.subnetList,
         h("div", { class: "scan-bar" }, this.scanButton, this.cancelButton, this.progress, this.status),
-        h("div", { class: "results-tools" }, this.filter),
+        h("div", { class: "results-tools" }, this.filter, h("label", { class: "check show-all" }, this.showAllCheck, this.showAllLabel)),
         h(
           "table",
           { class: "results" },
@@ -213,6 +230,7 @@ export class FindView {
       h(
         "div",
         { class: "row-actions" },
+        button("Scan", () => void this.scan([subnet]), { title: `Scan ${subnet.cidr} only; results from other subnets stay` }),
         button("Edit", () => void this.editSubnet(subnet)),
         button("Remove", () => void this.removeSubnet(subnet), { kind: "quiet" }),
       ),
@@ -328,8 +346,13 @@ export class FindView {
   }
 
   private renderScanState(): void {
-    this.scanButton.disabled = this.scanning || this.chosen().length === 0;
-    this.scanButton.textContent = this.scanning ? "Scanning..." : "Scan";
+    const chosen = this.chosen().length;
+    this.scanButton.disabled = this.scanning || chosen === 0;
+    this.scanButton.textContent = this.scanning
+      ? "Scanning..."
+      : chosen === this.subnets.length || chosen === 0
+        ? "Scan all"
+        : `Scan selected (${chosen})`;
     this.cancelButton.hidden = !this.scanning;
     for (const input of this.subnetList.querySelectorAll<HTMLInputElement>("input[type=checkbox]")) input.disabled = this.scanning;
     for (const b of this.subnetList.querySelectorAll<HTMLButtonElement>(".row-actions button")) b.disabled = this.scanning;
@@ -340,8 +363,8 @@ export class FindView {
     }
   }
 
-  private async scan(): Promise<void> {
-    const chosen = this.chosen();
+  /** Scan these subnets. Results from other subnets stay; results inside these are replaced. */
+  private async scan(chosen: Subnet[]): Promise<void> {
     if (chosen.length === 0 || this.scanning) return;
     const total = chosen.reduce((sum, s) => {
       const parsed = parseCidr(s.cidr);
@@ -357,7 +380,7 @@ export class FindView {
     }
     const generation = ++this.generation;
     this.showProblem(null);
-    this.hosts = [];
+    this.hosts = withoutSubnets(this.hosts, chosen.map((s) => s.cidr));
     this.scanning = true;
     this.scanId = null;
     this.progress.hidden = false;
@@ -390,7 +413,7 @@ export class FindView {
         this.status.textContent = progressText(event.done, event.total, event.found);
         break;
       case "host":
-        this.hosts.push(event.host);
+        this.hosts = upsertHost(this.hosts, event.host);
         this.scheduleRender();
         break;
       case "finished": {
@@ -452,12 +475,20 @@ export class FindView {
   private renderResults(): void {
     window.clearTimeout(this.renderTimer);
     this.renderTimer = 0;
-    const shown = sortHosts(filterHosts(this.hosts, this.filter.value), this.sortKey, this.ascending);
+    const computers = this.hosts.filter(isComputer);
+    const hidden = this.hosts.length - computers.length;
+    this.showAllLabel.textContent = hiddenToggleLabel(this.showAll ? 0 : hidden);
+    const pool = this.showAll ? this.hosts : computers;
+    const shown = sortHosts(filterHosts(pool, this.filter.value), this.sortKey, this.ascending);
     this.resultsBody.replaceChildren(...shown.map((host) => this.cachedRow(host)));
     if (this.hosts.length === 0) {
       this.resultsNote.textContent = this.scanning ? "Computers appear here as they are found." : "No results yet. Choose subnets and press Scan.";
-    } else if (shown.length < this.hosts.length) {
-      this.resultsNote.textContent = `Showing ${shown.length} of ${this.hosts.length} computers.`;
+    } else if (pool.length === 0) {
+      this.resultsNote.textContent = this.scanning
+        ? "No Windows PCs or Macs yet. Other devices are hidden."
+        : "No Windows PCs or Macs found. Tick \u201cShow all devices\u201d to see the other devices that answered.";
+    } else if (shown.length < pool.length) {
+      this.resultsNote.textContent = `Showing ${shown.length} of ${pool.length} ${this.showAll ? "devices" : "computers"}.`;
     } else {
       this.resultsNote.textContent = "";
     }
@@ -481,6 +512,7 @@ export class FindView {
     const tooltip: string[] = [];
     if (found.names.rdp_certificate) tooltip.push(`Certificate name: ${found.names.rdp_certificate}`);
     if (found.names.mdns_name || found.names.mdns_host) tooltip.push(`Bonjour: ${[found.names.mdns_name, found.names.mdns_host].filter(Boolean).join(", ")}`);
+    if (found.names.smb) tooltip.push(`File sharing (SMB): ${found.names.smb}`);
     if (found.names.netbios) tooltip.push(`NetBIOS: ${found.names.netbios}`);
     if (found.names.dns) tooltip.push(`DNS: ${found.names.dns}`);
     if (found.rfb_version) tooltip.push(`VNC version: ${found.rfb_version}`);
@@ -506,6 +538,7 @@ export class FindView {
     if (protocols.length === 0) actions.append(h("span", { class: "muted", text: "SSH only", title: "RemoteControl connects with Remote Desktop or Screen Sharing; neither answered." }));
 
     const kindLabel = found.kind === "windows" ? "Windows" : found.kind === "mac" ? "Mac" : "Other";
+    const source = nameSource(found);
     const row = h(
       "tr",
       { attrs: { "data-ip": found.ip } },
@@ -514,6 +547,7 @@ export class FindView {
         "td",
         { class: "results-name" },
         h("div", { class: "row-name selectable", text: names[0] ?? "(no name found)" }),
+        source ? h("div", { class: "row-detail muted name-source", text: `Name from ${source}` }) : null,
         extra.length > 0 ? h("div", { class: "row-detail selectable", text: extra.join(", ") }) : null,
       ),
       h("td", {}, h("span", { class: `kind-tag kind-${found.kind}`, text: kindLabel }), ...serviceLabels(found).map((s) => h("span", { class: "service-tag", text: s }))),

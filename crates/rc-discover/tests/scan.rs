@@ -9,7 +9,9 @@ use ironrdp_server::{
     RdpServerInputHandler, TlsIdentityCtx,
 };
 use rc_discover::{CancelToken, Host, HostKind, Ports, ScanEvent, ScanOptions, ScanSummary};
-use tokio::io::AsyncWriteExt as _;
+use std::sync::{Arc, Mutex};
+
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
 
@@ -60,6 +62,44 @@ async fn udp_responder(reply: fn(&[u8]) -> Vec<u8>) -> u16 {
         }
     });
     port
+}
+
+/// What a fake SMB server received from each client: the messages, in order.
+type SmbLog = Arc<Mutex<Vec<Vec<Vec<u8>>>>>;
+
+/// A fake SMB server: answers NEGOTIATE and SESSION_SETUP with an NTLM challenge naming
+/// STUDIO-MAC / Studio-Mac.local, then records anything else the client sends until it closes.
+async fn smb_server() -> (u16, SmbLog) {
+    let listener = TcpListener::bind((LOCAL, 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let log: SmbLog = Arc::default();
+    let server_log = Arc::clone(&log);
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let log = Arc::clone(&server_log);
+            tokio::spawn(async move {
+                let (negotiate, setup) = rc_discover::smb::sample_responses("STUDIO-MAC", "Studio-Mac.local");
+                let mut received = Vec::new();
+                for reply in [Some(negotiate), Some(setup), None, None] {
+                    let mut frame = [0u8; 4];
+                    if stream.read_exact(&mut frame).await.is_err() {
+                        break;
+                    }
+                    let length = usize::from(frame[1]) << 16 | usize::from(frame[2]) << 8 | usize::from(frame[3]);
+                    let mut message = vec![0u8; length.min(65536)];
+                    if stream.read_exact(&mut message).await.is_err() {
+                        break;
+                    }
+                    received.push(message);
+                    if let Some(reply) = reply {
+                        let _ = stream.write_all(&reply).await;
+                    }
+                }
+                log.lock().unwrap().push(received);
+            });
+        }
+    });
+    (port, log)
 }
 
 #[derive(Clone)]
@@ -211,7 +251,8 @@ async fn finds_services_and_names_on_loopback() {
     let ssh = greeter(b"SSH-2.0-OpenSSH_9.6\r\n").await;
     let mdns = udp_responder(|q| rc_discover::mdns::sample_reply(q, "Studio-Mac.local", "Studio Mac", "Mac14,3")).await;
     let netbios = udp_responder(|q| rc_discover::netbios::sample_reply(q, &[("DESKTOP-TEST01", 0, false)])).await;
-    let ports = Ports { rdp, vnc, ssh, mdns, netbios };
+    let (smb, _) = smb_server().await;
+    let ports = Ports { rdp, vnc, ssh, mdns, netbios, smb };
 
     let mut targets = vec![LOCAL];
     // Linux routes all of 127.0.0.0/8 to the loopback interface; nothing listens on these.
@@ -230,6 +271,7 @@ async fn finds_services_and_names_on_loopback() {
     assert_eq!(host.names.mdns_host.as_deref(), Some("Studio-Mac.local"));
     assert_eq!(host.names.mdns_name.as_deref(), Some("Studio Mac"));
     assert_eq!(host.names.netbios.as_deref(), Some("DESKTOP-TEST01"));
+    assert_eq!(host.names.smb.as_deref(), Some("Studio-Mac.local"));
     assert_eq!(host.names.dns, None);
     assert_eq!(host.model.as_deref(), Some("Mac14,3"));
     assert_eq!(host.rfb_version.as_deref(), Some("003.889"));
@@ -242,7 +284,7 @@ async fn finds_services_and_names_on_loopback() {
 async fn closed_ports_find_nothing() {
     // Free ports, then closed again.
     let free = || std::net::TcpListener::bind((LOCAL, 0)).unwrap().local_addr().unwrap().port();
-    let ports = Ports { rdp: free(), vnc: free(), ssh: free(), mdns: free(), netbios: free() };
+    let ports = Ports { rdp: free(), vnc: free(), ssh: free(), mdns: free(), netbios: free(), smb: free() };
     let (hosts, finished) = run_scan(vec![LOCAL], quiet_options(ports), CancelToken::default()).await;
     assert!(hosts.is_empty());
     assert_eq!(finished, ScanEvent::Finished { cancelled: false, too_many: false, done: 1, total: 1, found: 0 });
@@ -252,7 +294,7 @@ async fn closed_ports_find_nothing() {
 async fn cancel_stops_the_scan_and_the_rate_cap_holds() {
     let vnc = greeter(b"RFB 003.008\n").await;
     let ports = Ports { rdp: vnc, vnc, ssh: vnc, ..Ports::default() };
-    let options = ScanOptions { max_probes_per_sec: 60, mdns: false, netbios: false, ..quiet_options(ports) };
+    let options = ScanOptions { max_probes_per_sec: 60, mdns: false, netbios: false, smb: false, ..quiet_options(ports) };
     let cancel = CancelToken::default();
     let canceller = cancel.clone();
     tokio::spawn(async move {
@@ -287,10 +329,11 @@ fn tight_options(ports: Ports) -> ScanOptions {
 async fn open_sockets_stay_bounded_when_everything_answers() {
     let a = silent_holder().await;
     let b = silent_holder().await;
-    let ports = Ports { rdp: a, vnc: b, ssh: a, ..Ports::default() };
+    // SMB answers too (and says nothing), so each described host holds a fourth socket.
+    let ports = Ports { rdp: a, vnc: b, ssh: a, smb: b, ..Ports::default() };
     let options = tight_options(ports);
     let bound = rc_discover::socket_bound(&options);
-    assert_eq!(bound, 3 * (2 + 2));
+    assert_eq!(bound, 3 * 2 + 4 * 2);
 
     let count = 40;
     let (hosts, finished, summary) = run_scan_summary(vec![LOCAL; count], options, CancelToken::default()).await;
@@ -306,7 +349,7 @@ async fn open_sockets_stay_bounded_when_everything_answers() {
 #[tokio::test]
 async fn too_many_answers_stop_the_scan_and_cap_the_lookups() {
     let port = silent_holder().await;
-    let ports = Ports { rdp: port, vnc: port, ssh: port, ..Ports::default() };
+    let ports = Ports { rdp: port, vnc: port, ssh: port, smb: port, ..Ports::default() };
     let options = ScanOptions { max_described_hosts: 3, max_reported_hosts: 10, ..tight_options(ports) };
     let bound = rc_discover::socket_bound(&options);
     let (hosts, finished, summary) = run_scan_summary(vec![LOCAL; 200], options, CancelToken::default()).await;
@@ -321,4 +364,42 @@ async fn too_many_answers_stop_the_scan_and_cap_the_lookups() {
     // Machines past the lookup cap still show their open ports.
     assert!(hosts.iter().all(|h| h.rdp == Some(port)));
     assert!(summary.peak_sockets <= bound);
+}
+
+#[tokio::test]
+async fn reads_the_smb_computer_name_without_signing_in() {
+    let (port, log) = smb_server().await;
+    let tcp = tokio::net::TcpStream::connect((LOCAL, port)).await.unwrap();
+    let names = rc_discover::smb::names(tcp, Duration::from_secs(2)).await.expect("names");
+    assert_eq!(names.netbios.as_deref(), Some("STUDIO-MAC"));
+    assert_eq!(names.dns.as_deref(), Some("Studio-Mac.local"));
+    // Wait for the server to see the connection close, then check what it was sent.
+    for _ in 0..100 {
+        if !log.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let sessions = log.lock().unwrap().clone();
+    assert_eq!(sessions.len(), 1);
+    let messages = &sessions[0];
+    assert_eq!(messages.len(), 2, "NEGOTIATE and one SESSION_SETUP, then the client closed");
+    let ntlm_types: Vec<u8> = messages
+        .iter()
+        .flat_map(|m| m.windows(9).filter(|w| &w[..8] == b"NTLMSSP\0").map(|w| w[8]).collect::<Vec<_>>())
+        .collect();
+    assert_eq!(ntlm_types, [1], "only an NTLM NEGOTIATE; never an AUTHENTICATE (type 3)");
+}
+
+#[tokio::test]
+async fn a_non_smb_server_gives_no_names_quickly() {
+    let port = greeter(b"SSH-2.0-OpenSSH_9.6\r\n").await;
+    let tcp = tokio::net::TcpStream::connect((LOCAL, port)).await.unwrap();
+    let started = std::time::Instant::now();
+    assert_eq!(rc_discover::smb::names(tcp, Duration::from_secs(2)).await, None);
+    assert!(started.elapsed() < Duration::from_secs(3));
+    // A server that never answers: the time box ends it.
+    let silent = silent_holder().await;
+    let tcp = tokio::net::TcpStream::connect((LOCAL, silent)).await.unwrap();
+    assert_eq!(rc_discover::smb::names(tcp, Duration::from_millis(200)).await, None);
 }

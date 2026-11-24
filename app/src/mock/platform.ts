@@ -542,7 +542,7 @@ function blankHost(ip: string): FoundHost {
     vnc: null,
     ssh: null,
     name: null,
-    names: { rdp_certificate: null, mdns_name: null, mdns_host: null, netbios: null, dns: null },
+    names: { rdp_certificate: null, mdns_name: null, mdns_host: null, netbios: null, smb: null, dns: null },
     kind: "unknown",
     rdp_certificate_sha256: null,
     rfb_version: null,
@@ -570,7 +570,20 @@ function fakeHost(base: string, offset: number): FoundHost | null {
       // A hostile name: must show as plain text.
       return { ...host, rdp: 3389, kind: "windows", name: '<img src=x onerror="window.__xss=1">', names: { ...host.names, rdp_certificate: '<img src=x onerror="window.__xss=1">' }, rdp_certificate_sha256: "9a".repeat(32) };
     case 120:
+      // A non-Apple VNC server (hidden until "Show all devices").
       return { ...host, vnc: 5900, name: null, rfb_version: "003.008" };
+    case 2:
+      // An access point with SSH: not a computer, hidden by default.
+      return { ...host, ssh: 22, name: "ap-lobby.example.internal", names: { ...host.names, dns: "ap-lobby.example.internal" }, ssh_banner: "SSH-2.0-dropbear_2022.83" };
+    case 31:
+      // A Mac on another VLAN: no Bonjour answer, named by its File Sharing (SMB) server.
+      return { ...host, vnc: 5900, kind: "mac", name: "Reception-Mac.local", names: { ...host.names, smb: "Reception-Mac.local", netbios: "RECEPTION-MAC" }, rfb_version: "003.889" };
+    case 35:
+      // A Mac with only Screen Sharing on and no name anywhere: still shown.
+      return { ...host, vnc: 5900, kind: "mac", rfb_version: "003.889" };
+    case 64:
+      // Screen Sharing whose greeting didn't arrive in time: may be a Mac, so shown.
+      return { ...host, vnc: 5900, name: "studio-b.example.internal", names: { ...host.names, dns: "studio-b.example.internal" } };
     case 77:
       // Announces the name of the saved "Office PC" sample from another address: a warning, not "Saved".
       return { ...host, rdp: 3389, kind: "windows", name: "office-pc.local", names: { ...host.names, rdp_certificate: "office-pc.local" }, rdp_certificate_sha256: "4c".repeat(32) };
@@ -619,7 +632,7 @@ function mockStartScan(ids: string[], onEvent: (event: ScanEvent) => void): stri
       for (let offset = 1; offset < 255; offset++) found.push({ ...blankHost(`10.0.9.${offset}`), rdp: 3389, kind: "windows" });
       continue;
     }
-    for (const offset of [10, 23, 42, 57, 77, 88, 120]) {
+    for (const offset of [2, 10, 23, 31, 35, 42, 57, 64, 77, 88, 120]) {
       const host = fakeHost(s.cidr, offset);
       if (host) found.push(host);
     }

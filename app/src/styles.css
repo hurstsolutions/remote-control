@@ -938,8 +938,19 @@ body.fullscreen .session-top:focus-within {
   width: 160px;
 }
 
+.results-tools {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
 .results-filter {
   max-width: 340px;
+}
+
+.name-source {
+  font-size: 11px;
 }
 
 .results {

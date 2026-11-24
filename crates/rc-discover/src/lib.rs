@@ -3,8 +3,8 @@
 //!
 //! Probes are plain TCP connects, with bounded concurrency, a rate cap and a short timeout.
 //! Nothing sent can sign in or lock out an account: name lookups read what servers announce before
-//! authentication (TLS certificate, RFB / SSH greetings) or ask name services (reverse DNS,
-//! unicast mDNS, NetBIOS node status). A scan result is never trusted for anything: certificate
+//! authentication (TLS certificate, RFB / SSH greetings, the NTLM challenge of an SMB server
+//! that is never answered) or ask name services (reverse DNS, unicast mDNS, NetBIOS node status). A scan result is never trusted for anything: certificate
 //! fingerprints are information only and pinning happens on the first real connection.
 
 pub mod banner;
@@ -13,6 +13,7 @@ mod dns;
 pub mod mdns;
 pub mod netbios;
 pub mod rdp;
+pub mod smb;
 
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -36,6 +37,8 @@ pub struct Ports {
     pub ssh: u16,
     pub mdns: u16,
     pub netbios: u16,
+    /// SMB, for the computer name in its NTLM challenge. Only asked of machines already found.
+    pub smb: u16,
 }
 
 impl Default for Ports {
@@ -46,6 +49,7 @@ impl Default for Ports {
             ssh: 22,
             mdns: mdns::MDNS_PORT,
             netbios: netbios::NETBIOS_PORT,
+            smb: smb::SMB_PORT,
         }
     }
 }
@@ -72,6 +76,8 @@ pub struct ScanOptions {
     pub reverse_dns: bool,
     pub mdns: bool,
     pub netbios: bool,
+    /// Ask the SMB server (port 445) of each found machine for its NTLM challenge.
+    pub smb: bool,
     /// Read the RDP certificate, the RFB greeting and the SSH greeting.
     pub greetings: bool,
 }
@@ -90,6 +96,7 @@ impl Default for ScanOptions {
             reverse_dns: true,
             mdns: true,
             netbios: true,
+            smb: true,
             greetings: true,
         }
     }
@@ -106,6 +113,9 @@ pub struct Names {
     /// Bonjour host name, e.g. "Studio-Mac.local".
     pub mdns_host: Option<String>,
     pub netbios: Option<String>,
+    /// The computer name in the SMB server's NTLM challenge: its DNS form ("Studio-Mac.local")
+    /// when given, else its NetBIOS name. Windows with file sharing, Macs with File Sharing on.
+    pub smb: Option<String>,
     /// Reverse DNS (PTR).
     pub dns: Option<String>,
 }
@@ -159,10 +169,10 @@ pub struct ScanSummary {
 }
 
 /// The most TCP sockets a scan with these options holds at once: three per host being probed,
-/// three per host being described. Probing waits for a free name-lookup slot before it gives up
-/// its own slot, so the two never add up to more.
+/// four per host being described (its three open ports plus the SMB name lookup). Probing waits
+/// for a free name-lookup slot before it gives up its own slot, so the two never add up to more.
 pub fn socket_bound(options: &ScanOptions) -> usize {
-    3 * (host_slots(options) + options.max_name_lookups.max(1))
+    3 * host_slots(options) + 4 * options.max_name_lookups.max(1)
 }
 
 fn host_slots(options: &ScanOptions) -> usize {
@@ -354,7 +364,7 @@ async fn probe_host(ip: Ipv4Addr, permit: tokio::sync::OwnedSemaphorePermit, con
         // counted against one limit or the other, never neither.
         let Ok(_slot) = context.names.acquire().await else { return };
         drop(permit);
-        let host = describe(ip, rdp, vnc, ssh, &context.options).await;
+        let host = describe(ip, rdp, vnc, ssh, &context).await;
         drop((rdp_token, vnc_token, ssh_token));
         host
     } else {
@@ -389,13 +399,14 @@ async fn describe(
     rdp: Option<TcpStream>,
     vnc: Option<TcpStream>,
     ssh: Option<TcpStream>,
-    options: &ScanOptions,
+    context: &Arc<Context>,
 ) -> Host {
+    let options = &context.options;
     let limit = options.name_timeout;
     let ports = options.ports;
     let (rdp_open, vnc_open, ssh_open) = (rdp.is_some(), vnc.is_some(), ssh.is_some());
     let greetings = options.greetings;
-    let (cert, rfb, ssh_banner, dns_name, bonjour, netbios_name) = tokio::join!(
+    let (cert, rfb, ssh_banner, dns_name, bonjour, netbios_name, smb_names) = tokio::join!(
         async move { rdp::certificate(rdp.filter(|_| greetings)?, limit).await },
         async move { banner::rfb(vnc.filter(|_| greetings)?, limit).await },
         async move { banner::ssh(ssh.filter(|_| greetings)?, limit).await },
@@ -408,11 +419,17 @@ async fn describe(
             }
         },
         async {
-            if options.netbios && rdp_open {
-                netbios::query(ip, ports.netbios, limit).await
-            } else {
-                None
+            // Windows answers when NetBIOS over TCP/IP is on; macOS's netbiosd may too.
+            if options.netbios { netbios::query(ip, ports.netbios, limit).await } else { None }
+        },
+        async {
+            if !options.smb {
+                return None;
             }
+            // Counted like every other socket, inside the name time box.
+            let started = Instant::now();
+            let (tcp, _token) = connect(ip, ports.smb, context).await?;
+            smb::names(tcp, limit.saturating_sub(started.elapsed())).await
         },
     );
     let bonjour = bonjour.unwrap_or_default();
@@ -421,6 +438,7 @@ async fn describe(
         mdns_name: clean(bonjour.friendly_name),
         mdns_host: clean(bonjour.host_name),
         netbios: clean(netbios_name),
+        smb: clean(smb_names.and_then(smb::SmbNames::best)),
         dns: clean(dns_name),
     };
     let model = clean(bonjour.model);
@@ -432,7 +450,7 @@ async fn describe(
     } else {
         HostKind::Unknown
     };
-    let name = [&names.rdp_certificate, &names.mdns_name, &names.mdns_host, &names.netbios, &names.dns]
+    let name = [&names.rdp_certificate, &names.mdns_name, &names.mdns_host, &names.smb, &names.netbios, &names.dns]
         .into_iter()
         .find_map(Clone::clone);
     Host {
@@ -520,7 +538,8 @@ pub(crate) async fn udp_exchange(to: SocketAddr, message: &[u8], limit: Duration
     let socket = UdpSocket::bind(bind).await.ok()?;
     let exchange = async {
         socket.send_to(message, to).await.ok()?;
-        let mut buffer = vec![0u8; 1500];
+        // The largest mDNS message (RFC 6762 §17).
+        let mut buffer = vec![0u8; 9000];
         loop {
             let (n, from) = socket.recv_from(&mut buffer).await.ok()?;
             if from.ip() == to.ip() {

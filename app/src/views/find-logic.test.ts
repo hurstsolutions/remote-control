@@ -6,7 +6,13 @@ import {
   allNames,
   estimateDuration,
   filterHosts,
+  hiddenToggleLabel,
+  ipInCidr,
+  isComputer,
   nameMatchWarning,
+  nameSource,
+  upsertHost,
+  withoutSubnets,
   nameOnlyMatches,
   parseCidr,
   prefillConnection,
@@ -23,7 +29,7 @@ function host(ip: string, extra: Partial<FoundHost> = {}): FoundHost {
     vnc: null,
     ssh: null,
     name: null,
-    names: { rdp_certificate: null, mdns_name: null, mdns_host: null, netbios: null, dns: null },
+    names: { rdp_certificate: null, mdns_name: null, mdns_host: null, netbios: null, smb: null, dns: null },
     kind: "unknown",
     rdp_certificate_sha256: null,
     rfb_version: null,
@@ -37,14 +43,14 @@ const windows = host("10.0.0.10", {
   rdp: 3389,
   kind: "windows",
   name: "DESKTOP-TEST01.corp.example",
-  names: { rdp_certificate: "DESKTOP-TEST01.corp.example", mdns_name: null, mdns_host: null, netbios: "DESKTOP-TEST01", dns: null },
+  names: { rdp_certificate: "DESKTOP-TEST01.corp.example", mdns_name: null, mdns_host: null, netbios: "DESKTOP-TEST01", smb: null, dns: null },
 });
 const mac = host("10.0.0.9", {
   vnc: 5900,
   ssh: 22,
   kind: "mac",
   name: "Studio Mac",
-  names: { rdp_certificate: null, mdns_name: "Studio Mac", mdns_host: "Studio-Mac.local", netbios: null, dns: null },
+  names: { rdp_certificate: null, mdns_name: "Studio Mac", mdns_host: "Studio-Mac.local", netbios: null, smb: null, dns: null },
   rfb_version: "003.889",
 });
 const nameless = host("10.0.0.200", { vnc: 5901 });
@@ -125,6 +131,73 @@ describe("results", () => {
     expect(progressText(1200, 65534, 1)).toBe("1,200 of 65,534 addresses checked, 1 computer found");
     expect(estimateDuration(254)).toBe("about 2 seconds");
     expect(estimateDuration(65534)).toBe("about 7 minutes");
+  });
+});
+
+describe("computers and other devices", () => {
+  it("never hides a Mac with only Screen Sharing or a PC with only Remote Desktop", () => {
+    const screenSharingOnly = host("10.0.0.31", { vnc: 5900, kind: "mac", rfb_version: "003.889" });
+    const rdpOnly = host("10.0.0.32", { rdp: 3389, kind: "windows" });
+    // Reported without lookups (past the description cap): kind unknown, but RDP is open.
+    const bareRdp = host("10.0.0.33", { rdp: 3389 });
+    // Screen Sharing whose greeting never arrived: could be a Mac.
+    const unreadVnc = host("10.0.0.34", { vnc: 5900 });
+    for (const h of [windows, mac, screenSharingOnly, rdpOnly, bareRdp, unreadVnc]) expect(isComputer(h), h.ip).toBe(true);
+  });
+
+  it("hides SSH-only devices and non-Apple VNC servers", () => {
+    const accessPoint = host("10.0.0.2", { ssh: 22, ssh_banner: "SSH-2.0-dropbear_2022.83" });
+    const linuxVnc = host("10.0.0.120", { vnc: 5900, rfb_version: "003.008" });
+    expect(isComputer(accessPoint)).toBe(false);
+    expect(isComputer(linuxVnc)).toBe(false);
+    expect(isComputer(nameless)).toBe(true);
+  });
+
+  it("labels the toggle with the hidden count", () => {
+    expect(hiddenToggleLabel(0)).toBe("Show all devices");
+    expect(hiddenToggleLabel(3)).toBe("Show all devices (3 hidden)");
+    expect(hiddenToggleLabel(1200)).toBe("Show all devices (1,200 hidden)");
+  });
+});
+
+describe("name sources", () => {
+  it("says where the best name came from", () => {
+    expect(nameSource(windows)).toBe("Remote Desktop certificate");
+    expect(nameSource(mac)).toBe("Bonjour");
+    expect(nameSource(nameless)).toBeNull();
+    const smbMac = host("10.0.0.31", {
+      vnc: 5900,
+      kind: "mac",
+      name: "Reception-Mac.local",
+      names: { ...mac.names, mdns_name: null, mdns_host: null, smb: "Reception-Mac.local", netbios: "RECEPTION-MAC" },
+    });
+    expect(nameSource(smbMac)).toBe("file sharing (SMB)");
+    expect(allNames(smbMac)).toEqual(["Reception-Mac.local", "RECEPTION-MAC"]);
+    expect(filterHosts([smbMac, windows], "reception")).toEqual([smbMac]);
+    expect(suggestedName(smbMac, "vnc")).toBe("Reception-Mac");
+    const dnsOnly = host("10.0.0.40", { rdp: 3389, name: "pc.example.internal", names: { ...windows.names, rdp_certificate: null, netbios: null, dns: "pc.example.internal" } });
+    expect(nameSource(dnsOnly)).toBe("DNS");
+  });
+});
+
+describe("rescanning one subnet", () => {
+  it("knows which subnet an address is in", () => {
+    expect(ipInCidr("10.0.0.9", "10.0.0.0/24")).toBe(true);
+    expect(ipInCidr("10.0.1.9", "10.0.0.0/24")).toBe(false);
+    expect(ipInCidr("10.0.1.9", "10.0.0.0/16")).toBe(true);
+    expect(ipInCidr("10.0.0.9", "10.0.0.9/32")).toBe(true);
+    expect(ipInCidr("10.0.0.9", "bad")).toBe(false);
+    expect(ipInCidr("bad", "10.0.0.0/24")).toBe(false);
+  });
+
+  it("replaces only the rescanned subnet's results", () => {
+    const other = host("10.0.1.5", { rdp: 3389, kind: "windows" });
+    const kept = withoutSubnets([windows, mac, other, nameless], ["10.0.0.0/24"]);
+    expect(kept).toEqual([other]);
+    expect(withoutSubnets([windows, other], [])).toEqual([windows, other]);
+    const renamed = { ...windows, name: "NEW-NAME" };
+    expect(upsertHost([windows, other], renamed)).toEqual([renamed, other]);
+    expect(upsertHost([other], windows)).toEqual([other, windows]);
   });
 });
 
