@@ -16,7 +16,7 @@ ironrdp-graphics = "0.9"
 ironrdp-input = "0.7"
 ironrdp-cliprdr = "0.7"
 ironrdp-dvc = "0.8"
-ironrdp-displaycontrol = "0.8"
+ironrdp-displaycontrol = "0.10"
 ironrdp-svc = "0.8"
 sha2 = "0.10"
 x509-cert = { version = "0.2", features = ["std"] }
