@@ -30,6 +30,8 @@ export class HomeView {
   private tailscale: TailscaleView | null = null;
   /** The last tailnet read, for the online dots; null when Tailscale is unavailable. */
   private tailnet: TailscaleStatus | null = null;
+  /** A tailnet read is in flight. */
+  private tailnetLoading = false;
   /** Each row's dot slot, by connection id (rebuilt with the list). */
   private dotSlots = new Map<string, HTMLElement>();
   private readonly list: HTMLElement;
@@ -103,11 +105,16 @@ export class HomeView {
 
   /** Read the tailnet for the online dots. Unavailable or failing: no dots, nothing said. */
   private async refreshTailnet(): Promise<void> {
+    // One read at a time: a slow Tailscale client must not pile up polls.
+    if (this.tailnetLoading) return;
+    this.tailnetLoading = true;
     try {
       const status = await this.host.platform.api.tailscaleStatus();
       this.tailnet = status.available ? status : null;
     } catch {
       this.tailnet = null;
+    } finally {
+      this.tailnetLoading = false;
     }
     this.renderDots();
   }
@@ -119,7 +126,7 @@ export class HomeView {
     for (const connection of this.host.store.connections) {
       const slot = this.dotSlots.get(connection.id);
       if (!slot) continue;
-      const device = deviceForConnection(connection, devices);
+      const device = deviceForConnection(connection, devices, this.tailnet?.magicDnsSuffix);
       if (!device) {
         slot.replaceChildren();
         continue;

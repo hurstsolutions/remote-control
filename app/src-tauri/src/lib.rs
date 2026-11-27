@@ -7,6 +7,7 @@ mod secrets;
 mod store;
 
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -73,6 +74,7 @@ fn kind_name(kind: ErrorKind) -> &'static str {
         ErrorKind::IdentityChanged => "identity_changed",
         ErrorKind::Protocol => "protocol",
         ErrorKind::Disconnected => "disconnected",
+        ErrorKind::NotTailscale => "not_tailscale",
         ErrorKind::Other => "other",
     }
 }
@@ -365,6 +367,7 @@ fn connect(
             let config = rc_rdp::RdpConfig {
                 host: connection.host.clone(),
                 port: connection.port,
+                resolved: None,
                 username: connection.username.clone(),
                 password: password.clone().into(),
                 domain: Some(connection.domain.clone()).filter(|d| !d.is_empty()),
@@ -375,10 +378,7 @@ fn connect(
                 nla: connection.nla,
                 clipboard: connection.share_clipboard,
             };
-            if let Err(e) = rc_rdp::spawn(config, io) {
-                lock(&state.sessions).remove(&session_id);
-                return Err(UiError::other(format!("cannot start the session thread: {e}")));
-            }
+            tauri::async_runtime::spawn(run_rdp(config, io));
         }
         Protocol::Vnc => {
             tauri::async_runtime::spawn(run_vnc(connection.clone(), password.clone(), pinned, io));
@@ -400,6 +400,24 @@ fn connect(
     tauri::async_runtime::spawn(pump.run(handle));
 
     Ok(session_id)
+}
+
+/// RDP on its own thread, to the checked addresses when the host is reached through Tailscale.
+async fn run_rdp(mut config: rc_rdp::RdpConfig, io: SessionIo) {
+    let events = io.events.clone();
+    match tailscale_route(&config.host, config.port).await {
+        Ok(route) => config.resolved = route,
+        Err(error) => {
+            warn!(kind = ?error.kind, detail = %error.detail, "connection stopped before it started");
+            let _ = events.send(SessionEvent::Closed { error: Some(error) }).await;
+            return;
+        }
+    }
+    if let Err(e) = rc_rdp::spawn(config, io) {
+        error!(error = %e, "cannot start the RDP session thread");
+        let error = SessionError::new(ErrorKind::Other, format!("cannot start the session thread: {e}"));
+        let _ = events.send(SessionEvent::Closed { error: Some(error) }).await;
+    }
 }
 
 /// VNC-level encryption for a Mac connection. Direct connections must be encrypted by Apple
@@ -457,6 +475,15 @@ async fn run_vnc(connection: Connection, password: String, pinned: Option<String
     }
     let allow_unverified = allow_unverified_sign_in(&connection, srp);
     let options = vnc_options(connection.ssh_tunnel, srp, allow_unverified);
+    let port = if connection.ssh_tunnel { connection.ssh_port } else { connection.port };
+    let route = match tailscale_route(&connection.host, port).await {
+        Ok(route) => route,
+        Err(error) => {
+            warn!(kind = ?error.kind, detail = %error.detail, "connection stopped before it started");
+            let _ = io.events.send(SessionEvent::Closed { error: Some(error) }).await;
+            return;
+        }
+    };
     if !connection.ssh_tunnel {
         if connection.allow_older_mac_sign_in && connection.srp_seen {
             info!("older Mac sign-in is allowed for this connection, but ignored: this Mac has signed in with SRP before");
@@ -467,7 +494,8 @@ async fn run_vnc(connection: Connection, password: String, pinned: Option<String
             allow_unverified,
             "VNC without an SSH tunnel: Apple Screen Sharing encryption is required"
         );
-        rc_vnc::connect_and_run_with_options(&connection.host, connection.port, config, options, io).await;
+        rc_vnc::connect_to_and_run_with_options(&connection.host, connection.port, route.as_deref(), config, options, io)
+            .await;
         return;
     }
 
@@ -481,6 +509,7 @@ async fn run_vnc(connection: Connection, password: String, pinned: Option<String
     let tunnel = rc_tunnel::open(rc_tunnel::TunnelConfig {
         ssh_host: connection.host.clone(),
         ssh_port: connection.ssh_port,
+        resolved: route,
         username: connection.username.clone(),
         password: password.into(),
         target_host: "127.0.0.1".to_owned(),
@@ -506,6 +535,94 @@ async fn run_vnc(connection: Connection, password: String, pinned: Option<String
             let _ = io.events.send(SessionEvent::Closed { error: Some(error) }).await;
         }
     }
+}
+
+// ── Tailscale routing ────────────────────────────────────────────────────────
+//
+// A MagicDNS name or Tailscale address is only reached through Tailscale. If Tailscale is not
+// running, "studio-mac.example.ts.net" could resolve through ordinary DNS to some other machine
+// (and 100.64.0.0/10 is also carrier-grade NAT space), which would then get the sign-in attempt.
+// So such a host is resolved once, every address must be a Tailscale address, and the session
+// connects to exactly those addresses: no second lookup. TLS (SNI, the CredSSP name), messages and
+// the saved pins still use the host as typed.
+
+/// The host as an IP address, if it is one (IPv6 with or without brackets).
+fn host_ip(host: &str) -> Option<IpAddr> {
+    let host = host.trim();
+    let host = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+    host.parse().ok()
+}
+
+/// Whether `host` must be reached through Tailscale: a name in `*.ts.net` or the tailnet's
+/// MagicDNS domain (`suffix`), or an address in 100.64.0.0/10 or fd7a:115c:a1e0::/48.
+fn is_tailscale_host(host: &str, suffix: Option<&str>) -> bool {
+    match host_ip(host) {
+        Some(ip) => rc_discover::tailscale::is_tailscale_ip(ip),
+        None => rc_discover::tailscale::in_magic_dns_domain(host.trim(), suffix),
+    }
+}
+
+/// Whether the tailnet's own MagicDNS suffix is needed to decide: a dotted name not already in
+/// `*.ts.net`. Other hosts never cost a run of the Tailscale client.
+fn needs_tailnet_suffix(host: &str) -> bool {
+    let host = host.trim();
+    host_ip(host).is_none() && host.contains('.') && !rc_discover::tailscale::in_magic_dns_domain(host, None)
+}
+
+/// Where to connect for `host`: `None` for a host not reached through Tailscale (it is resolved as
+/// usual), else the addresses it resolved to, every one a Tailscale address. `resolve` looks a
+/// name up (the system resolver; tests inject one). An address outside Tailscale's ranges stops
+/// the connection with [`ErrorKind::NotTailscale`].
+async fn check_tailscale_route<R, F>(
+    host: &str,
+    port: u16,
+    suffix: Option<&str>,
+    resolve: R,
+) -> Result<Option<Vec<SocketAddr>>, SessionError>
+where
+    R: FnOnce(String, u16) -> F,
+    F: std::future::Future<Output = std::io::Result<Vec<SocketAddr>>>,
+{
+    if !is_tailscale_host(host, suffix) {
+        return Ok(None);
+    }
+    if let Some(ip) = host_ip(host) {
+        // A Tailscale address needs no lookup.
+        return Ok(Some(vec![SocketAddr::new(ip, port)]));
+    }
+    let host = host.trim();
+    let addrs = resolve(host.to_owned(), port)
+        .await
+        .map_err(|e| SessionError::new(ErrorKind::Unreachable, format!("cannot resolve {host}: {e}")))?;
+    if addrs.is_empty() {
+        return Err(SessionError::new(ErrorKind::Unreachable, format!("{host} did not resolve to any address")));
+    }
+    if let Some(outside) = addrs.iter().find(|a| !rc_discover::tailscale::is_tailscale_ip(a.ip())) {
+        return Err(SessionError::new(
+            ErrorKind::NotTailscale,
+            format!(
+                "{host} resolved to {}, which isn't a Tailscale address. Is Tailscale running and connected on this \
+                 computer? The connection was stopped so it can't reach a different machine.",
+                outside.ip()
+            ),
+        ));
+    }
+    info!(host, addresses = ?addrs, "Tailscale host resolved to Tailscale addresses");
+    Ok(Some(addrs))
+}
+
+/// [`check_tailscale_route`] with the system resolver, reading the tailnet's MagicDNS suffix from
+/// the local Tailscale client only when it matters.
+async fn tailscale_route(host: &str, port: u16) -> Result<Option<Vec<SocketAddr>>, SessionError> {
+    let suffix = if needs_tailnet_suffix(host) {
+        rc_discover::tailscale::status().await.magic_dns_suffix
+    } else {
+        None
+    };
+    check_tailscale_route(host, port, suffix.as_deref(), |name, port| async move {
+        tokio::net::lookup_host((name.as_str(), port)).await.map(Iterator::collect)
+    })
+    .await
 }
 
 /// Forwards one session's events to its window channel.
@@ -1086,6 +1203,7 @@ mod tests {
             (ErrorKind::IdentityChanged, "identity_changed"),
             (ErrorKind::Protocol, "protocol"),
             (ErrorKind::Disconnected, "disconnected"),
+            (ErrorKind::NotTailscale, "not_tailscale"),
             (ErrorKind::Other, "other"),
         ];
         for (kind, name) in kinds {
@@ -1094,6 +1212,104 @@ mod tests {
             let json = serde_json::to_value(UiError::from(&SessionError::new(kind, "d"))).unwrap();
             assert_eq!(json, serde_json::json!({ "kind": name, "detail": "d" }));
         }
+    }
+
+    /// A resolver that answers from a table and counts its lookups; never real DNS.
+    fn fake_resolver(
+        answers: &'static [&'static str],
+        lookups: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> impl FnOnce(String, u16) -> std::future::Ready<std::io::Result<Vec<SocketAddr>>> {
+        let lookups = std::sync::Arc::clone(lookups);
+        move |_name, port| {
+            lookups.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Ok(answers.iter().map(|a| SocketAddr::new(a.parse().unwrap(), port)).collect()))
+        }
+    }
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(future)
+    }
+
+    #[test]
+    fn a_magicdns_name_resolving_outside_tailscale_is_refused() {
+        let lookups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for host in ["studio-mac.example.ts.net", "Studio-Mac.Example.TS.net.", "pc.other-tailnet.ts.net"] {
+            let error = block_on(check_tailscale_route(host, 3389, None, fake_resolver(&["100.64.0.2", "10.0.0.2"], &lookups)))
+                .unwrap_err();
+            assert_eq!(error.kind, ErrorKind::NotTailscale, "{host}");
+            assert!(error.detail.contains("resolved to 10.0.0.2, which isn't a Tailscale address"), "{}", error.detail);
+            assert_eq!(UiError::from(&error).kind, "not_tailscale");
+        }
+        // A name in the tailnet's own MagicDNS domain, given by the local client.
+        let error = block_on(check_tailscale_route(
+            "pc.corp.example",
+            5900,
+            Some("corp.example"),
+            fake_resolver(&["fd7a:115c:a1e0::5", "2001:db8::5"], &lookups),
+        ))
+        .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::NotTailscale);
+        assert!(error.detail.contains("2001:db8::5"));
+    }
+
+    #[test]
+    fn a_magicdns_name_resolving_inside_tailscale_connects_to_those_addresses() {
+        let lookups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let route = block_on(check_tailscale_route(
+            "studio-mac.example.ts.net",
+            22,
+            None,
+            fake_resolver(&["100.64.0.2", "fd7a:115c:a1e0::2"], &lookups),
+        ))
+        .unwrap();
+        assert_eq!(
+            route,
+            Some(vec!["100.64.0.2:22".parse().unwrap(), "[fd7a:115c:a1e0::2]:22".parse().unwrap()])
+        );
+        assert_eq!(lookups.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_tailscale_address_is_used_as_is() {
+        let lookups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for (host, expected) in [
+            ("100.64.0.2", "100.64.0.2:3389"),
+            ("fd7a:115c:a1e0::2", "[fd7a:115c:a1e0::2]:3389"),
+            ("[fd7a:115c:a1e0::2]", "[fd7a:115c:a1e0::2]:3389"),
+        ] {
+            let route = block_on(check_tailscale_route(host, 3389, None, fake_resolver(&["10.0.0.1"], &lookups))).unwrap();
+            assert_eq!(route, Some(vec![expected.parse().unwrap()]), "{host}");
+        }
+        assert_eq!(lookups.load(std::sync::atomic::Ordering::SeqCst), 0, "no lookup for an address");
+    }
+
+    #[test]
+    fn other_hosts_are_not_affected() {
+        let lookups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for host in ["10.0.0.5", "pc.example.com", "studio-mac", "pc.local", "100.128.0.1", "ts.net", "pc.ts.net.example.com"] {
+            let route =
+                block_on(check_tailscale_route(host, 3389, Some("example.ts.net"), fake_resolver(&["10.0.0.5"], &lookups)))
+                    .unwrap();
+            assert_eq!(route, None, "{host}");
+        }
+        assert_eq!(lookups.load(std::sync::atomic::Ordering::SeqCst), 0, "resolved later, as before");
+        // The tailnet's suffix is only read for dotted names outside *.ts.net.
+        assert!(needs_tailnet_suffix("pc.corp.example"));
+        for host in ["studio-mac.example.ts.net", "100.64.0.2", "10.0.0.5", "studio-mac", "fd7a:115c:a1e0::2"] {
+            assert!(!needs_tailnet_suffix(host), "{host}");
+        }
+    }
+
+    #[test]
+    fn a_failed_lookup_of_a_magicdns_name_is_unreachable() {
+        let error = block_on(check_tailscale_route("gone.example.ts.net", 3389, None, |_, _| {
+            std::future::ready(Err(std::io::Error::other("no such host")))
+        }))
+        .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Unreachable);
+        let lookups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let error = block_on(check_tailscale_route("empty.example.ts.net", 3389, None, fake_resolver(&[], &lookups))).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Unreachable);
     }
 
     #[test]

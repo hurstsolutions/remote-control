@@ -68,6 +68,11 @@ export type ErrorKind =
   | "identity_changed"
   | "protocol"
   | "disconnected"
+  /**
+   * The host is a MagicDNS name or Tailscale address, but it resolved to an address outside
+   * Tailscale's ranges (usually Tailscale is off on this computer), so nothing was sent.
+   */
+  | "not_tailscale"
   | "other"
   /** No password was supplied and none is saved: ask the user, then call connect again. */
   | "password_required";
@@ -248,7 +253,13 @@ export interface TailscaleStatus {
   reason: null | TailscaleUnavailableReason;
   /** With reason "error": what went wrong. */
   detail: string | null;
+  /** For display: the MagicDNS suffix, else the tailnet's name. */
   tailnet: string | null;
+  /**
+   * The MagicDNS suffix only ("example.ts.net"), when the client reports a valid one. Device
+   * names count only if they end in it or in ".ts.net".
+   */
+  magicDnsSuffix: string | null;
   selfName: string | null;
   devices: TailscaleDevice[];
 }

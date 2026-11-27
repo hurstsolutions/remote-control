@@ -67,16 +67,56 @@ export function cleanText(text: string | null | undefined, max = MAX_NAME_CHARS)
   return chars.length > max ? `${chars.slice(0, Math.max(max - 1, 1)).join("").trimEnd()}…` : joined;
 }
 
-/** A MagicDNS name without its trailing dot, lowercased; "" when absent or not a plain DNS name. */
-export function cleanDnsName(dnsName: string | null | undefined): string {
-  const text = (dnsName ?? "").trim().replace(/\.$/, "").toLowerCase();
-  return /^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(text) && text.length <= 253 ? text : "";
+/** Shared-in devices have a MagicDNS name in another tailnet's `<name>.ts.net`. */
+const TS_NET = "ts.net";
+
+/** A plain host name, lowercased and without a trailing dot, or "" (in step with rc_discover::tailscale::host_name). */
+function plainHostName(raw: string | null | undefined): string {
+  const text = (raw ?? "").trim().replace(/\.$/, "").toLowerCase();
+  if (text === "" || text.length > 253 || !/^[a-z0-9-]+(\.[a-z0-9-]+)*$/.test(text)) return "";
+  const labels = text.split(".");
+  if (labels.some((label) => label.length > 63 || label.startsWith("-"))) return "";
+  // Never an address: no all-digit last label (that covers dotted IPv4); IPv6 has ':' and fails above.
+  if (/^\d+$/.test(labels[labels.length - 1] ?? "")) return "";
+  return text;
 }
 
-/** Only a dotted-quad IPv4 address is used as one (and shown as one). */
+/**
+ * Whether a host name is in the tailnet's MagicDNS domain (`suffix`, e.g. "example.ts.net") or in
+ * another tailnet's (`*.ts.net`, shared-in devices), with a label before the suffix. In step with
+ * rc_discover::tailscale::in_magic_dns_domain.
+ */
+export function inMagicDnsDomain(name: string, suffix?: string | null): boolean {
+  const key = name.trim().replace(/\.$/, "").toLowerCase();
+  const under = (domain: string): boolean => {
+    const d = domain.trim().replace(/^\.+/, "").replace(/\.$/, "").toLowerCase();
+    return d !== "" && key.length > d.length + 1 && key.endsWith(`.${d}`);
+  };
+  return under(TS_NET) || (!!suffix && under(suffix));
+}
+
+/**
+ * A MagicDNS name without its trailing dot, lowercased; "" unless it is a plain host name (not an
+ * address) ending in the tailnet's MagicDNS suffix or in `.ts.net`. Without `suffix`, only
+ * `*.ts.net` names are kept.
+ */
+export function cleanDnsName(dnsName: string | null | undefined, suffix?: string | null): string {
+  const text = plainHostName(dnsName);
+  return text.includes(".") && inMagicDnsDomain(text, suffix) ? text : "";
+}
+
+/** Whether a dotted-quad IPv4 address is in Tailscale's range, 100.64.0.0/10. */
+export function isTailscaleIpv4(ip: string): boolean {
+  const match = /^100\.(\d{1,3})\.\d{1,3}\.\d{1,3}$/.exec(ip);
+  const second = match ? Number(match[1]) : -1;
+  return second >= 64 && second <= 127;
+}
+
+/** Only a dotted-quad IPv4 address in Tailscale's range (100.64.0.0/10) is used (and shown) as one. */
 export function cleanIpv4(ip: string | null | undefined): string {
   const text = (ip ?? "").trim();
-  return /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/.test(text) ? text : "";
+  const dottedQuad = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/.test(text);
+  return dottedQuad && isTailscaleIpv4(text) ? text : "";
 }
 
 /** Windows or Mac from Tailscale's OS label ("windows", "macOS"); everything else is unknown. */
@@ -138,23 +178,26 @@ function normalizeHost(host: string): string {
   return host.trim().toLowerCase().replace(/\.$/, "");
 }
 
-/** Whether a saved host is this device's Tailscale IPv4 or MagicDNS name. Names alone never count. */
-export function deviceMatchesHost(device: TailscaleDevice, host: string): boolean {
+/**
+ * Whether a saved host is this device's Tailscale IPv4 or MagicDNS name. Names alone never count.
+ * `suffix` is the tailnet's MagicDNS suffix (TailscaleStatus.magicDnsSuffix).
+ */
+export function deviceMatchesHost(device: TailscaleDevice, host: string, suffix?: string | null): boolean {
   const key = normalizeHost(host);
   if (key === "") return false;
   const ip = cleanIpv4(device.ipv4);
-  const dns = cleanDnsName(device.dnsName);
+  const dns = cleanDnsName(device.dnsName, suffix);
   return (ip !== "" && key === ip) || (dns !== "" && key === dns);
 }
 
 /** Saved connections that point at this device by address (IPv4 or MagicDNS name). */
-export function savedForDevice(device: TailscaleDevice, connections: Connection[]): Connection[] {
-  return connections.filter((c) => deviceMatchesHost(device, c.host));
+export function savedForDevice(device: TailscaleDevice, connections: Connection[], suffix?: string | null): Connection[] {
+  return connections.filter((c) => deviceMatchesHost(device, c.host, suffix));
 }
 
 /** The tailnet device a saved connection points at, if any. */
-export function deviceForConnection(connection: Connection, devices: TailscaleDevice[]): TailscaleDevice | null {
-  return devices.find((d) => deviceMatchesHost(d, connection.host)) ?? null;
+export function deviceForConnection(connection: Connection, devices: TailscaleDevice[], suffix?: string | null): TailscaleDevice | null {
+  return devices.find((d) => deviceMatchesHost(d, connection.host, suffix)) ?? null;
 }
 
 /** Tailscale's "never seen" is year 1; anything that old, or unparsable, is no date at all. */
@@ -212,16 +255,16 @@ export interface HostChoices {
   ip: string;
 }
 
-export function hostChoices(device: TailscaleDevice): HostChoices {
-  return { dnsName: cleanDnsName(device.dnsName), ip: cleanIpv4(device.ipv4) };
+export function hostChoices(device: TailscaleDevice, suffix?: string | null): HostChoices {
+  return { dnsName: cleanDnsName(device.dnsName, suffix), ip: cleanIpv4(device.ipv4) };
 }
 
 /**
  * A connection name from the device name. Like "Find computers", a name a saved connection
  * already uses gets the address added, so another tailnet member can't make a look-alike.
  */
-export function suggestedDeviceName(device: TailscaleDevice, saved: Connection[] = []): string {
-  const choices = hostChoices(device);
+export function suggestedDeviceName(device: TailscaleDevice, saved: Connection[] = [], suffix?: string | null): string {
+  const choices = hostChoices(device, suffix);
   const fallback = choices.dnsName.split(".")[0] || choices.ip;
   const name = cleanText(device.name) || fallback;
   const key = name.toLowerCase();
@@ -238,10 +281,10 @@ export function suggestedDeviceName(device: TailscaleDevice, saved: Connection[]
  * Screen Sharing, the host is the MagicDNS name (the IP when there is none). The user enters the
  * username. Nothing is known about the machine yet, so clipboard sharing starts off.
  */
-export function prefillFromDevice(device: TailscaleDevice, saved: Connection[] = []): Connection {
+export function prefillFromDevice(device: TailscaleDevice, saved: Connection[] = [], suffix?: string | null): Connection {
   const connection = blankConnection(protocolForDevice(device));
-  const choices = hostChoices(device);
-  connection.name = suggestedDeviceName(device, saved);
+  const choices = hostChoices(device, suffix);
+  connection.name = suggestedDeviceName(device, saved, suffix);
   connection.host = choices.dnsName || choices.ip;
   connection.share_clipboard = false;
   return connection;

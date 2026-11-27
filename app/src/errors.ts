@@ -19,6 +19,7 @@ const KINDS: readonly ErrorKind[] = [
   "identity_changed",
   "protocol",
   "disconnected",
+  "not_tailscale",
   "other",
   "password_required",
 ];
@@ -190,6 +191,15 @@ export function describeError(error: SessionError, target: Target): ErrorText {
         hints: [
           "The remote computer may have gone to sleep, restarted, or the network dropped.",
           windows ? "Someone else signing in to the PC also ends your session." : "Reconnect to carry on where you left off.",
+        ],
+      };
+    case "not_tailscale":
+      return {
+        headline: `${host} isn't reachable through Tailscale right now`,
+        hints: [
+          "This address belongs to your tailnet, but it pointed to a computer outside Tailscale, so the connection was stopped before anything was sent. Otherwise it could have reached a different machine.",
+          "Check that Tailscale is running and connected on this computer, then reconnect.",
+          "If it keeps happening, open the Tailscale app and check that this computer is signed in to the right tailnet.",
         ],
       };
     case "password_required":

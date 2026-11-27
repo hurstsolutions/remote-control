@@ -304,11 +304,31 @@ pub async fn connect_and_run(host: &str, port: u16, config: VncConfig, io: Sessi
 /// [`connect_and_run`] with explicit [`VncOptions`]. Direct connections to a Mac should use
 /// `EncryptionPolicy::Required`.
 pub async fn connect_and_run_with_options(host: &str, port: u16, config: VncConfig, options: VncOptions, io: SessionIo) {
-    info!(host, port, encryption = ?options.encryption, "connecting to VNC server");
+    connect_to_and_run_with_options(host, port, None, config, options, io).await
+}
+
+/// [`connect_and_run_with_options`], connecting to `resolved` (addresses `host` already resolved
+/// to, which the caller checked) instead of looking `host` up again. `host` is then only shown in
+/// messages. `None` resolves `host`.
+pub async fn connect_to_and_run_with_options(
+    host: &str,
+    port: u16,
+    resolved: Option<&[std::net::SocketAddr]>,
+    config: VncConfig,
+    options: VncOptions,
+    io: SessionIo,
+) {
+    info!(host, port, ?resolved, encryption = ?options.encryption, "connecting to VNC server");
     if io.events.send(SessionEvent::Status(format!("Connecting to {host}:{port}"))).await.is_err() {
         return;
     }
-    let connect = tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect((host, port))).await;
+    let tcp = async {
+        match resolved {
+            Some(addrs) => tokio::net::TcpStream::connect(addrs).await,
+            None => tokio::net::TcpStream::connect((host, port)).await,
+        }
+    };
+    let connect = tokio::time::timeout(CONNECT_TIMEOUT, tcp).await;
     let detail = match connect {
         Ok(Ok(stream)) => {
             if let Err(e) = stream.set_nodelay(true) {

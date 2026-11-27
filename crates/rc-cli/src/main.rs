@@ -126,6 +126,7 @@ async fn main() -> anyhow::Result<()> {
             let config = rc_rdp::RdpConfig {
                 host: common.host.clone(),
                 port,
+                resolved: None,
                 username: common.user.clone(),
                 password: common.password.clone().into(),
                 domain,
@@ -159,6 +160,7 @@ async fn main() -> anyhow::Result<()> {
                 let tunnel = rc_tunnel::open(rc_tunnel::TunnelConfig {
                     ssh_host: common.host.clone(),
                     ssh_port,
+                    resolved: None,
                     username: common.user.clone(),
                     password: common.password.clone().into(),
                     target_host: "127.0.0.1".to_owned(),

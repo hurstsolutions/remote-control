@@ -2,7 +2,7 @@
 // on subnets; this mirrors its rules for instant feedback.
 import type { Connection, FoundHost, HostKind, Protocol } from "../ipc";
 import { DEFAULT_SSH_PORT, blankConnection } from "../state";
-import { cleanDnsName, cleanText, osKind } from "./tailscale-logic";
+import { cleanDnsName, cleanText, isTailscaleIpv4, osKind } from "./tailscale-logic";
 
 export const MIN_PREFIX = 16;
 export const WARN_PREFIX = 22;
@@ -125,8 +125,11 @@ export function sortHosts(hosts: FoundHost[], key: SortKey, ascending: boolean):
   });
 }
 
-/** Every name a host is known by, best first, without duplicates. */
-export function allNames(host: FoundHost): string[] {
+/**
+ * Every name a host is known by, best first, without duplicates. `suffix` is the tailnet's
+ * MagicDNS suffix, for Tailscale results.
+ */
+export function allNames(host: FoundHost, suffix?: string | null): string[] {
   const names = [
     host.name,
     host.names.rdp_certificate,
@@ -137,7 +140,7 @@ export function allNames(host: FoundHost): string[] {
     host.names.dns,
     // Last: what the tailnet calls the device (its owner chose the name; cleaned for display).
     cleanText(host.tailscaleName),
-    cleanDnsName(host.tailscaleDnsName),
+    tailscaleDnsName(host, suffix),
   ];
   const seen = new Set<string>();
   const out: string[] = [];
@@ -255,15 +258,24 @@ function normalizeHost(host: string): string {
  * Saved connections that point at this machine's address. Only the address counts: the names a
  * scan finds are whatever the machine (or anyone on the network) chose to announce.
  */
-export function savedMatches(host: FoundHost, connections: Connection[]): Connection[] {
-  return connections.filter((c) => isAddressOf(host, c.host));
+export function savedMatches(host: FoundHost, connections: Connection[], suffix?: string | null): Connection[] {
+  return connections.filter((c) => isAddressOf(host, c.host, suffix));
+}
+
+/**
+ * A Tailscale result's MagicDNS name, or "": only a name in the tailnet's MagicDNS domain (or
+ * `*.ts.net`), and only for a result whose address is a Tailscale address, so a name is never
+ * tied to an address outside the tailnet.
+ */
+export function tailscaleDnsName(host: FoundHost, suffix?: string | null): string {
+  return isTailscaleIpv4(host.ip) ? cleanDnsName(host.tailscaleDnsName, suffix) : "";
 }
 
 /** The machine's IP, or (Tailscale results) its MagicDNS name, which is an address too. */
-function isAddressOf(host: FoundHost, saved: string): boolean {
+function isAddressOf(host: FoundHost, saved: string, suffix?: string | null): boolean {
   const key = normalizeHost(saved);
   if (key === host.ip) return true;
-  const dns = cleanDnsName(host.tailscaleDnsName);
+  const dns = tailscaleDnsName(host, suffix);
   return dns !== "" && key === dns;
 }
 

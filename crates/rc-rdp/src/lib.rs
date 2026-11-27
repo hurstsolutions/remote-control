@@ -53,8 +53,13 @@ use crate::clipboard::{ClipEvent, TextClipboard};
 
 #[derive(Clone)]
 pub struct RdpConfig {
+    /// The name (or address) to connect to. Also the TLS SNI name and the CredSSP server name.
     pub host: String,
     pub port: u16,
+    /// Addresses `host` already resolved to (and the caller checked). When set, the session
+    /// connects to these instead of looking `host` up again; `host` is still used for TLS and
+    /// sign-in. `None`: resolve `host` when connecting.
+    pub resolved: Option<Vec<SocketAddr>>,
     pub username: String,
     /// Wiped from memory when dropped; the session drops its copy once signed in.
     pub password: Zeroizing<String>,
@@ -77,6 +82,7 @@ impl std::fmt::Debug for RdpConfig {
         f.debug_struct("RdpConfig")
             .field("host", &self.host)
             .field("port", &self.port)
+            .field("resolved", &self.resolved)
             .field("username", &self.username)
             .field("password", &"<redacted>")
             .field("domain", &self.domain)
@@ -168,10 +174,13 @@ async fn connect(
 ) -> Result<(ConnectionResult, Framed), SessionError> {
     status(events.clone(), &format!("Connecting to {}:{}", config.host, config.port)).await;
 
-    let tcp = tokio::time::timeout(
-        Duration::from_secs(10),
-        TcpStream::connect((config.host.as_str(), config.port)),
-    )
+    let connect = async {
+        match &config.resolved {
+            Some(addrs) => TcpStream::connect(addrs.as_slice()).await,
+            None => TcpStream::connect((config.host.as_str(), config.port)).await,
+        }
+    };
+    let tcp = tokio::time::timeout(Duration::from_secs(10), connect)
     .await
     .map_err(|_| {
         SessionError::new(
@@ -860,6 +869,7 @@ mod tests {
         RdpConfig {
             host: "pc.example".to_owned(),
             port: 3389,
+            resolved: None,
             username: "user".to_owned(),
             password: "secret".to_owned().into(),
             domain: None,

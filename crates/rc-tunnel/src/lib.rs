@@ -21,8 +21,12 @@ use zeroize::Zeroizing;
 
 #[derive(Clone)]
 pub struct TunnelConfig {
+    /// The SSH server's name or address. Used for messages, and resolved when `resolved` is `None`.
     pub ssh_host: String,
     pub ssh_port: u16,
+    /// Addresses `ssh_host` already resolved to (and the caller checked): connect to these instead
+    /// of looking the name up again. The host key is checked against the pin either way.
+    pub resolved: Option<Vec<SocketAddr>>,
     pub username: String,
     /// Wiped from memory when dropped; `open` drops its copy once signed in.
     pub password: Zeroizing<String>,
@@ -116,7 +120,7 @@ pub async fn open(mut config: TunnelConfig) -> Result<Tunnel, SessionError> {
     };
 
     info!(host = %config.ssh_host, port = config.ssh_port, "opening SSH tunnel");
-    let socket = connect_tcp(&config.ssh_host, config.ssh_port).await?;
+    let socket = connect_tcp(&config.ssh_host, config.ssh_port, config.resolved.as_deref()).await?;
     let connect = client::connect_stream(ssh_config, socket, handler);
     let result = tokio::time::timeout(Duration::from_secs(10), connect).await;
     let host_key = seen.lock().ok().and_then(|s| s.clone());
@@ -192,9 +196,14 @@ pub async fn open(mut config: TunnelConfig) -> Result<Tunnel, SessionError> {
 /// Open the TCP connection to the SSH port. A name that does not resolve is
 /// [`ErrorKind::Unreachable`]; a resolved address whose SSH port refuses or does not answer is
 /// [`ErrorKind::TunnelUnavailable`], which on a Mac almost always means Remote Login is off.
-async fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, SessionError> {
-    let addrs: Vec<SocketAddr> = match tokio::net::lookup_host((host, port)).await {
-        Ok(addrs) => addrs.collect(),
+/// `resolved` addresses are used as they are, without another lookup.
+async fn connect_tcp(host: &str, port: u16, resolved: Option<&[SocketAddr]>) -> Result<TcpStream, SessionError> {
+    let lookup = match resolved {
+        Some(addrs) => Ok(addrs.to_vec()),
+        None => tokio::net::lookup_host((host, port)).await.map(Iterator::collect),
+    };
+    let addrs: Vec<SocketAddr> = match lookup {
+        Ok(addrs) => addrs,
         Err(error) => {
             return Err(SessionError::new(
                 ErrorKind::Unreachable,

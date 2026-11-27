@@ -169,10 +169,11 @@ export class TailscaleView {
   private row(device: TailscaleDevice, now: number): HTMLElement {
     const name = cleanText(device.name);
     const fullName = cleanText(device.name, 256);
-    const dns = cleanDnsName(device.dnsName);
+    const suffix = this.status?.magicDnsSuffix;
+    const dns = cleanDnsName(device.dnsName, suffix);
     const ip = cleanIpv4(device.ipv4);
     const kind = osKind(device.os);
-    const saved = savedForDevice(device, this.host.store.connections);
+    const saved = savedForDevice(device, this.host.store.connections, suffix);
     const details = [cleanText(dns, MAX_DNS_CHARS), ip].filter(Boolean);
     const seen = device.online ? null : lastSeenText(device, now);
     const tags = displayTags(device);
@@ -214,8 +215,9 @@ export class TailscaleView {
   }
 
   private async add(device: TailscaleDevice): Promise<void> {
-    const template = prefillFromDevice(device, this.host.store.connections);
-    const saved = await openEditor(this.host.platform, null, template, { tailscaleHosts: hostChoices(device) });
+    const suffix = this.status?.magicDnsSuffix;
+    const template = prefillFromDevice(device, this.host.store.connections, suffix);
+    const saved = await openEditor(this.host.platform, null, template, { tailscaleHosts: hostChoices(device, suffix) });
     if (saved) await this.host.store.reload();
   }
 }

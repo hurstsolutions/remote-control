@@ -10,10 +10,11 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use serde::de::{DeserializeOwned, Deserializer};
 use serde::{Deserialize, Serialize};
@@ -24,11 +25,16 @@ use crate::{clean, is_unsafe_char, HostTarget, TailscaleLabel};
 /// At most this many devices (this computer included) are reported.
 pub const MAX_DEVICES: usize = 4096;
 /// More standard output than this is refused.
-pub const MAX_STDOUT: usize = 8 * 1024 * 1024;
+pub const MAX_STDOUT: usize = 4 * 1024 * 1024;
 /// Standard error kept; anything beyond is read and dropped.
 const MAX_STDERR: usize = 16 * 1024;
 /// How long `tailscale status` may take before it is killed.
 pub const TIMEOUT: Duration = Duration::from_secs(3);
+/// How long one reading of `tailscale status` is reused. Several views poll it, and a connect to a
+/// MagicDNS name reads it too: within this time they share one run of the client.
+pub const CACHE_TTL: Duration = Duration::from_secs(3);
+/// MagicDNS names of shared-in devices end in another tailnet's `<name>.ts.net`.
+const TS_NET: &str = "ts.net";
 /// Tags kept per device.
 const MAX_TAGS: usize = 64;
 /// Longest DNS name kept (the DNS limit).
@@ -58,8 +64,11 @@ pub struct TailscaleStatus {
     pub available: bool,
     pub reason: Option<Reason>,
     pub detail: Option<String>,
-    /// The MagicDNS suffix, e.g. "example.ts.net" (else the tailnet's name).
+    /// The MagicDNS suffix, e.g. "example.ts.net" (else the tailnet's name). For display.
     pub tailnet: Option<String>,
+    /// The MagicDNS suffix only ("example.ts.net"), lowercase, when the client reports a valid
+    /// one. Device names must end in it (or in `.ts.net`).
+    pub magic_dns_suffix: Option<String>,
     pub self_name: Option<String>,
     /// This computer first, then the others by name.
     pub devices: Vec<Device>,
@@ -72,6 +81,7 @@ impl TailscaleStatus {
             reason: Some(reason),
             detail: detail.map(str::to_owned),
             tailnet: None,
+            magic_dns_suffix: None,
             self_name: None,
             devices: Vec::new(),
         }
@@ -85,12 +95,14 @@ pub struct Device {
     pub id: String,
     pub name: String,
     /// MagicDNS name without the trailing dot, e.g. "studio-mac.example.ts.net". Only letters,
-    /// digits, '-' and '.', so it can be used as a host name.
+    /// digits, '-' and '.', so it can be used as a host name; never an IP address, and always
+    /// ending in the tailnet's MagicDNS suffix or `.ts.net`.
     pub dns_name: Option<String>,
     /// As Tailscale reports it: "windows", "macOS", "linux", "iOS", "android", ...
     pub os: Option<String>,
+    /// Only an address in 100.64.0.0/10.
     pub ipv4: Option<String>,
-    /// For display only; scans use IPv4.
+    /// Only an address in fd7a:115c:a1e0::/48. For display only; scans use IPv4.
     pub ipv6: Option<String>,
     pub online: bool,
     /// RFC 3339, or None when never seen / not reported.
@@ -105,11 +117,7 @@ pub struct Device {
 pub fn candidate_paths() -> Vec<PathBuf> {
     #[cfg(windows)]
     {
-        let program_files = std::env::var_os("ProgramFiles")
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"));
-        vec![program_files.join("Tailscale").join("tailscale.exe")]
+        vec![windows_program_files().join("Tailscale").join("tailscale.exe")]
     }
     #[cfg(target_os = "macos")]
     {
@@ -122,6 +130,47 @@ pub fn candidate_paths() -> Vec<PathBuf> {
     {
         ["/usr/bin/tailscale", "/usr/sbin/tailscale", "/usr/local/bin/tailscale"].into_iter().map(PathBuf::from).collect()
     }
+}
+
+/// The Program Files folder as Windows knows it (the 64-bit one in a 64-bit process), asked of the
+/// shell rather than read from the `ProgramFiles` environment variable, which any parent process
+/// can set. Falls back to `%SystemDrive%\Program Files`, then `C:\Program Files`.
+#[cfg(windows)]
+fn windows_program_files() -> PathBuf {
+    use std::os::windows::ffi::OsStringExt as _;
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{FOLDERID_ProgramFiles, SHGetKnownFolderPath};
+
+    let mut raw: windows_sys::core::PWSTR = std::ptr::null_mut();
+    // SAFETY: valid GUID pointer, no flags, the current user's token (null), and an out pointer the
+    // shell fills with a NUL-terminated string allocated with CoTaskMemAlloc (or leaves null).
+    let hr = unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramFiles, 0, std::ptr::null_mut(), &mut raw) };
+    let mut found = None;
+    if !raw.is_null() {
+        if hr >= 0 {
+            // SAFETY: on success `raw` points to a NUL-terminated UTF-16 string.
+            let wide = unsafe {
+                let mut len = 0usize;
+                while *raw.add(len) != 0 {
+                    len += 1;
+                }
+                std::slice::from_raw_parts(raw, len)
+            };
+            found = Some(PathBuf::from(std::ffi::OsString::from_wide(wide)));
+        }
+        // SAFETY: the buffer came from SHGetKnownFolderPath and must be freed even on failure.
+        unsafe { CoTaskMemFree(raw.cast_const().cast()) };
+    }
+    if let Some(path) = found.filter(|p| p.is_absolute()) {
+        return path;
+    }
+    tracing::debug!(hr, "tailscale: SHGetKnownFolderPath(ProgramFiles) failed; using the system drive");
+    // Only a plain drive letter ("C:") is taken from the environment, never a network path.
+    let drive = std::env::var("SystemDrive").ok().filter(|d| {
+        let b = d.as_bytes();
+        b.len() == 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
+    });
+    PathBuf::from(format!("{}\\Program Files", drive.as_deref().unwrap_or("C:")))
 }
 
 /// The first candidate that is an absolute path to a regular file (symbolic links followed).
@@ -221,18 +270,88 @@ async fn read_dropping_excess(mut stream: impl AsyncRead + Unpin, max: usize) ->
     }
 }
 
-/// The tailnet as the local Tailscale client sees it.
-pub async fn status() -> TailscaleStatus {
-    status_with(&candidate_paths(), RunLimits::default()).await
+/// One reading of the status, reused for [`CACHE_TTL`]. Callers that arrive while it is being
+/// read wait for that reading instead of starting another (single flight).
+pub struct StatusCache {
+    slot: tokio::sync::Mutex<Option<(Instant, TailscaleStatus)>>,
 }
 
-/// [`status`] with the candidate paths and limits given (tests).
+impl StatusCache {
+    pub const fn new() -> Self {
+        Self { slot: tokio::sync::Mutex::const_new(None) }
+    }
+
+    /// The cached status if it is younger than `ttl`, else the one `read` gives (then cached).
+    pub async fn get<F>(&self, ttl: Duration, read: impl FnOnce() -> F) -> TailscaleStatus
+    where
+        F: std::future::Future<Output = TailscaleStatus>,
+    {
+        let mut slot = self.slot.lock().await;
+        if let Some((at, status)) = slot.as_ref() {
+            if at.elapsed() < ttl {
+                return status.clone();
+            }
+        }
+        let status = read().await;
+        *slot = Some((Instant::now(), status.clone()));
+        status
+    }
+}
+
+impl Default for StatusCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+static CACHE: StatusCache = StatusCache::new();
+
+/// The tailnet as the local Tailscale client sees it, at most [`CACHE_TTL`] old.
+pub async fn status() -> TailscaleStatus {
+    let candidates = candidate_paths();
+    CACHE.get(CACHE_TTL, || status_with(&candidates, RunLimits::default())).await
+}
+
+/// What the last status said, for logging changes only.
+type Summary = (bool, Option<Reason>, Option<String>);
+static LAST_SUMMARY: Mutex<Option<Summary>> = Mutex::new(None);
+
+/// Whether a status says something different from the last one logged (availability, reason or
+/// detail). Updates the record.
+fn status_changed(last: &Mutex<Option<Summary>>, status: &TailscaleStatus) -> bool {
+    let summary = (status.available, status.reason, status.detail.clone());
+    let mut last = last.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let changed = last.as_ref() != Some(&summary);
+    *last = Some(summary);
+    changed
+}
+
+/// Info when the state changes, debug otherwise: the views poll every 30 seconds.
+fn log_status(status: &TailscaleStatus) {
+    let changed = status_changed(&LAST_SUMMARY, status);
+    match (status.available, changed) {
+        (true, true) => tracing::info!(devices = status.devices.len(), "tailscale: status read"),
+        (true, false) => tracing::debug!(devices = status.devices.len(), "tailscale: status read"),
+        (false, true) => tracing::info!(reason = ?status.reason, detail = ?status.detail, "tailscale: not available"),
+        (false, false) => tracing::debug!(reason = ?status.reason, detail = ?status.detail, "tailscale: not available"),
+    }
+    if status.available {
+        tracing::debug!(devices = ?status.devices, "tailscale: devices");
+    }
+}
+
+/// [`status`] with the candidate paths and limits given (tests). Not cached.
 pub async fn status_with(candidates: &[PathBuf], limits: RunLimits) -> TailscaleStatus {
+    let status = read_status(candidates, limits).await;
+    log_status(&status);
+    status
+}
+
+async fn read_status(candidates: &[PathBuf], limits: RunLimits) -> TailscaleStatus {
     let Some(binary) = find_binary(candidates) else {
-        tracing::info!("tailscale: client not installed");
         return TailscaleStatus::unavailable(Reason::NotInstalled, None);
     };
-    let status = match run_status_json(&binary, limits).await {
+    match run_status_json(&binary, limits).await {
         Ok(stdout) => parse_status(&stdout)
             .unwrap_or_else(|| TailscaleStatus::unavailable(Reason::Error, Some("Tailscale gave an answer RemoteControl cannot read."))),
         // With --json the client prints the status and exits 0 whatever the state, but take
@@ -242,25 +361,16 @@ pub async fn status_with(candidates: &[PathBuf], limits: RunLimits) -> Tailscale
             TailscaleStatus::unavailable(Reason::NotInstalled, None)
         }
         Err(RunError::Spawn(error)) => {
-            tracing::warn!(%error, binary = %binary.display(), "tailscale: cannot run the client");
+            tracing::debug!(%error, binary = %binary.display(), "tailscale: cannot run the client");
             TailscaleStatus::unavailable(Reason::Error, Some("The Tailscale client could not be started."))
         }
         Err(RunError::TimedOut) => {
-            tracing::warn!("tailscale: status timed out");
             TailscaleStatus::unavailable(Reason::Error, Some("Tailscale did not answer within 3 seconds."))
         }
         Err(RunError::TooLarge) => {
-            tracing::warn!("tailscale: status output too large");
             TailscaleStatus::unavailable(Reason::Error, Some("Tailscale's answer was too large."))
         }
-    };
-    if status.available {
-        tracing::info!(devices = status.devices.len(), "tailscale: status read");
-        tracing::debug!(devices = ?status.devices, "tailscale: devices");
-    } else {
-        tracing::info!(reason = ?status.reason, detail = ?status.detail, "tailscale: not available");
     }
-    status
 }
 
 /// A failed run that printed no status: the service is not running, or something else.
@@ -366,15 +476,22 @@ pub fn parse_status(json: &[u8]) -> Option<TailscaleStatus> {
         }
         _ => {}
     }
-    let tailnet = raw.current_tailnet.as_ref().map(|t| t.magic_dns_suffix.clone()).and_then(non_empty)
-        .or_else(|| non_empty(raw.magic_dns_suffix.clone()))
+    let reported_suffix = raw
+        .current_tailnet
+        .as_ref()
+        .map(|t| t.magic_dns_suffix.clone())
+        .and_then(non_empty)
+        .or_else(|| non_empty(raw.magic_dns_suffix.clone()));
+    let magic_dns_suffix = reported_suffix.as_deref().and_then(magic_dns_suffix);
+    let tailnet = reported_suffix
         .or_else(|| raw.current_tailnet.as_ref().map(|t| t.name.clone()).and_then(non_empty))
         .and_then(|t| clean(Some(t)));
+    let suffix = magic_dns_suffix.as_deref();
 
     let mut devices = Vec::new();
     let mut self_name = None;
     if let Some(me) = raw.self_ {
-        let device = device(me, "self", true);
+        let device = device(me, "self", true, suffix);
         self_name = Some(device.name.clone());
         devices.push(device);
     }
@@ -382,28 +499,29 @@ pub fn parse_status(json: &[u8]) -> Option<TailscaleStatus> {
         .peer
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|(key, value)| Some(device(RawPeer::deserialize(value).ok()?, &key, false)))
+        .filter_map(|(key, value)| Some(device(RawPeer::deserialize(value).ok()?, &key, false, suffix)))
         .take(MAX_DEVICES.saturating_sub(devices.len()))
         .collect();
     peers.sort_by_cached_key(|d| d.name.to_lowercase());
     devices.extend(peers);
-    Some(TailscaleStatus { available: true, reason: None, detail: None, tailnet, self_name, devices })
+    Some(TailscaleStatus { available: true, reason: None, detail: None, tailnet, magic_dns_suffix, self_name, devices })
 }
 
 fn non_empty(text: String) -> Option<String> {
     (!text.trim().is_empty()).then_some(text)
 }
 
-fn device(raw: RawPeer, key: &str, is_self: bool) -> Device {
+fn device(raw: RawPeer, key: &str, is_self: bool, suffix: Option<&str>) -> Device {
     let addresses: Vec<IpAddr> = raw
         .tailscale_ips
         .unwrap_or_default()
         .iter()
         .filter_map(|v| v.as_str()?.trim().parse().ok())
         .collect();
-    let ipv4 = addresses.iter().find(|a| a.is_ipv4()).map(ToString::to_string);
-    let ipv6 = addresses.iter().find(|a| a.is_ipv6()).map(ToString::to_string);
-    let dns_name = dns_name(&raw.dns_name);
+    // Only addresses in Tailscale's own ranges: anything else could point outside the tailnet.
+    let ipv4 = addresses.iter().find(|a| matches!(a, IpAddr::V4(v4) if is_tailscale_ipv4(*v4))).map(ToString::to_string);
+    let ipv6 = addresses.iter().find(|a| matches!(a, IpAddr::V6(v6) if is_tailscale_ipv6(*v6))).map(ToString::to_string);
+    let dns_name = dns_name(&raw.dns_name, suffix);
     let name = clean(Some(raw.host_name))
         .or_else(|| dns_name.as_deref().and_then(|d| d.split('.').next()).map(str::to_owned))
         .or_else(|| ipv4.clone())
@@ -430,15 +548,43 @@ fn device(raw: RawPeer, key: &str, is_self: bool) -> Device {
     }
 }
 
-/// A MagicDNS name usable as a host name: trailing dot dropped, ASCII letters, digits, '-' and
-/// '.' only, no empty label, at most 253 characters. Anything else is not kept.
-fn dns_name(raw: &str) -> Option<String> {
-    let name = raw.trim().strip_suffix('.').unwrap_or(raw.trim());
+/// A plain host name: trailing dot dropped, lowercase, ASCII letters, digits, '-' and '.' only,
+/// no empty label, at most 253 characters, and not an address (the last label is not all digits,
+/// and it does not parse as an IP).
+fn host_name(raw: &str) -> Option<String> {
+    let name = raw.trim().strip_suffix('.').unwrap_or(raw.trim()).to_ascii_lowercase();
     let valid = !name.is_empty()
         && name.len() <= MAX_DNS_NAME
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
-        && name.split('.').all(|label| !label.is_empty() && label.len() <= 63 && !label.starts_with('-'));
-    valid.then(|| name.to_ascii_lowercase())
+        && name.split('.').all(|label| !label.is_empty() && label.len() <= 63 && !label.starts_with('-'))
+        && !name.rsplit('.').next().unwrap_or("").bytes().all(|b| b.is_ascii_digit())
+        && name.parse::<IpAddr>().is_err();
+    valid.then_some(name)
+}
+
+/// The tailnet's MagicDNS suffix, if it is a host name of at least two labels.
+fn magic_dns_suffix(raw: &str) -> Option<String> {
+    host_name(raw).filter(|s| s.contains('.'))
+}
+
+/// Whether a host name is in the tailnet's MagicDNS domain (`<suffix>`) or another tailnet's
+/// (`.ts.net`, for shared-in devices). The name must have a label before the suffix.
+pub fn in_magic_dns_domain(name: &str, suffix: Option<&str>) -> bool {
+    let name = name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase();
+    let in_suffix = |suffix: &str| {
+        let suffix = suffix.trim_start_matches('.');
+        !suffix.is_empty()
+            && name.len() > suffix.len() + 1
+            && name.ends_with(suffix)
+            && name.as_bytes()[name.len() - suffix.len() - 1] == b'.'
+    };
+    in_suffix(TS_NET) || suffix.is_some_and(|s| in_suffix(&s.to_ascii_lowercase()))
+}
+
+/// A device's MagicDNS name, kept only if it is a plain host name in the tailnet's MagicDNS
+/// domain (`suffix`) or ending in `.ts.net`. Anything else is not kept.
+fn dns_name(raw: &str, suffix: Option<&str>) -> Option<String> {
+    host_name(raw).filter(|name| in_magic_dns_domain(name, suffix))
 }
 
 /// A timestamp as Tailscale writes it (RFC 3339), or None for Go's zero time and anything odd.
@@ -455,6 +601,21 @@ fn last_seen(raw: &str) -> Option<String> {
 pub fn is_tailscale_ipv4(ip: Ipv4Addr) -> bool {
     let [a, b, ..] = ip.octets();
     a == 100 && (b & 0xC0) == 64
+}
+
+/// Whether an address is in Tailscale's IPv6 range, fd7a:115c:a1e0::/48.
+pub fn is_tailscale_ipv6(ip: Ipv6Addr) -> bool {
+    let [a, b, c, ..] = ip.segments();
+    (a, b, c) == (0xfd7a, 0x115c, 0xa1e0)
+}
+
+/// Whether an address is a Tailscale address (either range; an IPv4-mapped IPv6 address counts as
+/// its IPv4 address).
+pub fn is_tailscale_ip(ip: IpAddr) -> bool {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => is_tailscale_ipv4(v4),
+        IpAddr::V6(v6) => is_tailscale_ipv6(v6),
+    }
 }
 
 /// What a Tailscale scan checks: the other online devices' IPv4 addresses in 100.64.0.0/10,
@@ -513,7 +674,10 @@ mod tests {
         "nodekey:3333": { "HostName": "", "DNSName": "bare-box.example.ts.net.", "TailscaleIPs": ["100.64.0.4"], "Online": "yes" },
         "nodekey:4444": { "ID": "n4444CNTRL", "HostName": "outside", "OS": "linux", "TailscaleIPs": ["192.0.2.7"], "Online": true },
         "nodekey:5555": { "ID": "n5555CNTRL", "HostName": "evil", "DNSName": "evil host;rm -rf.example.ts.net.", "OS": "linux", "TailscaleIPs": ["100.64.0.5"], "Online": true },
-        "nodekey:6666": null
+        "nodekey:6666": null,
+        "nodekey:7777": { "ID": "n7777CNTRL", "HostName": "friend-pc", "DNSName": "friend-pc.other-tailnet.ts.net.", "OS": "windows", "TailscaleIPs": ["100.64.0.7", "fd7a:115c:a1e0::7"], "Online": false },
+        "nodekey:8888": { "ID": "n8888CNTRL", "HostName": "elsewhere", "DNSName": "server.example.com.", "OS": "linux", "TailscaleIPs": ["10.0.0.8", "2001:db8::8"], "Online": false },
+        "nodekey:9999": { "ID": "n9999CNTRL", "HostName": "numeric", "DNSName": "10.0.0.9.", "OS": "linux", "TailscaleIPs": ["100.64.0.9"], "Online": false }
       },
       "User": {}
     }"#;
@@ -527,8 +691,9 @@ mod tests {
         let status = parse_status(FIXTURE.as_bytes()).unwrap();
         assert!(status.available);
         assert_eq!(status.tailnet.as_deref(), Some("example.ts.net"));
+        assert_eq!(status.magic_dns_suffix.as_deref(), Some("example.ts.net"));
         assert_eq!(status.self_name.as_deref(), Some("my-laptop"));
-        assert_eq!(status.devices.len(), 6);
+        assert_eq!(status.devices.len(), 9);
         let me = &status.devices[0];
         assert!(me.is_self && me.name == "my-laptop" && me.last_seen.is_none());
         assert_eq!(me.dns_name.as_deref(), Some("my-laptop.example.ts.net"));
@@ -552,21 +717,33 @@ mod tests {
         assert!(bare.tags.is_empty());
         // A DNS name that is not a host name is not kept.
         assert_eq!(find(&status, "evil").dns_name, None);
+        // Shared-in devices keep their other tailnet's name; names outside *.ts.net and the
+        // tailnet's suffix, and addresses outside Tailscale's ranges, are dropped.
+        let friend = find(&status, "friend-pc");
+        assert_eq!(friend.dns_name.as_deref(), Some("friend-pc.other-tailnet.ts.net"));
+        assert_eq!((friend.ipv4.as_deref(), friend.ipv6.as_deref()), (Some("100.64.0.7"), Some("fd7a:115c:a1e0::7")));
+        let elsewhere = find(&status, "elsewhere");
+        assert_eq!((elsewhere.dns_name.as_deref(), elsewhere.ipv4.as_deref(), elsewhere.ipv6.as_deref()), (None, None, None));
+        assert_eq!(find(&status, "outside").ipv4, None);
+        assert_eq!(find(&status, "numeric").dns_name, None);
         // Others are sorted by name after this computer.
         let names: Vec<&str> = status.devices.iter().map(|d| d.name.as_str()).collect();
-        assert_eq!(names, ["my-laptop", "bare-box", "evil", "OfficePC", "outside", "studio-mac"]);
+        assert_eq!(
+            names,
+            ["my-laptop", "bare-box", "elsewhere", "evil", "friend-pc", "numeric", "OfficePC", "outside", "studio-mac"]
+        );
     }
 
     #[test]
     fn whole_status_json_matches_the_ui_contract() {
         let json = serde_json::to_value(parse_status(FIXTURE.as_bytes()).unwrap()).unwrap();
         let keys: Vec<&String> = json.as_object().unwrap().keys().collect();
-        assert_eq!(keys, ["available", "detail", "devices", "reason", "selfName", "tailnet"]);
+        assert_eq!(keys, ["available", "detail", "devices", "magicDnsSuffix", "reason", "selfName", "tailnet"]);
         assert_eq!(json["reason"], serde_json::Value::Null);
         let down = serde_json::to_value(TailscaleStatus::unavailable(Reason::NotInstalled, None)).unwrap();
         assert_eq!(
             down,
-            serde_json::json!({ "available": false, "reason": "not_installed", "detail": null, "tailnet": null, "selfName": null, "devices": [] })
+            serde_json::json!({ "available": false, "reason": "not_installed", "detail": null, "tailnet": null, "magicDnsSuffix": null, "selfName": null, "devices": [] })
         );
     }
 
@@ -626,8 +803,86 @@ mod tests {
                 os: Some("macOS".into())
             })
         );
-        assert!(is_tailscale_ipv4(Ipv4Addr::new(100, 127, 255, 255)));
+        assert!(is_tailscale_ipv4(Ipv4Addr::new(100, 127, 255, 255)) && is_tailscale_ipv4(Ipv4Addr::new(100, 64, 0, 0)));
         assert!(!is_tailscale_ipv4(Ipv4Addr::new(100, 128, 0, 1)) && !is_tailscale_ipv4(Ipv4Addr::new(100, 63, 0, 1)));
+    }
+
+    #[test]
+    fn dns_names_must_be_in_the_tailnet_and_not_addresses() {
+        let suffix = Some("example.ts.net");
+        let ok = |raw: &str, suffix: Option<&str>| dns_name(raw, suffix);
+        assert_eq!(ok("Studio-Mac.Example.ts.net.", suffix).as_deref(), Some("studio-mac.example.ts.net"));
+        assert_eq!(ok("pc.other-tailnet.ts.net", None).as_deref(), Some("pc.other-tailnet.ts.net"));
+        // A tailnet with its own (older) suffix.
+        assert_eq!(ok("pc.example.beta.tailscale.net", Some("example.beta.tailscale.net")).as_deref(), Some("pc.example.beta.tailscale.net"));
+        for bad in [
+            "pc.example.com",       // outside the tailnet's domain
+            "pc.example.ts.net.evil.com",
+            "pc-ts.net",            // not a label boundary
+            "ts.net",               // nothing before the suffix
+            "10.0.0.1",             // an address
+            "100.64.0.1",
+            "pc.123",               // all-digit last label
+            "0x7f.1",
+            "pc..example.ts.net",
+            "-pc.example.ts.net",
+            "",
+        ] {
+            assert_eq!(ok(bad, suffix), None, "{bad}");
+        }
+        assert_eq!(ok("pc.example.beta.tailscale.net", suffix), None);
+        assert_eq!(magic_dns_suffix("Example.ts.net."), Some("example.ts.net".to_owned()));
+        assert_eq!(magic_dns_suffix("100.64.0.1"), None);
+        assert_eq!(magic_dns_suffix("localhost"), None);
+        assert!(in_magic_dns_domain("PC.example.ts.net.", None));
+        assert!(!in_magic_dns_domain("pc.example.com", Some(".")));
+    }
+
+    #[test]
+    fn tailscale_address_ranges() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert!(is_tailscale_ip(ip("100.64.0.1")) && is_tailscale_ip(ip("100.127.255.254")));
+        assert!(!is_tailscale_ip(ip("100.128.0.1")) && !is_tailscale_ip(ip("10.0.0.1")));
+        assert!(is_tailscale_ip(ip("fd7a:115c:a1e0::1")) && is_tailscale_ip(ip("fd7a:115c:a1e0:ffff::1")));
+        assert!(!is_tailscale_ip(ip("fd7a:115c:a1e1::1")) && !is_tailscale_ip(ip("2001:db8::1")));
+        assert!(is_tailscale_ip(ip("::ffff:100.64.0.1")) && !is_tailscale_ip(ip("::ffff:10.0.0.1")));
+    }
+
+    #[tokio::test]
+    async fn status_reads_are_shared_and_reused_briefly() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let cache = Arc::new(StatusCache::new());
+        let reads = Arc::new(AtomicUsize::new(0));
+        let read = |reads: Arc<AtomicUsize>| async move {
+            reads.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            TailscaleStatus::unavailable(Reason::NotRunning, None)
+        };
+        let ttl = Duration::from_millis(300);
+        let (a, b) = tokio::join!(
+            cache.get(ttl, || read(reads.clone())),
+            cache.get(ttl, || read(reads.clone()))
+        );
+        assert_eq!((a.reason, b.reason), (Some(Reason::NotRunning), Some(Reason::NotRunning)));
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "concurrent callers share one read");
+        cache.get(ttl, || read(reads.clone())).await;
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "reused within the time");
+        tokio::time::sleep(ttl).await;
+        cache.get(ttl, || read(reads.clone())).await;
+        assert_eq!(reads.load(Ordering::SeqCst), 2, "read again once stale");
+    }
+
+    #[test]
+    fn only_changes_are_logged_at_info() {
+        let last = Mutex::new(None);
+        let down = TailscaleStatus::unavailable(Reason::NotRunning, None);
+        assert!(status_changed(&last, &down));
+        assert!(!status_changed(&last, &down));
+        assert!(status_changed(&last, &TailscaleStatus::unavailable(Reason::LoggedOut, None)));
+        let up = parse_status(FIXTURE.as_bytes()).unwrap();
+        assert!(status_changed(&last, &up));
+        assert!(!status_changed(&last, &up));
     }
 
     #[test]
@@ -674,7 +929,7 @@ mod tests {
         let ok = script("ok", &format!("[ \"$1 $2\" = 'status --json' ] || exit 9\ncat <<'EOF'\n{FIXTURE}\nEOF"));
         let status = status_with(&ok, limits).await;
         assert!(status.available, "{status:?}");
-        assert_eq!(status.devices.len(), 6);
+        assert_eq!(status.devices.len(), 9);
 
         let slow = script("slow", "exec sleep 30");
         let started = std::time::Instant::now();

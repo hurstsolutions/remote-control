@@ -291,6 +291,23 @@ describe("Tailscale results", () => {
     expect(savedMatches(windows, [byDns])).toEqual([]);
   });
 
+  it("ties a MagicDNS name only to a tailnet address in the tailnet's domain", () => {
+    const byDns = { ...blankConnection("rdp"), id: "1", name: "PC", host: "gaming-pc.example.ts.net" };
+    // A result outside 100.64.0.0/10 never carries a MagicDNS name.
+    const outside = host("10.0.0.11", { rdp: 3389, tailscaleName: "gaming-pc", tailscaleDnsName: "gaming-pc.example.ts.net.", tailscaleOs: "windows" });
+    expect(savedMatches(outside, [byDns])).toEqual([]);
+    expect(allNames(outside)).toEqual(["gaming-pc"]);
+    // A name outside *.ts.net counts only when it is in the tailnet's own suffix.
+    const custom = host("100.64.0.40", { rdp: 3389, tailscaleName: "pc", tailscaleDnsName: "pc.corp.example.", tailscaleOs: "windows" });
+    const byCustom = { ...blankConnection("rdp"), id: "4", name: "PC", host: "pc.corp.example" };
+    expect(savedMatches(custom, [byCustom])).toEqual([]);
+    expect(savedMatches(custom, [byCustom], "corp.example")).toEqual([byCustom]);
+    expect(allNames(custom, "corp.example")).toEqual(["pc", "pc.corp.example"]);
+    // An address is never a MagicDNS name.
+    const numeric = host("100.64.0.41", { rdp: 3389, tailscaleDnsName: "10.0.0.41.", tailscaleOs: "windows" });
+    expect(allNames(numeric)).toEqual([]);
+  });
+
   it("replaces only the previous Tailscale results on a rescan", () => {
     const subnetHost = host("10.0.0.10", { rdp: 3389 });
     const unmarked = host("100.64.0.30", { rdp: 3389 });

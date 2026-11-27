@@ -53,7 +53,7 @@ const phone = device(15, { name: "sams-iphone", os: "iOS", online: false, lastSe
 const all = [self, pc, mbp, air, nas, phone];
 
 function status(extra: Partial<TailscaleStatus>): TailscaleStatus {
-  return { available: false, reason: null, detail: null, tailnet: null, selfName: null, devices: [], ...extra };
+  return { available: false, reason: null, detail: null, tailnet: null, magicDnsSuffix: null, selfName: null, devices: [], ...extra };
 }
 
 describe("cleanText", () => {
@@ -94,6 +94,45 @@ describe("addresses", () => {
     expect(cleanIpv4("100.64.0.11")).toBe("100.64.0.11");
     expect(cleanIpv4("100.64.0.256")).toBe("");
     expect(cleanIpv4("fd7a:115c:a1e0::1")).toBe("");
+  });
+
+  it("keeps only names in the tailnet's MagicDNS domain or *.ts.net, never addresses", () => {
+    // Shared-in devices: another tailnet's ts.net name.
+    expect(cleanDnsName("friend-pc.other-tailnet.ts.net.")).toBe("friend-pc.other-tailnet.ts.net");
+    expect(cleanDnsName("pc.example.com")).toBe("");
+    expect(cleanDnsName("pc.example.com", "example.ts.net")).toBe("");
+    expect(cleanDnsName("pc.example.ts.net.evil.com", "example.ts.net")).toBe("");
+    expect(cleanDnsName("pc-ts.net")).toBe("");
+    expect(cleanDnsName("ts.net")).toBe("");
+    // A tailnet with its own (older) suffix, only when the status says so.
+    expect(cleanDnsName("pc.example.beta.tailscale.net", "example.beta.tailscale.net")).toBe("pc.example.beta.tailscale.net");
+    expect(cleanDnsName("pc.example.beta.tailscale.net")).toBe("");
+    // Addresses are not names.
+    expect(cleanDnsName("10.0.0.1")).toBe("");
+    expect(cleanDnsName("100.64.0.1.", "example.ts.net")).toBe("");
+    expect(cleanDnsName("pc.123", "123")).toBe("");
+    expect(cleanDnsName("-pc.example.ts.net")).toBe("");
+    expect(cleanDnsName("pc..example.ts.net")).toBe("");
+  });
+
+  it("keeps only IPv4 addresses in 100.64.0.0/10", () => {
+    expect(cleanIpv4("100.64.0.0")).toBe("100.64.0.0");
+    expect(cleanIpv4("100.127.255.255")).toBe("100.127.255.255");
+    expect(cleanIpv4("100.128.0.1")).toBe("");
+    expect(cleanIpv4("100.63.255.255")).toBe("");
+    expect(cleanIpv4("10.0.0.1")).toBe("");
+    expect(cleanIpv4("100.064.0.1")).toBe("");
+  });
+
+  it("ties a device to a saved host only by tailnet addresses", () => {
+    const outside = device(20, { name: "outside", os: "windows", ipv4: "10.0.0.20", dnsName: "outside.example.com." });
+    expect(deviceMatchesHost(outside, "10.0.0.20")).toBe(false);
+    expect(deviceMatchesHost(outside, "outside.example.com")).toBe(false);
+    expect(hostChoices(outside)).toEqual({ dnsName: "", ip: "" });
+    const custom = device(21, { name: "pc", os: "windows", dnsName: "pc.corp.example." });
+    expect(deviceMatchesHost(custom, "pc.corp.example")).toBe(false);
+    expect(deviceMatchesHost(custom, "pc.corp.example", "corp.example")).toBe(true);
+    expect(hostChoices(custom, "corp.example").dnsName).toBe("pc.corp.example");
   });
 });
 

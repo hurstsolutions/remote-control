@@ -554,6 +554,7 @@ function mockError(kind: ErrorKind, host: string): SessionError {
     other: "mock: an error with no particular kind",
     password_required: "no password supplied and none saved",
     no_verified_sign_in: NO_SRP_DETAIL,
+    not_tailscale: `${host} resolved to 10.0.0.20, which isn't a Tailscale address. Is Tailscale running and connected on this computer? The connection was stopped so it can't reach a different machine.`,
   };
   return { kind, detail: details[kind] };
 }
@@ -760,11 +761,12 @@ function mockTailscaleStatus(): TailscaleStatus {
       reason,
       detail: reason === "error" ? "tailscale status: unexpected reply from the local Tailscale service (mock)" : null,
       tailnet: null,
+      magicDnsSuffix: null,
       selfName: null,
       devices: [],
     };
   }
-  return { available: true, reason: null, detail: null, tailnet: "example.ts.net", selfName: "this-laptop", devices: tailscaleDevices() };
+  return { available: true, reason: null, detail: null, tailnet: "example.ts.net", magicDnsSuffix: "example.ts.net", selfName: "this-laptop", devices: tailscaleDevices() };
 }
 
 /** Like the subnet scan, over the tailnet's online devices (not this computer). */

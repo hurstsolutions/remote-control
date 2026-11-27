@@ -115,6 +115,10 @@ pub enum ErrorKind {
     Protocol,
     /// The connection dropped mid-session.
     Disconnected,
+    /// A MagicDNS name (or Tailscale address) resolved to an address outside Tailscale's ranges,
+    /// so the connection was not made: it could have reached a different machine. Usually
+    /// Tailscale is not running or not connected on this computer. Nothing was sent.
+    NotTailscale,
     Other,
 }
 

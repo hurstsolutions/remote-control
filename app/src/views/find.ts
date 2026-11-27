@@ -64,6 +64,8 @@ export class FindView {
   /** Null until read, or when it couldn't be read at all. */
   private tailscale: TailscaleStatus | null = null;
   private tailscaleError: string | null = null;
+  /** A Tailscale status read is in flight. */
+  private tailscaleLoading = false;
   /** Bumped per scan, so events of an earlier scan are ignored. */
   private generation = 0;
   /** A batched results render is pending. */
@@ -189,12 +191,17 @@ export class FindView {
   }
 
   private async loadTailscale(): Promise<void> {
+    // One read at a time: a slow Tailscale client must not pile up polls.
+    if (this.tailscaleLoading) return;
+    this.tailscaleLoading = true;
     try {
       this.tailscale = await this.host.platform.api.tailscaleStatus();
       this.tailscaleError = null;
     } catch (error) {
       this.tailscale = null;
       this.tailscaleError = messageOf(error);
+    } finally {
+      this.tailscaleLoading = false;
     }
     this.renderScanState();
   }
@@ -579,7 +586,8 @@ export class FindView {
   }
 
   private resultRow(found: FoundHost): HTMLElement {
-    const names = allNames(found);
+    const suffix = this.tailscale?.magicDnsSuffix;
+    const names = allNames(found, suffix);
     const others = names.slice(1);
     const extra = [...others];
     if (found.model) extra.push(found.model);
@@ -596,7 +604,7 @@ export class FindView {
     if (found.tailscaleOs) tooltip.push(`Tailscale OS: ${osLabel(found.tailscaleOs)}`);
     if (found.rdp_certificate_sha256) tooltip.push(`Certificate SHA-256 (information only, not trusted): ${found.rdp_certificate_sha256}`);
 
-    const matches = savedMatches(found, this.host.store.connections);
+    const matches = savedMatches(found, this.host.store.connections, suffix);
     const savedCell = h("td", { class: "results-saved" });
     if (matches.length > 0) {
       savedCell.append(h("span", { class: "saved-tag", text: matches.length === 1 ? `Saved: ${matches[0]?.name ?? ""}` : `Saved (${matches.length})`, title: matches.map((m) => m.name).join(", ") }));

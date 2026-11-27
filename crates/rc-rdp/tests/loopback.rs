@@ -148,6 +148,7 @@ fn config(port: u16, password: &str, nla: bool) -> RdpConfig {
     RdpConfig {
         host: "127.0.0.1".to_owned(),
         port,
+        resolved: None,
         username: USER.to_owned(),
         password: password.to_owned().into(),
         domain: None,

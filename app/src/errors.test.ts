@@ -17,6 +17,17 @@ describe("describeError", () => {
     expect(direct.hints.join(" ")).not.toContain("Remote Login");
   });
 
+  it("says a tailnet address went outside Tailscale, and to check Tailscale", () => {
+    const detail =
+      "studio-mac.example.ts.net resolved to 10.0.0.20, which isn't a Tailscale address. Is Tailscale running and connected on this computer? The connection was stopped so it can't reach a different machine.";
+    expect(toSessionError({ kind: "not_tailscale", detail })).toEqual({ kind: "not_tailscale", detail });
+    const text = describeError({ kind: "not_tailscale", detail }, { ...windows, host: "studio-mac.example.ts.net" });
+    expect(text.headline).toBe("studio-mac.example.ts.net isn't reachable through Tailscale right now");
+    const hints = text.hints.join(" ");
+    expect(hints).toContain("Tailscale is running and connected");
+    expect(hints).toContain("before anything was sent");
+  });
+
   it("says Remote Login is off when the SSH tunnel cannot be opened, and offers both ways on", () => {
     const text = describeError({ kind: "tunnel_unavailable", detail: "os error 10061" }, mac);
     expect(text.headline).toBe("Remote Login is off on studio-mac");
