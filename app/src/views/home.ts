@@ -2,12 +2,17 @@
 import { confirmDialog } from "../dialog";
 import { button, h } from "../dom";
 import { messageOf } from "../errors";
-import type { Connection } from "../ipc";
+import type { Connection, TailscaleStatus } from "../ipc";
 import { copyLogButton, showLogFileButton } from "../logs";
 import type { Platform } from "../platform";
+import { pollWhileVisible } from "../poll";
 import { hostLabel, protocolLabel, type ConnectionStore } from "../state";
 import { PASSWORD_CLEARED_NOTE, openEditor } from "./editor";
 import { FindView } from "./find";
+import { TailscaleView } from "./tailscale";
+import { REFRESH_MS, deviceForConnection, presenceTooltip } from "./tailscale-logic";
+
+type Page = "list" | "find" | "tailscale";
 
 export interface HomeHost {
   platform: Platform;
@@ -22,6 +27,11 @@ export class HomeView {
   readonly element: HTMLElement;
   private readonly listPage: HTMLElement;
   private find: FindView | null = null;
+  private tailscale: TailscaleView | null = null;
+  /** The last tailnet read, for the online dots; null when Tailscale is unavailable. */
+  private tailnet: TailscaleStatus | null = null;
+  /** Each row's dot slot, by connection id (rebuilt with the list). */
+  private dotSlots = new Map<string, HTMLElement>();
   private readonly list: HTMLElement;
   private readonly problem: HTMLElement;
   private readonly info: HTMLElement;
@@ -44,7 +54,8 @@ export class HomeView {
         h(
           "div",
           { class: "row-actions" },
-          button("Find computers", () => this.showFind(true), { title: "Scan your subnets for Windows PCs and Macs" }),
+          button("Tailscale", () => this.show("tailscale"), { title: "Windows PCs and Macs in your tailnet" }),
+          button("Find computers", () => this.show("find"), { title: "Scan your subnets for Windows PCs and Macs" }),
           button("Add connection", () => void this.edit(null), { kind: "primary" }),
         ),
       ),
@@ -61,6 +72,8 @@ export class HomeView {
     this.element = h("div", { class: "home-stack" }, this.listPage);
     host.store.subscribe(() => this.render());
     this.render();
+    void this.refreshTailnet();
+    pollWhileVisible(this.listPage, REFRESH_MS, () => void this.refreshTailnet());
     host.platform.api.appInfo().then(
       (info) => {
         this.version.textContent = `RemoteControl ${info.version} (${info.os} ${info.arch})`;
@@ -70,13 +83,53 @@ export class HomeView {
     );
   }
 
-  private showFind(on: boolean): void {
-    if (on && !this.find) {
-      this.find = new FindView({ platform: this.host.platform, store: this.host.store, back: () => this.showFind(false) });
+  private show(page: Page): void {
+    const back = () => this.show("list");
+    if (page === "find" && !this.find) {
+      this.find = new FindView({ platform: this.host.platform, store: this.host.store, back });
       this.element.append(this.find.element);
     }
-    if (this.find) this.find.element.hidden = !on;
-    this.listPage.hidden = on;
+    const reopen = page === "tailscale" && this.tailscale !== null;
+    if (page === "tailscale" && !this.tailscale) {
+      this.tailscale = new TailscaleView({ platform: this.host.platform, store: this.host.store, back });
+      this.element.append(this.tailscale.element);
+    }
+    if (this.find) this.find.element.hidden = page !== "find";
+    if (this.tailscale) this.tailscale.element.hidden = page !== "tailscale";
+    this.listPage.hidden = page !== "list";
+    if (reopen) this.tailscale?.opened();
+    if (page === "list") void this.refreshTailnet();
+  }
+
+  /** Read the tailnet for the online dots. Unavailable or failing: no dots, nothing said. */
+  private async refreshTailnet(): Promise<void> {
+    try {
+      const status = await this.host.platform.api.tailscaleStatus();
+      this.tailnet = status.available ? status : null;
+    } catch {
+      this.tailnet = null;
+    }
+    this.renderDots();
+  }
+
+  /** Dots only for saved hosts that are a tailnet device's IPv4 or MagicDNS name. */
+  private renderDots(): void {
+    const devices = this.tailnet?.devices ?? [];
+    const now = Date.now();
+    for (const connection of this.host.store.connections) {
+      const slot = this.dotSlots.get(connection.id);
+      if (!slot) continue;
+      const device = deviceForConnection(connection, devices);
+      if (!device) {
+        slot.replaceChildren();
+        continue;
+      }
+      const tooltip = presenceTooltip(device, now);
+      slot.replaceChildren(
+        h("span", { class: `ts-dot ${device.online ? "ts-dot-online" : "ts-dot-offline"}`, title: tooltip, attrs: { "aria-hidden": "true" } }),
+        h("span", { class: "visually-hidden", text: tooltip }),
+      );
+    }
   }
 
   private showProblem(message: string | null): void {
@@ -102,17 +155,22 @@ export class HomeView {
             "div",
             { class: "row-actions" },
             button("Add connection", () => void this.edit(null), { kind: "primary" }),
-            button("Find computers", () => this.showFind(true)),
+            button("Find computers", () => this.show("find")),
+            button("Tailscale", () => this.show("tailscale")),
           ),
         ),
       );
       return;
     }
+    this.dotSlots = new Map();
     for (const connection of connections) this.list.append(this.row(connection));
+    this.renderDots();
   }
 
   private row(connection: Connection): HTMLElement {
     const connect = () => this.host.connect(connection);
+    const dot = h("span", { class: "ts-dot-slot" });
+    this.dotSlots.set(connection.id, dot);
     const actions = h(
       "div",
       { class: "row-actions" },
@@ -130,7 +188,7 @@ export class HomeView {
       h(
         "div",
         { class: "row-main" },
-        h("div", { class: "row-name", text: connection.name }),
+        h("div", { class: "row-name" }, dot, h("span", { text: connection.name })),
         h("div", { class: "row-detail", text: `${connection.username} at ${hostLabel(connection)}` }),
       ),
       actions,

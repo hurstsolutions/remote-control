@@ -1056,3 +1056,77 @@ body.fullscreen .session-top:focus-within {
   clip: rect(0 0 0 0);
   white-space: nowrap;
 }
+
+/* ---- Tailscale ---- */
+
+.ts-dot-slot:empty {
+  display: none;
+}
+
+.ts-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 6px;
+  border-radius: 50%;
+  border: 1px solid var(--muted);
+  vertical-align: middle;
+}
+
+.ts-dot-online {
+  background: var(--ok);
+  border-color: var(--ok);
+}
+
+.ts-dot-offline {
+  background: transparent;
+}
+
+.ts-summary {
+  margin: 0;
+}
+
+.ts-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.ts-group-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+  margin: 0 0 6px;
+}
+
+.ts-os {
+  width: 72px;
+}
+
+.ts-os-windows,
+.ts-os-mac {
+  color: var(--text);
+}
+
+.ts-tag {
+  margin-left: 6px;
+  color: var(--muted);
+}
+
+.ts-link {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--text);
+}
+
+.connect-by {
+  border: none;
+  margin: 0;
+  padding: 0;
+  gap: 6px;
+}
+
+.connect-by-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+}

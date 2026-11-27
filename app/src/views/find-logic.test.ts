@@ -3,6 +3,10 @@ import type { FoundHost } from "../ipc";
 import { blankConnection } from "../state";
 import {
   addableProtocols,
+  displayName,
+  hostKind,
+  isTailscaleResult,
+  withoutTailscale,
   allNames,
   estimateDuration,
   filterHosts,
@@ -237,5 +241,75 @@ describe("prefill", () => {
   it("suggests short names", () => {
     expect(suggestedName(host("10.0.0.1", { name: "pc-1.example.internal", names: { ...windows.names, rdp_certificate: null, netbios: null, dns: "pc-1.example.internal" } }), "rdp")).toBe("pc-1");
     expect(suggestedName(host("10.0.0.2", { vnc: 5900, names: { ...mac.names, mdns_name: null } }), "vnc")).toBe("Studio-Mac");
+  });
+});
+
+describe("Tailscale results", () => {
+  const tsPc = host("100.64.0.11", {
+    rdp: 3389,
+    tailscaleName: "gaming-pc",
+    tailscaleDnsName: "gaming-pc.example.ts.net.",
+    tailscaleOs: "windows",
+  });
+  const tsMac = host("100.64.0.12", {
+    vnc: 5900,
+    rfb_version: "003.008",
+    tailscaleName: "studio‮mbp",
+    tailscaleDnsName: "studio-mbp.example.ts.net.",
+    tailscaleOs: "macOS",
+  });
+  const tsLinux = host("100.64.0.14", { ssh: 22, tailscaleName: "nas-01", tailscaleDnsName: "nas-01.example.ts.net.", tailscaleOs: "linux" });
+  const named = host("100.64.0.15", { rdp: 3389, kind: "windows", name: "GAMING-2", names: { ...windows.names, rdp_certificate: "GAMING-2", netbios: null }, tailscaleName: "gaming-2", tailscaleOs: "windows" });
+
+  it("falls back to the Tailscale name, cleaned, and says where it came from", () => {
+    expect(displayName(tsPc)).toBe("gaming-pc");
+    expect(nameSource(tsPc)).toBe("Tailscale");
+    expect(displayName(tsMac)).toBe("studiombp");
+    expect(displayName(named)).toBe("GAMING-2");
+    expect(nameSource(named)).toBe("Remote Desktop certificate");
+    expect(allNames(tsPc)).toEqual(["gaming-pc", "gaming-pc.example.ts.net"]);
+    expect(nameSource(host("100.64.0.20", { tailscaleOs: "windows" }))).toBeNull();
+  });
+
+  it("classifies from the Tailscale OS when the probes couldn't", () => {
+    expect(hostKind(tsPc)).toBe("windows");
+    expect(hostKind(tsMac)).toBe("mac");
+    expect(hostKind(tsLinux)).toBe("unknown");
+    // A non-Apple VNC greeting would be hidden, but Tailscale says it is a Mac.
+    expect(isComputer(tsMac)).toBe(true);
+    expect(isComputer(tsLinux)).toBe(false);
+    // The probes win when they know.
+    expect(hostKind({ ...tsMac, kind: "windows" })).toBe("windows");
+  });
+
+  it("counts the IP or the MagicDNS name as Saved, never the Tailscale name", () => {
+    const byDns = { ...blankConnection("rdp"), id: "1", name: "PC", host: "Gaming-PC.example.ts.net" };
+    const byIp = { ...blankConnection("rdp"), id: "2", name: "PC ip", host: "100.64.0.11" };
+    const byName = { ...blankConnection("rdp"), id: "3", name: "PC name", host: "gaming-pc" };
+    expect(savedMatches(tsPc, [byDns, byIp, byName])).toEqual([byDns, byIp]);
+    expect(nameOnlyMatches(tsPc, [byDns, byIp, byName]).map((m) => m.connection)).toEqual([byName]);
+    expect(savedMatches(windows, [byDns])).toEqual([]);
+  });
+
+  it("replaces only the previous Tailscale results on a rescan", () => {
+    const subnetHost = host("10.0.0.10", { rdp: 3389 });
+    const unmarked = host("100.64.0.30", { rdp: 3389 });
+    expect(isTailscaleResult(tsPc)).toBe(true);
+    expect(isTailscaleResult(subnetHost)).toBe(false);
+    let results = [subnetHost, tsPc, tsMac, unmarked];
+    results = withoutTailscale(results, new Set(["100.64.0.30"]));
+    expect(results.map((h) => h.ip)).toEqual(["10.0.0.10"]);
+    results = upsertHost(results, tsLinux);
+    expect(results.map((h) => h.ip)).toEqual(["10.0.0.10", "100.64.0.14"]);
+    // A subnet rescan keeps Tailscale results outside the subnet.
+    expect(withoutSubnets(results, ["10.0.0.0/24"]).map((h) => h.ip)).toEqual(["100.64.0.14"]);
+  });
+
+  it("filters, sorts and prefills by the Tailscale name", () => {
+    expect(filterHosts([tsPc, tsMac, windows], "gaming").map((h) => h.ip)).toEqual(["100.64.0.11"]);
+    expect(filterHosts([tsPc, tsMac], "example.ts.net")).toHaveLength(2);
+    expect(sortHosts([tsMac, nameless, tsPc], "name", true).map((h) => h.ip)).toEqual(["100.64.0.11", "100.64.0.12", "10.0.0.200"]);
+    const c = prefillConnection(tsPc, "rdp");
+    expect(c).toMatchObject({ name: "gaming-pc", host: "100.64.0.11", share_clipboard: false });
   });
 });

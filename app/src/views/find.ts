@@ -3,14 +3,16 @@
 import { confirmDialog, openDialog } from "../dialog";
 import { button, h } from "../dom";
 import { messageOf } from "../errors";
-import type { FoundHost, Protocol, ScanEvent, Subnet } from "../ipc";
+import type { FoundHost, Protocol, ScanEvent, Subnet, TailscaleStatus } from "../ipc";
 import type { Platform } from "../platform";
+import { pollWhileVisible } from "../poll";
 import { protocolLabel, type ConnectionStore } from "../state";
 import { openEditor } from "./editor";
 import {
   addableProtocols,
   allNames,
   estimateDuration,
+  hostKind,
   filterHosts,
   hiddenToggleLabel,
   isComputer,
@@ -25,8 +27,10 @@ import {
   sortHosts,
   upsertHost,
   withoutSubnets,
+  withoutTailscale,
   type SortKey,
 } from "./find-logic";
+import { MAX_DNS_CHARS, REFRESH_MS, cleanText, osLabel, unavailableShort } from "./tailscale-logic";
 
 export interface FindHost {
   platform: Platform;
@@ -53,6 +57,13 @@ export class FindView {
   /** Show devices that are not Windows PCs or Macs. Off whenever the view opens. */
   private showAll = false;
   private scanId: string | null = null;
+  /** The running scan is the Tailscale one. */
+  private scanningTailscale = false;
+  /** Addresses the last Tailscale scan reported, replaced by the next one. */
+  private tailscaleIps = new Set<string>();
+  /** Null until read, or when it couldn't be read at all. */
+  private tailscale: TailscaleStatus | null = null;
+  private tailscaleError: string | null = null;
   /** Bumped per scan, so events of an earlier scan are ignored. */
   private generation = 0;
   /** A batched results render is pending. */
@@ -62,6 +73,8 @@ export class FindView {
 
   private readonly problem: HTMLElement;
   private readonly subnetList: HTMLElement;
+  private readonly tailscaleDetail: HTMLElement;
+  private readonly tailscaleScanButton: HTMLButtonElement;
   private readonly scanButton: HTMLButtonElement;
   private readonly cancelButton: HTMLButtonElement;
   private readonly progress: HTMLProgressElement;
@@ -78,6 +91,9 @@ export class FindView {
     this.problem = h("p", { class: "notice notice-error", attrs: { role: "alert" } });
     this.problem.hidden = true;
     this.subnetList = h("div", { class: "connection-list subnet-list", attrs: { role: "list", "aria-label": "Subnets" } });
+    this.tailscaleDetail = h("div", { class: "row-detail", text: "Reading Tailscale..." });
+    this.tailscaleScanButton = button("Scan", () => void this.scanTailscale(), { title: "Scan the Windows PCs and Macs in your tailnet; subnet results stay" });
+    this.tailscaleScanButton.disabled = true;
     this.scanButton = button("Scan all", () => void this.scan(this.chosen()), { kind: "primary" });
     this.cancelButton = button("Cancel scan", () => void this.cancel());
     this.cancelButton.hidden = true;
@@ -128,6 +144,16 @@ export class FindView {
         }),
         this.problem,
         this.subnetList,
+        h(
+          "div",
+          { class: "connection-list", attrs: { role: "list", "aria-label": "Tailscale" } },
+          h(
+            "div",
+            { class: "connection-row subnet-row tailscale-source", attrs: { role: "listitem" } },
+            h("div", { class: "row-main" }, h("div", { class: "row-name", text: "Tailscale" }), this.tailscaleDetail),
+            h("div", { class: "row-actions" }, this.tailscaleScanButton),
+          ),
+        ),
         h("div", { class: "scan-bar" }, this.scanButton, this.cancelButton, this.progress, this.status),
         h("div", { class: "results-tools" }, this.filter, h("label", { class: "check show-all" }, this.showAllCheck, this.showAllLabel)),
         h(
@@ -158,6 +184,34 @@ export class FindView {
     this.renderSort();
     this.renderResults();
     void this.loadSubnets();
+    void this.loadTailscale();
+    pollWhileVisible(this.element, REFRESH_MS, () => void this.loadTailscale());
+  }
+
+  private async loadTailscale(): Promise<void> {
+    try {
+      this.tailscale = await this.host.platform.api.tailscaleStatus();
+      this.tailscaleError = null;
+    } catch (error) {
+      this.tailscale = null;
+      this.tailscaleError = messageOf(error);
+    }
+    this.renderScanState();
+  }
+
+  private renderTailscaleRow(): void {
+    const status = this.tailscale;
+    if (status?.available) {
+      const tailnet = cleanText(status.tailnet, MAX_DNS_CHARS);
+      const others = status.devices.filter((d) => !d.isSelf);
+      const online = others.filter((d) => d.online).length;
+      this.tailscaleDetail.textContent = `${tailnet ? `${tailnet}: ` : ""}${online} of ${others.length} devices online`;
+    } else if (status) {
+      this.tailscaleDetail.textContent = unavailableShort(status);
+    } else {
+      this.tailscaleDetail.textContent = this.tailscaleError ? `Couldn't read Tailscale: ${this.tailscaleError}` : "Reading Tailscale...";
+    }
+    this.tailscaleScanButton.disabled = this.scanning || !status?.available;
   }
 
   private showProblem(message: string | null): void {
@@ -354,6 +408,7 @@ export class FindView {
         ? "Scan all"
         : `Scan selected (${chosen})`;
     this.cancelButton.hidden = !this.scanning;
+    this.renderTailscaleRow();
     for (const input of this.subnetList.querySelectorAll<HTMLInputElement>("input[type=checkbox]")) input.disabled = this.scanning;
     for (const b of this.subnetList.querySelectorAll<HTMLButtonElement>(".row-actions button")) b.disabled = this.scanning;
     if (!this.scanning && this.subnets.length > 0 && this.chosen().length === 0 && !this.status.textContent) {
@@ -378,23 +433,41 @@ export class FindView {
       });
       if (!ok) return;
     }
+    this.hosts = withoutSubnets(this.hosts, chosen.map((s) => s.cidr));
+    await this.begin(false, progressText(0, total, 0), (onEvent) =>
+      this.host.platform.api.startScan(
+        chosen.map((s) => s.id),
+        onEvent,
+      ),
+    );
+  }
+
+  /**
+   * Rescan the tailnet. Results of the previous Tailscale scan are replaced; subnet results stay,
+   * as with a single-subnet rescan.
+   */
+  private async scanTailscale(): Promise<void> {
+    if (this.scanning || !this.tailscale?.available) return;
+    this.hosts = withoutTailscale(this.hosts, this.tailscaleIps);
+    this.tailscaleIps = new Set();
+    await this.begin(true, "Checking the devices in your tailnet...", (onEvent) => this.host.platform.api.startTailscaleScan(onEvent));
+  }
+
+  private async begin(tailscale: boolean, initialStatus: string, start: (onEvent: (event: ScanEvent) => void) => Promise<string>): Promise<void> {
     const generation = ++this.generation;
     this.showProblem(null);
-    this.hosts = withoutSubnets(this.hosts, chosen.map((s) => s.cidr));
     this.scanning = true;
+    this.scanningTailscale = tailscale;
     this.scanId = null;
     this.progress.hidden = false;
     this.progress.value = 0;
-    this.status.textContent = progressText(0, total, 0);
+    this.status.textContent = initialStatus;
     this.renderScanState();
     this.renderResults();
     try {
-      const id = await this.host.platform.api.startScan(
-        chosen.map((s) => s.id),
-        (event) => {
-          if (generation === this.generation) this.onEvent(event);
-        },
-      );
+      const id = await start((event) => {
+        if (generation === this.generation) this.onEvent(event);
+      });
       if (generation === this.generation && this.scanning) this.scanId = id;
     } catch (error) {
       if (generation !== this.generation) return;
@@ -413,6 +486,7 @@ export class FindView {
         this.status.textContent = progressText(event.done, event.total, event.found);
         break;
       case "host":
+        if (this.scanningTailscale) this.tailscaleIps.add(event.host.ip);
         this.hosts = upsertHost(this.hosts, event.host);
         this.scheduleRender();
         break;
@@ -517,6 +591,9 @@ export class FindView {
     if (found.names.dns) tooltip.push(`DNS: ${found.names.dns}`);
     if (found.rfb_version) tooltip.push(`VNC version: ${found.rfb_version}`);
     if (found.ssh_banner) tooltip.push(`SSH: ${found.ssh_banner}`);
+    if (found.tailscaleName) tooltip.push(`Tailscale name: ${cleanText(found.tailscaleName, 256)}`);
+    if (found.tailscaleDnsName) tooltip.push(`MagicDNS: ${cleanText(found.tailscaleDnsName, 256)}`);
+    if (found.tailscaleOs) tooltip.push(`Tailscale OS: ${osLabel(found.tailscaleOs)}`);
     if (found.rdp_certificate_sha256) tooltip.push(`Certificate SHA-256 (information only, not trusted): ${found.rdp_certificate_sha256}`);
 
     const matches = savedMatches(found, this.host.store.connections);
@@ -537,7 +614,8 @@ export class FindView {
     }
     if (protocols.length === 0) actions.append(h("span", { class: "muted", text: "SSH only", title: "RemoteControl connects with Remote Desktop or Screen Sharing; neither answered." }));
 
-    const kindLabel = found.kind === "windows" ? "Windows" : found.kind === "mac" ? "Mac" : "Other";
+    const kind = hostKind(found);
+    const kindLabel = kind === "windows" ? "Windows" : kind === "mac" ? "Mac" : "Other";
     const source = nameSource(found);
     const row = h(
       "tr",
@@ -550,7 +628,7 @@ export class FindView {
         source ? h("div", { class: "row-detail muted name-source", text: `Name from ${source}` }) : null,
         extra.length > 0 ? h("div", { class: "row-detail selectable", text: extra.join(", ") }) : null,
       ),
-      h("td", {}, h("span", { class: `kind-tag kind-${found.kind}`, text: kindLabel }), ...serviceLabels(found).map((s) => h("span", { class: "service-tag", text: s }))),
+      h("td", {}, h("span", { class: `kind-tag kind-${kind}`, text: kindLabel }), ...serviceLabels(found).map((s) => h("span", { class: "service-tag", text: s }))),
       savedCell,
       actions,
     );
