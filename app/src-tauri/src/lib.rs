@@ -170,8 +170,9 @@ fn clean_name(text: &str) -> String {
     text.chars().filter(|c| !rc_discover::is_unsafe_char(*c)).collect::<String>().trim().to_owned()
 }
 
-#[tauri::command]
-fn save_connection(state: State<'_, AppState>, mut connection: Connection) -> Result<SavedConnection, UiError> {
+/// Tidy a connection from the UI. The host is kept as typed apart from surrounding space: an IP
+/// address, a local name or a DNS name such as a Tailscale MagicDNS name all work.
+fn normalize_connection(connection: &mut Connection) -> Result<(), UiError> {
     connection.name = clean_name(&connection.name);
     connection.host = connection.host.trim().to_owned();
     connection.username = connection.username.trim().to_owned();
@@ -182,6 +183,12 @@ fn save_connection(state: State<'_, AppState>, mut connection: Connection) -> Re
     if connection.name.is_empty() {
         connection.name = connection.host.clone();
     }
+    Ok(())
+}
+
+#[tauri::command]
+fn save_connection(state: State<'_, AppState>, mut connection: Connection) -> Result<SavedConnection, UiError> {
+    normalize_connection(&mut connection)?;
     let mut store = lock(&state.store);
     let existing = store.get(&connection.id).filter(|_| !connection.id.is_empty());
     let decision = decide_save(existing.as_ref(), &connection);
@@ -801,6 +808,55 @@ fn start_scan(
     let saved = lock(&state.subnets).list();
     let plan = discover::scan_plan(&saved, &args.subnet_ids).map_err(UiError::other)?;
     let targets = rc_discover::targets(&plan).map_err(UiError::other)?;
+    let subnets: Vec<String> = plan.iter().map(ToString::to_string).collect();
+    let addresses = targets.len();
+    let id = begin_scan(app, &state, events, |cancel, tx| rc_discover::scan(targets, rc_discover::ScanOptions::default(), cancel, tx))?;
+    info!(scan = %id, ?subnets, addresses, "scan requested");
+    Ok(id)
+}
+
+/// Check the online devices of the tailnet (not this computer) like a subnet scan: same ports,
+/// probes and limits, same events, and the same one-scan-at-a-time rule; `cancel_scan` stops it.
+#[tauri::command]
+async fn start_tailscale_scan(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    events: Channel<InvokeResponseBody>,
+) -> Result<String, UiError> {
+    use rc_discover::tailscale::{self, Reason};
+    let status = tailscale::status().await;
+    if !status.available {
+        let detail = status.detail.unwrap_or_else(|| {
+            match status.reason {
+                Some(Reason::NotInstalled) => "Tailscale is not installed on this computer.",
+                Some(Reason::NotRunning) => "Tailscale is not running on this computer.",
+                Some(Reason::LoggedOut) => "Tailscale is not signed in on this computer.",
+                _ => "Tailscale is not available.",
+            }
+            .to_owned()
+        });
+        return Err(UiError::other(detail));
+    }
+    let hosts = rc_discover::host_targets(tailscale::scan_targets(&status)).map_err(UiError::other)?;
+    let devices = hosts.len();
+    let id = begin_scan(app, &state, events, |cancel, tx| {
+        rc_discover::scan_hosts(hosts, rc_discover::ScanOptions::default(), cancel, tx)
+    })?;
+    info!(scan = %id, devices, "tailscale scan requested");
+    Ok(id)
+}
+
+/// Start a scan unless one is running, and pass its events to the channel. `scan` gets the cancel
+/// token and the event sender.
+fn begin_scan<F>(
+    app: tauri::AppHandle,
+    state: &AppState,
+    events: Channel<InvokeResponseBody>,
+    scan: impl FnOnce(rc_discover::CancelToken, mpsc::Sender<rc_discover::ScanEvent>) -> F,
+) -> Result<String, UiError>
+where
+    F: std::future::Future<Output = rc_discover::ScanSummary> + Send + 'static,
+{
     let mut running = lock(&state.scan);
     if running.is_some() {
         return Err(UiError::other("A scan is already running. Cancel it or wait for it to finish."));
@@ -809,11 +865,9 @@ fn start_scan(
     let cancel = rc_discover::CancelToken::default();
     *running = Some(discover::RunningScan { id: id.clone(), cancel: cancel.clone() });
     drop(running);
-    let subnets: Vec<String> = plan.iter().map(ToString::to_string).collect();
-    info!(scan = %id, ?subnets, addresses = targets.len(), "scan requested");
 
     let (tx, mut rx) = mpsc::channel(256);
-    tauri::async_runtime::spawn(rc_discover::scan(targets, rc_discover::ScanOptions::default(), cancel.clone(), tx));
+    tauri::async_runtime::spawn(scan(cancel.clone(), tx));
     let scan_id = id.clone();
     tauri::async_runtime::spawn(async move {
         while let Some(event) = rx.recv().await {
@@ -844,6 +898,14 @@ fn cancel_scan(state: State<'_, AppState>, scan_id: String) {
         info!(scan = %scan_id, "scan cancelled");
         scan.cancel.cancel();
     }
+}
+
+// ── Tailscale ────────────────────────────────────────────────────────────────
+
+/// The tailnet as the Tailscale client signed in on this computer sees it. Nothing is stored.
+#[tauri::command]
+async fn tailscale_status() -> rc_discover::tailscale::TailscaleStatus {
+    rc_discover::tailscale::status().await
 }
 
 // ── Diagnostics ──────────────────────────────────────────────────────────────
@@ -912,7 +974,9 @@ pub fn run() {
             list_subnets,
             save_subnets,
             start_scan,
+            start_tailscale_scan,
             cancel_scan,
+            tailscale_status,
             app_info,
             log_text,
             reveal_log,
@@ -1056,6 +1120,19 @@ mod tests {
         serde_json::from_str::<SessionInput>(r#"{"type":"wheel","dx":0,"dy":-1.5,"x":1,"y":2}"#).unwrap();
         serde_json::from_str::<SessionInput>(r#"{"type":"resize","width":1280,"height":800}"#).unwrap();
         serde_json::from_str::<SessionInput>(r#"{"type":"clipboard","text":"hi"}"#).unwrap();
+    }
+
+    #[test]
+    fn magicdns_host_names_are_kept() {
+        let mut saved = Connection { name: String::new(), host: "  studio-mac.example.ts.net ".into(), ..conn("") };
+        normalize_connection(&mut saved).unwrap();
+        assert_eq!((saved.host.as_str(), saved.name.as_str()), ("studio-mac.example.ts.net", "studio-mac.example.ts.net"));
+        // The same machine whatever the case; the pin and saved password stay with it.
+        let edited = Connection { host: "Studio-Mac.Example.ts.net".into(), ..saved.clone() };
+        assert!(edited.same_target(&saved));
+        assert!(!decide_save(Some(&saved), &edited).clear_password);
+        let mut blank = Connection { host: "   ".into(), ..conn("") };
+        assert!(normalize_connection(&mut blank).is_err());
     }
 
     fn conn(id: &str) -> Connection {

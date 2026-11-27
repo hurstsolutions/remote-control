@@ -14,8 +14,9 @@ pub mod mdns;
 pub mod netbios;
 pub mod rdp;
 pub mod smb;
+pub mod tailscale;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -147,7 +148,34 @@ pub struct Host {
     pub ssh_banner: Option<String>,
     /// Mac model identifier from Bonjour.
     pub model: Option<String>,
+    /// From the Tailscale client, for machines found by a Tailscale scan; absent otherwise. Device
+    /// names are chosen by other tailnet users: cleaned, but untrusted like every other name.
+    #[serde(rename = "tailscaleName", skip_serializing_if = "Option::is_none")]
+    pub tailscale_name: Option<String>,
+    #[serde(rename = "tailscaleDnsName", skip_serializing_if = "Option::is_none")]
+    pub tailscale_dns_name: Option<String>,
+    /// As Tailscale reports it: "windows", "macOS", "linux", "iOS", "android", ...
+    #[serde(rename = "tailscaleOs", skip_serializing_if = "Option::is_none")]
+    pub tailscale_os: Option<String>,
 }
+
+/// What the Tailscale client says about an address, attached to the machine found there.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TailscaleLabel {
+    pub name: Option<String>,
+    pub dns_name: Option<String>,
+    pub os: Option<String>,
+}
+
+/// One address of a host-list scan, with what Tailscale says about it (if anything).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostTarget {
+    pub ip: Ipv4Addr,
+    pub tailscale: Option<TailscaleLabel>,
+}
+
+/// The most addresses a host-list scan takes.
+pub const MAX_HOST_LIST: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -224,6 +252,7 @@ pub fn targets(subnets: &[Cidr]) -> Result<Vec<Ipv4Addr>, String> {
 
 struct Context {
     options: ScanOptions,
+    labels: HashMap<Ipv4Addr, TailscaleLabel>,
     done: AtomicUsize,
     found: AtomicUsize,
     described: AtomicUsize,
@@ -252,10 +281,50 @@ impl Drop for SocketToken {
     }
 }
 
+/// The addresses of a host-list scan: duplicates removed (the first kept), order kept. Refuses
+/// more than `MAX_HOST_LIST`.
+pub fn host_targets(hosts: Vec<HostTarget>) -> Result<Vec<HostTarget>, String> {
+    let mut seen = HashSet::new();
+    let hosts: Vec<HostTarget> = hosts.into_iter().filter(|h| seen.insert(h.ip)).collect();
+    if hosts.len() > MAX_HOST_LIST {
+        return Err(format!(
+            "{} machines to check; one scan can cover at most {MAX_HOST_LIST}.",
+            hosts.len()
+        ));
+    }
+    Ok(hosts)
+}
+
 /// Probe every target, sending progress and found machines on `events`, and finally one
 /// `Finished`. Returns when done or soon after `cancel` fires.
 pub async fn scan(
     targets: Vec<Ipv4Addr>,
+    options: ScanOptions,
+    cancel: CancelToken,
+    events: mpsc::Sender<ScanEvent>,
+) -> ScanSummary {
+    run(targets, HashMap::new(), options, cancel, events).await
+}
+
+/// [`scan`] for an explicit list of addresses (pass it through [`host_targets`] first; anything
+/// past `MAX_HOST_LIST` is dropped here too). Each found machine carries its target's Tailscale
+/// label.
+pub async fn scan_hosts(
+    hosts: Vec<HostTarget>,
+    options: ScanOptions,
+    cancel: CancelToken,
+    events: mpsc::Sender<ScanEvent>,
+) -> ScanSummary {
+    let mut seen = HashSet::new();
+    let hosts: Vec<HostTarget> = hosts.into_iter().filter(|h| seen.insert(h.ip)).take(MAX_HOST_LIST).collect();
+    let targets = hosts.iter().map(|h| h.ip).collect();
+    let labels = hosts.into_iter().filter_map(|h| Some((h.ip, h.tailscale?))).collect();
+    run(targets, labels, options, cancel, events).await
+}
+
+async fn run(
+    targets: Vec<Ipv4Addr>,
+    labels: HashMap<Ipv4Addr, TailscaleLabel>,
     options: ScanOptions,
     cancel: CancelToken,
     events: mpsc::Sender<ScanEvent>,
@@ -266,6 +335,7 @@ pub async fn scan(
     let context = Arc::new(Context {
         names: Semaphore::new(options.max_name_lookups.max(1)),
         options,
+        labels,
         done: AtomicUsize::new(0),
         found: AtomicUsize::new(0),
         described: AtomicUsize::new(0),
@@ -373,7 +443,25 @@ async fn probe_host(ip: Ipv4Addr, permit: tokio::sync::OwnedSemaphorePermit, con
         drop(permit);
         bare_host(ip, open, ports)
     };
+    let mut host = host;
+    if let Some(label) = context.labels.get(&ip) {
+        label_host(&mut host, label);
+    }
     let _ = context.events.send(ScanEvent::Host { host: Box::new(host) }).await;
+}
+
+/// Attach what Tailscale says; its OS classifies a machine the probes could not.
+fn label_host(host: &mut Host, label: &TailscaleLabel) {
+    host.tailscale_name.clone_from(&label.name);
+    host.tailscale_dns_name.clone_from(&label.dns_name);
+    host.tailscale_os.clone_from(&label.os);
+    if host.kind == HostKind::Unknown {
+        match label.os.as_deref() {
+            Some("macOS") => host.kind = HostKind::Mac,
+            Some("windows") => host.kind = HostKind::Windows,
+            _ => {}
+        }
+    }
 }
 
 /// A machine reported with its open ports only (no lookups).
@@ -390,6 +478,9 @@ fn bare_host(ip: Ipv4Addr, (rdp, vnc, ssh): (bool, bool, bool), ports: Ports) ->
         rfb_version: None,
         ssh_banner: None,
         model: None,
+        tailscale_name: None,
+        tailscale_dns_name: None,
+        tailscale_os: None,
     }
 }
 
@@ -465,6 +556,9 @@ async fn describe(
         rfb_version: rfb.map(|r| r.version),
         ssh_banner: clean(ssh_banner),
         model,
+        tailscale_name: None,
+        tailscale_dns_name: None,
+        tailscale_os: None,
     }
 }
 

@@ -86,15 +86,8 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let config = client_config().map_err(io::Error::other)?;
-    // The name is only used for SNI. A host that is not a valid DNS name or IP address (e.g. a
-    // NetBIOS name with an underscore) still gets a TLS connection; certificates are pinned, not
-    // matched against names.
-    let name = ServerName::try_from(host.to_owned()).unwrap_or_else(|_| {
-        debug!(%host, "host is not a valid TLS server name; using a placeholder for SNI");
-        ServerName::try_from("rdp-server").expect("static name is valid")
-    });
     let mut tls = tokio_rustls::TlsConnector::from(Arc::new(config))
-        .connect(name, stream)
+        .connect(sni_name(host), stream)
         .await?;
     tls.flush().await?;
     let cert = tls
@@ -115,4 +108,32 @@ pub(crate) fn negotiated<S>(tls: &TlsStream<S>) -> (Option<rustls::ProtocolVersi
         connection.protocol_version(),
         connection.negotiated_cipher_suite().map(|suite| suite.suite()),
     )
+}
+
+/// The name sent for SNI. A host that is not a valid DNS name or IP address (e.g. a NetBIOS name
+/// with an underscore) still gets a TLS connection; certificates are pinned by fingerprint, never
+/// matched against names, so any host name (a MagicDNS name included) works. SNI carries no
+/// trailing dot (RFC 6066), so a fully qualified "name." is sent without it.
+fn sni_name(host: &str) -> ServerName<'static> {
+    let name = host.strip_suffix('.').unwrap_or(host);
+    ServerName::try_from(name.to_owned()).unwrap_or_else(|_| {
+        debug!(%host, "host is not a valid TLS server name; using a placeholder for SNI");
+        ServerName::try_from("rdp-server").expect("static name is valid")
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_names_are_sent_as_given() {
+        for host in ["studio-mac.example.ts.net", "Studio-Mac.example.ts.net", "pc.local"] {
+            assert!(matches!(sni_name(host), ServerName::DnsName(ref n) if n.as_ref() == host), "{host}");
+        }
+        let fqdn = sni_name("studio-mac.example.ts.net.");
+        assert!(matches!(fqdn, ServerName::DnsName(ref n) if n.as_ref() == "studio-mac.example.ts.net"));
+        assert!(matches!(sni_name("100.64.0.2"), ServerName::IpAddress(_)));
+        assert!(matches!(sni_name("Office PC"),ServerName::DnsName(ref n) if n.as_ref() == "rdp-server"));
+    }
 }

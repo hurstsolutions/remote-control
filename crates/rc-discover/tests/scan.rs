@@ -8,7 +8,7 @@ use ironrdp_server::{
     DesktopSize, DisplayUpdate, KeyboardEvent, MouseEvent, RdpServer, RdpServerDisplay, RdpServerDisplayUpdates,
     RdpServerInputHandler, TlsIdentityCtx,
 };
-use rc_discover::{CancelToken, Host, HostKind, Ports, ScanEvent, ScanOptions, ScanSummary};
+use rc_discover::{CancelToken, Host, HostKind, HostTarget, Ports, ScanEvent, ScanOptions, ScanSummary, TailscaleLabel};
 use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -278,6 +278,69 @@ async fn finds_services_and_names_on_loopback() {
     assert_eq!(host.ssh_banner.as_deref(), Some("SSH-2.0-OpenSSH_9.6"));
     assert_eq!(host.rdp_certificate_sha256.as_deref(), Some(sha256_hex(&der).as_str()));
     assert_eq!(host.kind, HostKind::Mac, "an Apple RFB greeting wins");
+}
+
+#[tokio::test]
+async fn host_list_scan_carries_tailscale_names() {
+    let ssh = greeter(b"SSH-2.0-OpenSSH_9.6\r\n").await;
+    let free = || std::net::TcpListener::bind((LOCAL, 0)).unwrap().local_addr().unwrap().port();
+    let ports = Ports { rdp: free(), vnc: free(), ssh, mdns: free(), netbios: free(), smb: free() };
+    let label = TailscaleLabel {
+        name: Some("studio-mac".into()),
+        dns_name: Some("studio-mac.example.ts.net".into()),
+        os: Some("macOS".into()),
+    };
+    let mut hosts = vec![
+        HostTarget { ip: LOCAL, tailscale: Some(label.clone()) },
+        HostTarget { ip: LOCAL, tailscale: None }, // a duplicate: the first is kept
+    ];
+    if cfg!(target_os = "linux") {
+        hosts.push(HostTarget { ip: Ipv4Addr::new(127, 0, 0, 2), tailscale: None });
+    }
+    let hosts = rc_discover::host_targets(hosts).unwrap();
+    let total = hosts.len();
+    let options = options_without_lookups(ports);
+    let (tx, mut rx) = mpsc::channel(64);
+    let scan = tokio::spawn(rc_discover::scan_hosts(hosts, options, CancelToken::default(), tx));
+    let mut found = Vec::new();
+    let mut last = None;
+    while let Some(event) = rx.recv().await {
+        match event {
+            ScanEvent::Host { host } => found.push(*host),
+            finished @ ScanEvent::Finished { .. } => last = Some(finished),
+            ScanEvent::Progress { .. } => {}
+        }
+    }
+    scan.await.unwrap();
+    assert_eq!(last, Some(ScanEvent::Finished { cancelled: false, too_many: false, done: total, total, found: 1 }));
+    assert_eq!(found.len(), 1);
+    let host = &found[0];
+    assert_eq!((host.ip.as_str(), host.ssh, host.name.as_deref()), ("127.0.0.1", Some(ssh), None));
+    assert_eq!(host.kind, HostKind::Mac, "classified by the Tailscale OS");
+    let json = serde_json::to_value(ScanEvent::Host { host: Box::new(host.clone()) }).unwrap();
+    assert_eq!(json["host"]["tailscaleName"], "studio-mac");
+    assert_eq!(json["host"]["tailscaleDnsName"], "studio-mac.example.ts.net");
+    assert_eq!(json["host"]["tailscaleOs"], "macOS");
+    assert_eq!(json["host"]["kind"], "mac");
+
+    // A subnet scan of the same machine has no Tailscale fields at all.
+    let (plain, _) = run_scan(vec![LOCAL], options_without_lookups(ports), CancelToken::default()).await;
+    let json = serde_json::to_value(&plain[0]).unwrap();
+    assert!(json.get("tailscaleName").is_none() && json.get("tailscaleOs").is_none() && json.get("tailscaleDnsName").is_none());
+    assert_eq!(plain[0].kind, HostKind::Unknown);
+}
+
+fn options_without_lookups(ports: Ports) -> ScanOptions {
+    ScanOptions { netbios: false, smb: false, mdns: false, ..quiet_options(ports) }
+}
+
+#[test]
+fn host_lists_are_capped() {
+    let many: Vec<HostTarget> = (0..=rc_discover::MAX_HOST_LIST as u32)
+        .map(|i| HostTarget { ip: Ipv4Addr::from(0x6440_0000 + i), tailscale: None })
+        .collect();
+    assert!(rc_discover::host_targets(many.clone()).unwrap_err().contains("at most"));
+    assert_eq!(rc_discover::host_targets(many[..rc_discover::MAX_HOST_LIST].to_vec()).unwrap().len(), rc_discover::MAX_HOST_LIST);
 }
 
 #[tokio::test]
