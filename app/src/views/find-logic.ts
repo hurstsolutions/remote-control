@@ -1,7 +1,8 @@
 // Logic for "Find computers". Pure: no DOM. The backend (crates/rc-discover) has the final say
 // on subnets; this mirrors its rules for instant feedback.
-import type { Connection, FoundHost, Protocol } from "../ipc";
+import type { Connection, FoundHost, HostKind, Protocol } from "../ipc";
 import { DEFAULT_SSH_PORT, blankConnection } from "../state";
+import { cleanDnsName, cleanText, osKind } from "./tailscale-logic";
 
 export const MIN_PREFIX = 16;
 export const WARN_PREFIX = 22;
@@ -111,10 +112,12 @@ export function sortHosts(hosts: FoundHost[], key: SortKey, ascending: boolean):
   return [...hosts].sort((a, b) => {
     if (key === "name") {
       // Machines without a name go last either way.
-      if (a.name === null || b.name === null) {
-        if (a.name !== b.name) return a.name === null ? 1 : -1;
+      const aName = displayName(a);
+      const bName = displayName(b);
+      if (aName === null || bName === null) {
+        if (aName !== bName) return aName === null ? 1 : -1;
       } else {
-        const byName = a.name.localeCompare(b.name, undefined, { sensitivity: "base", numeric: true });
+        const byName = aName.localeCompare(bName, undefined, { sensitivity: "base", numeric: true });
         if (byName !== 0) return sign * byName;
       }
     }
@@ -132,6 +135,9 @@ export function allNames(host: FoundHost): string[] {
     host.names.smb,
     host.names.netbios,
     host.names.dns,
+    // Last: what the tailnet calls the device (its owner chose the name; cleaned for display).
+    cleanText(host.tailscaleName),
+    cleanDnsName(host.tailscaleDnsName),
   ];
   const seen = new Set<string>();
   const out: string[] = [];
@@ -164,7 +170,7 @@ export function filterHosts(hosts: FoundHost[], text: string): FoundHost[] {
 
 /** Where the best name came from, for the results list. Same order as the backend picks it. */
 export function nameSource(host: FoundHost): string | null {
-  if (host.name === null) return null;
+  if (host.name === null) return cleanText(host.tailscaleName) ? "Tailscale" : null;
   const sources: Array<[string | null, string]> = [
     [host.names.rdp_certificate, "Remote Desktop certificate"],
     [host.names.mdns_name, "Bonjour"],
@@ -183,9 +189,33 @@ export function nameSource(host: FoundHost): string | null {
  * user asks to see everything.
  */
 export function isComputer(host: FoundHost): boolean {
-  if (host.kind === "windows" || host.kind === "mac") return true;
+  const kind = hostKind(host);
+  if (kind === "windows" || kind === "mac") return true;
   if (host.rdp !== null) return true;
   return host.vnc !== null && host.rfb_version === null;
+}
+
+/** The name shown for a machine: the best name found, else its Tailscale name. */
+export function displayName(host: FoundHost): string | null {
+  return allNames(host)[0] ?? null;
+}
+
+/** What the probes found, or (when they couldn't tell) what Tailscale reports as the OS. */
+export function hostKind(host: FoundHost): HostKind {
+  return host.kind !== "unknown" ? host.kind : osKind(host.tailscaleOs);
+}
+
+/** A result of the Tailscale scan. */
+export function isTailscaleResult(host: FoundHost): boolean {
+  return host.tailscaleName !== undefined || host.tailscaleDnsName !== undefined || host.tailscaleOs !== undefined;
+}
+
+/**
+ * The results without the previous Tailscale scan's (before Tailscale is rescanned): hosts with
+ * Tailscale fields, and any address that scan reported. Subnet results stay.
+ */
+export function withoutTailscale(hosts: FoundHost[], previousTailscaleIps: ReadonlySet<string> = new Set()): FoundHost[] {
+  return hosts.filter((host) => !isTailscaleResult(host) && !previousTailscaleIps.has(host.ip));
 }
 
 /** Whether an IPv4 address is inside a CIDR (false for anything unparsable). */
@@ -226,7 +256,15 @@ function normalizeHost(host: string): string {
  * scan finds are whatever the machine (or anyone on the network) chose to announce.
  */
 export function savedMatches(host: FoundHost, connections: Connection[]): Connection[] {
-  return connections.filter((c) => normalizeHost(c.host) === host.ip);
+  return connections.filter((c) => isAddressOf(host, c.host));
+}
+
+/** The machine's IP, or (Tailscale results) its MagicDNS name, which is an address too. */
+function isAddressOf(host: FoundHost, saved: string): boolean {
+  const key = normalizeHost(saved);
+  if (key === host.ip) return true;
+  const dns = cleanDnsName(host.tailscaleDnsName);
+  return dns !== "" && key === dns;
 }
 
 export interface NameMatch {
@@ -244,7 +282,7 @@ export function nameOnlyMatches(host: FoundHost, connections: Connection[]): Nam
     if (short && name.includes(".")) keys.add(short);
   }
   return connections
-    .filter((c) => normalizeHost(c.host) !== host.ip && keys.has(normalizeHost(c.host)))
+    .filter((c) => !isAddressOf(host, c.host) && keys.has(normalizeHost(c.host)))
     .map((connection) => ({ connection, differentAddress: parseIpv4(normalizeHost(connection.host)) !== null }));
 }
 
@@ -284,7 +322,7 @@ function announcedName(host: FoundHost, protocol: Protocol): string {
     protocol === "vnc"
       ? (host.names.mdns_name ?? host.names.mdns_host ?? host.name)
       : (host.names.rdp_certificate ?? host.names.netbios ?? host.name);
-  if (!preferred) return host.ip;
+  if (!preferred) return cleanText(host.tailscaleName) || host.ip;
   // A FQDN becomes its first label; friendly names (which may contain dots) are kept.
   if (preferred === host.names.mdns_name) return preferred;
   return /^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/.test(preferred) ? (preferred.split(".")[0] ?? preferred) : preferred;

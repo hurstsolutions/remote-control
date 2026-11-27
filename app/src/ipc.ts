@@ -204,6 +204,12 @@ export interface FoundHost {
   rfb_version: string | null;
   ssh_banner: string | null;
   model: string | null;
+  /** Tailscale scan only: the device's name in the tailnet (chosen by its owner; untrusted). */
+  tailscaleName?: string;
+  /** Tailscale scan only: the device's MagicDNS name. */
+  tailscaleDnsName?: string;
+  /** Tailscale scan only: the OS Tailscale reports ("windows", "macOS", "linux", "iOS", ...). */
+  tailscaleOs?: string;
 }
 
 export type ScanEvent =
@@ -211,6 +217,41 @@ export type ScanEvent =
   | { type: "host"; host: FoundHost }
   /** `too_many`: the scan stopped itself because more machines answered than any real subnet has. */
   | { type: "finished"; cancelled: boolean; too_many: boolean; done: number; total: number; found: number };
+
+export type TailscaleUnavailableReason = "not_installed" | "not_running" | "logged_out" | "error";
+
+/**
+ * A device in the user's tailnet, from the Tailscale client signed in on this computer. Every
+ * string was chosen by another member of the tailnet: show it as text only, cleaned. Tags are
+ * information only and never trusted.
+ */
+export interface TailscaleDevice {
+  id: string;
+  name: string;
+  /** MagicDNS name, possibly with a trailing dot ("studio-mbp.example.ts.net."). */
+  dnsName: string | null;
+  /** As Tailscale reports it: "windows", "macOS", "linux", "iOS", "android", ... */
+  os: string;
+  ipv4: string | null;
+  ipv6: string | null;
+  online: boolean;
+  /** RFC 3339; Tailscale uses year 1 for "never". */
+  lastSeen: string | null;
+  tags: string[];
+  /** This computer. */
+  isSelf: boolean;
+}
+
+export interface TailscaleStatus {
+  available: boolean;
+  /** Null when available. */
+  reason: null | TailscaleUnavailableReason;
+  /** With reason "error": what went wrong. */
+  detail: string | null;
+  tailnet: string | null;
+  selfName: string | null;
+  devices: TailscaleDevice[];
+}
 
 export const api = {
   listConnections: () => invoke<Connection[]>("list_connections"),
@@ -243,6 +284,17 @@ export const api = {
     return invoke<string>("start_scan", { args: { subnet_ids: subnetIds }, events });
   },
   cancelScan: (scanId: string) => invoke<void>("cancel_scan", { scanId }),
+  /** The tailnet as the local Tailscale client sees it. Resolves (available false) when it can't be read. */
+  tailscaleStatus: () => invoke<TailscaleStatus>("tailscale_status"),
+  /**
+   * Scan the tailnet's devices like a subnet scan: the same events (hosts carry the tailscale*
+   * fields), cancelled with cancelScan. One scan at a time, shared with startScan.
+   */
+  startTailscaleScan: (onEvent: (event: ScanEvent) => void) => {
+    const events = new Channel<ScanEvent>();
+    events.onmessage = onEvent;
+    return invoke<string>("start_tailscale_scan", { events });
+  },
   appInfo: () => invoke<AppInfo>("app_info"),
   /** The last part of the log (credentials are never logged). */
   logText: () => invoke<string>("log_text"),

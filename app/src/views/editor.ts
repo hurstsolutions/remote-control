@@ -49,6 +49,39 @@ function checkbox(label: string, checked: boolean): { row: HTMLElement; input: H
   return { row: h("label", { class: "check" }, input, h("span", { text: label })), input };
 }
 
+/**
+ * "Connect by: MagicDNS name / Tailscale IP" for a new Tailscale connection. Picking one fills
+ * the host field; typing another host clears the choice. Null when there is nothing to choose.
+ */
+function tailscaleChoice(hosts: { dnsName: string; ip: string } | undefined, hostInput: HTMLInputElement): HTMLElement | null {
+  if (!hosts || !hosts.dnsName || !hosts.ip) return null;
+  const group = `connect-by-${++fieldCounter}`;
+  const radio = (label: string, value: string) => {
+    const input = h("input", { attrs: { type: "radio", name: group } });
+    input.checked = hostInput.value.trim().toLowerCase() === value.toLowerCase();
+    input.addEventListener("change", () => {
+      if (!input.checked) return;
+      hostInput.value = value;
+      hostInput.dispatchEvent(new Event("input"));
+    });
+    return { input, row: h("label", { class: "check" }, input, h("span", { text: label }), h("span", { class: "muted selectable", text: ` (${value})` })) };
+  };
+  const byName = radio("MagicDNS name", hosts.dnsName);
+  const byIp = radio("Tailscale IP", hosts.ip);
+  hostInput.addEventListener("input", () => {
+    const value = hostInput.value.trim().toLowerCase();
+    byName.input.checked = value === hosts.dnsName.toLowerCase();
+    byIp.input.checked = value === hosts.ip;
+  });
+  return h(
+    "fieldset",
+    { class: "form-group connect-by" },
+    h("legend", { class: "field-label", text: "Connect by" }),
+    h("div", { class: "connect-by-options" }, byName.row, byIp.row),
+    h("p", { class: "field-hint", text: "The name keeps working if the device's Tailscale IP changes." }),
+  );
+}
+
 /** Shown after saving when the backend removed the saved password. */
 export const PASSWORD_CLEARED_NOTE = "Saved password was cleared because the address/user changed.";
 
@@ -57,10 +90,19 @@ export const PASSWORD_CLEARED_NOTE = "Saved password was cleared because the add
  * (check `password_cleared`), or null when cancelled. `template` pre-fills a new connection
  * (from "Find computers"); it is ignored when editing.
  */
+export interface EditorOptions {
+  /**
+   * A new connection to a Tailscale device: offer "Connect by: MagicDNS name / Tailscale IP".
+   * Shown only when both are known; the template's host should be one of them.
+   */
+  tailscaleHosts?: { dnsName: string; ip: string };
+}
+
 export async function openEditor(
   platform: Platform,
   existing: Connection | null,
   template: Connection | null = null,
+  options: EditorOptions = {},
 ): Promise<SavedConnection | null> {
   const api = platform.api;
   const start = existing ?? (template ? { ...template, id: "", pinned_identity: null } : blankConnection("rdp"));
@@ -86,6 +128,7 @@ export async function openEditor(
   const host = textField("Computer name or IP address", start.host);
   host.input.placeholder = "192.168.1.20";
   const port = textField("Port", String(start.port), { narrow: true });
+  const connectByRow = tailscaleChoice(existing === null && template !== null ? options.tailscaleHosts : undefined, host.input);
   const username = textField("Username", start.username);
   if (template && !existing) {
     // Everything but the account is filled in already.
@@ -232,6 +275,7 @@ export async function openEditor(
     name.row,
     typeRow,
     h("div", { class: "field-pair" }, host.row, port.row),
+    connectByRow,
     username.row,
     windowsOnly,
     macOnly,

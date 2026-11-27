@@ -12,6 +12,9 @@ import type {
   ScanEvent,
   SessionInput,
   Subnet,
+  TailscaleDevice,
+  TailscaleStatus,
+  TailscaleUnavailableReason,
 } from "../ipc";
 import type { Api, Platform } from "../platform";
 import { parseCidr } from "../views/find-logic";
@@ -55,6 +58,40 @@ const KEYCHAIN_FAILS = "keychain-fails";
 const HEADER = 8;
 
 const connections: Connection[] = [
+  {
+    // Matches the mock tailnet's "gaming-pc" by its MagicDNS name: a green dot on Home.
+    id: "mock-ts-pc",
+    name: "Gaming PC over Tailscale (sample)",
+    protocol: "rdp",
+    host: "gaming-pc.example.ts.net",
+    port: 3389,
+    username: "sam",
+    domain: "",
+    nla: true,
+    ssh_tunnel: true,
+    ssh_port: 22,
+    pinned_identity: null,
+    share_clipboard: false,
+    allow_older_mac_sign_in: false,
+    srp_seen: false,
+  },
+  {
+    // Matches the mock tailnet's offline "travel-air" by its Tailscale IP: a grey dot on Home.
+    id: "mock-ts-air",
+    name: "Travel Air over Tailscale (sample)",
+    protocol: "vnc",
+    host: "100.64.0.13",
+    port: 5900,
+    username: "sam",
+    domain: "",
+    nla: true,
+    ssh_tunnel: true,
+    ssh_port: 22,
+    pinned_identity: null,
+    share_clipboard: false,
+    allow_older_mac_sign_in: false,
+    srp_seen: false,
+  },
   {
     id: "mock-windows",
     name: "Office PC (sample)",
@@ -670,6 +707,121 @@ function mockStartScan(ids: string[], onEvent: (event: ScanEvent) => void): stri
   return id;
 }
 
+// ---- Tailscale ----------------------------------------------------------------------------
+// Open the page with ?tailscale=not_installed (or not_running, logged_out, error) to see Tailscale
+// unavailable. Read on every call, so history.replaceState can switch it without a reload.
+
+const TAILSCALE_REASONS: readonly TailscaleUnavailableReason[] = ["not_installed", "not_running", "logged_out", "error"];
+
+function tailscaleScenario(): TailscaleUnavailableReason | null {
+  const value = new URLSearchParams(window.location.search).get("tailscale");
+  return TAILSCALE_REASONS.find((r) => r === value) ?? null;
+}
+
+function ago(ms: number): string {
+  return new Date(Date.now() - ms).toISOString();
+}
+
+const HOUR = 3_600_000;
+
+function tailscaleDevices(): TailscaleDevice[] {
+  const device = (n: number, extra: Partial<TailscaleDevice> & Pick<TailscaleDevice, "name" | "os">): TailscaleDevice => ({
+    id: `mock-ts-node-${n}`,
+    dnsName: `${extra.name}.example.ts.net.`,
+    ipv4: `100.64.0.${n}`,
+    ipv6: `fd7a:115c:a1e0::${n.toString(16)}`,
+    online: true,
+    lastSeen: null,
+    tags: [],
+    isSelf: false,
+    ...extra,
+  });
+  return [
+    device(10, { name: "this-laptop", os: "macOS", isSelf: true }),
+    device(11, { name: "gaming-pc", os: "windows" }),
+    device(12, { name: "studio-mbp", os: "macOS" }),
+    device(13, { name: "travel-air", os: "macOS", online: false, lastSeen: ago(3 * 24 * HOUR) }),
+    device(14, { name: "nas-01", os: "linux", tags: ["tag:server", "tag:backup"] }),
+    device(15, { name: "sams-iphone", os: "iOS", online: false, lastSeen: ago(5 * HOUR) }),
+    // A right-to-left override that would make the name read "...exe.txt": shown without it.
+    device(16, { name: "invoice\u202Etxt.exe-pc", dnsName: "invoicetxtexe-pc.example.ts.net.", os: "windows", online: false, lastSeen: ago(2 * HOUR) }),
+    // A very long name: cut in the list, whole in the tooltip.
+    device(17, { name: "reception-desk-windows-pc-with-an-unreasonably-long-name-for-testing", dnsName: "reception-desk.example.ts.net.", os: "windows" }),
+    // Never seen: Tailscale reports year 1.
+    device(18, { name: "old-tablet", os: "android", online: false, lastSeen: "0001-01-01T00:00:00Z" }),
+  ];
+}
+
+function mockTailscaleStatus(): TailscaleStatus {
+  const reason = tailscaleScenario();
+  if (reason) {
+    return {
+      available: false,
+      reason,
+      detail: reason === "error" ? "tailscale status: unexpected reply from the local Tailscale service (mock)" : null,
+      tailnet: null,
+      selfName: null,
+      devices: [],
+    };
+  }
+  return { available: true, reason: null, detail: null, tailnet: "example.ts.net", selfName: "this-laptop", devices: tailscaleDevices() };
+}
+
+/** Like the subnet scan, over the tailnet's online devices (not this computer). */
+function mockStartTailscaleScan(onEvent: (event: ScanEvent) => void): string {
+  if (activeScan) throw { kind: "other", detail: "A scan is already running. Cancel it or wait for it to finish." } satisfies SessionError;
+  const status = mockTailscaleStatus();
+  if (!status.available) throw { kind: "other", detail: "Tailscale isn't available." } satisfies SessionError;
+  const targets = status.devices.filter((d) => d.online && !d.isSelf && d.ipv4);
+  const found: FoundHost[] = [];
+  for (const d of targets) {
+    const host: FoundHost = { ...blankHost(d.ipv4 ?? ""), tailscaleName: d.name, tailscaleDnsName: d.dnsName ?? undefined, tailscaleOs: d.os };
+    switch (d.name) {
+      case "gaming-pc":
+        // Answers Remote Desktop with its certificate name.
+        found.push({ ...host, rdp: 3389, kind: "windows", name: "GAMING-PC", names: { ...host.names, rdp_certificate: "GAMING-PC" }, rdp_certificate_sha256: "5e".repeat(32) });
+        break;
+      case "studio-mbp":
+        // Screen Sharing whose greeting didn't arrive: the probes can't tell, Tailscale says macOS. No name either.
+        found.push({ ...host, vnc: 5900, ssh: 22, ssh_banner: "SSH-2.0-OpenSSH_9.8" });
+        break;
+      case "nas-01":
+        // SSH only: hidden until "Show all devices".
+        found.push({ ...host, ssh: 22, ssh_banner: "SSH-2.0-OpenSSH_9.6p1 Ubuntu" });
+        break;
+      case "reception-desk-windows-pc-with-an-unreasonably-long-name-for-testing":
+        found.push({ ...host, rdp: 3389 });
+        break;
+      default:
+        break;
+    }
+  }
+  const total = targets.length;
+  const id = `mock-scan-${nextId++}`;
+  let done = 0;
+  let reported = 0;
+  const finish = (cancelled: boolean) => {
+    window.clearInterval(scanTimer);
+    activeScan = null;
+    note(`tailscale scan ${id} ${cancelled ? "cancelled" : "finished"}`);
+    onEvent({ type: "progress", done, total, found: reported });
+    onEvent({ type: "finished", cancelled, too_many: false, done, total, found: reported });
+  };
+  scanTimer = window.setInterval(() => {
+    const target = targets[done++];
+    const host = found.find((h) => h.ip === target?.ipv4);
+    if (host) {
+      reported++;
+      onEvent({ type: "host", host });
+    }
+    onEvent({ type: "progress", done, total, found: reported });
+    if (done >= total) finish(false);
+  }, 300);
+  activeScan = { id, cancel: () => finish(true) };
+  note(`tailscale scan ${id}: ${total} devices`);
+  return id;
+}
+
 const mockApi: Api = {
   listConnections: () => delay(connections.map((c) => ({ ...c }))),
   saveConnection: (connection: Connection) => {
@@ -794,6 +946,11 @@ const mockApi: Api = {
   cancelScan: (scanId: string) => {
     if (activeScan?.id === scanId) activeScan.cancel();
     return delay(undefined);
+  },
+  tailscaleStatus: () => delay(mockTailscaleStatus()),
+  startTailscaleScan: async (onEvent: (event: ScanEvent) => void) => {
+    await delay(null);
+    return mockStartTailscaleScan(onEvent);
   },
   appInfo: () =>
     delay<AppInfo>({ version: "0.1.0-mock", os: "browser", arch: "mock", log_path: "/mock/RemoteControl.log" }),
