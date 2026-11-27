@@ -64,4 +64,10 @@ ignore = [
     # server's public key. RSA here only verifies public signatures. The rc-rdp tests' RSA key is
     # aws-lc-rs, not this crate.
     "RUSTSEC-2023-0071",
+    # heapless 0.7.17 (iso7816 <- winscard <- sspi, pinned by ironrdp-connector 0.10):
+    # Deque::make_contiguous can break the deque's invariants (fixed only in 0.9.4, a semver-major
+    # jump the chain doesn't accept). iso7816 uses heapless Vec only; neither it nor winscard uses
+    # Deque, and winscard is sspi's smart-card emulation, which rc-rdp never uses (password
+    # credentials). Drop with the IronRDP upgrade if sspi moves on.
+    "RUSTSEC-2026-0581",
 ]
