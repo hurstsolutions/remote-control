@@ -856,11 +856,12 @@ fn sha512(parts: &[&[u8]]) -> Vec<u8> {
     d.finalize().to_vec()
 }
 
-/// The Mac's type 33 reply: u32 total, u8 step, u32 x = len + 4, u32 len, the SRP message.
+/// The Mac's type 33 reply as a real Mac (macOS 15) sends it: u32 total, u32 2, u16 len + 4,
+/// u32 len, the SRP message.
 fn rsa1_reply(payload: &[u8]) -> Vec<u8> {
-    let mut m = ((payload.len() + 9) as u32).to_be_bytes().to_vec();
-    m.push(1);
-    m.extend_from_slice(&(payload.len() as u32 + 4).to_be_bytes());
+    let mut m = ((payload.len() + 10) as u32).to_be_bytes().to_vec();
+    m.extend_from_slice(&[0, 0, 0, 2]);
+    m.extend_from_slice(&(payload.len() as u16 + 4).to_be_bytes());
     m.extend_from_slice(&(payload.len() as u32).to_be_bytes());
     m.extend_from_slice(payload);
     m

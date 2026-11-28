@@ -29,12 +29,13 @@
 //! * kind 2, message 3 in clear: aux = length of message 3 including its `u32` length, body =
 //!   message 3 (with its `u32` length), zero-padded so the total is 1076 (Apple's viewer's size).
 //!
-//! The Mac sends messages 2 and 4 as `u32 len`, then a header `u8 step, u32 x, u32 payload_len`
-//! (x = payload_len + 4), then the SRP message without its own `u32` length; message 4 is followed
-//! by the SecurityResult. If it cannot decrypt message 1 it sends its key again instead.
-//! Because neither source was a capture we could check ourselves, two other layouts are also
-//! accepted (a 6-byte header `u32, u16 n`, and fixed offsets with the control byte at 12 and a
-//! 512-byte N without a length); whatever the layout, the group check below still applies.
+//! The Mac sends messages 2 and 4 as `u32 len`, `u32 2`, `u16 n`, then the SRP message with its
+//! own `u32` length (n = that length + 4); seen from a real Mac running macOS 15: a 1165-byte
+//! message 2 and a 98-byte message 4. Message 4 is followed by the SecurityResult. If the Mac
+//! cannot decrypt message 1 it sends its key again instead. Older notes described other
+//! layouts (a header `u8 step, u32 x, u32 payload_len`; the same 6-byte header without the inner
+//! length; fixed offsets with a 512-byte N and no length), so those are still accepted; whatever
+//! the layout, the group check below and the M2 check still apply.
 //!
 //! Math (all numbers padded to the length of N where noted):
 //!
@@ -397,7 +398,12 @@ fn rsa1_payload(body: &[u8]) -> (&[u8], &'static str) {
     if body.len() >= 6 && body[..4] == [0, 0, 0, 2] {
         let len = u16::from_be_bytes([body[4], body[5]]) as usize;
         if len > 0 && len <= body.len() - 6 {
-            return (&body[6..6 + len], "u32, u16 length");
+            let payload = &body[6..6 + len];
+            // What macOS sends: the SRP message keeps its own `u32` length after this header.
+            if payload.len() >= 4 && be32(payload) == payload.len() - 4 {
+                return (&payload[4..], "u32, u16 length, u32 length");
+            }
+            return (payload, "u32, u16 length");
         }
     }
     (body, "no header")
@@ -756,6 +762,11 @@ mod tests {
         body.extend_from_slice(&(payload.len() as u16).to_be_bytes());
         body.extend_from_slice(&payload);
         check(parse_rsa1_challenge(&body).unwrap());
+        // What macOS 15 sends: u32 2, u16 length, then the message with its own u32 length.
+        let body = with_mac_header(&challenge_body(&ch, false));
+        assert_eq!(&body[..4], &[0, 0, 0, 2]);
+        assert_eq!((body[10], &body[11..13]), (0, &[2u8, 0][..]), "control byte at 10, then N's length");
+        check(parse_rsa1_challenge(&body).unwrap());
         // Fixed offsets: 12 header bytes, control byte, N without its length.
         let mut body = vec![0xee; 12];
         body.push(0);
@@ -793,6 +804,24 @@ mod tests {
         let m2 = parse_rsa1_final(&with_rsa1_header(&fin)).unwrap();
         assert!(p.server_proof_matches(&m2));
         assert!(p.server_proof_matches(&parse_rsa1_final(&fin).unwrap()));
+        // What macOS 15 sends: 98 bytes = u32 2, u16 92, u32 88, then the 88-byte message 4.
+        let body = with_mac_header(&fin);
+        assert_eq!(body.len(), 98);
+        assert_eq!(&body[..10], &[0, 0, 0, 2, 0, 92, 0, 0, 0, 88]);
+        assert!(p.server_proof_matches(&parse_rsa1_final(&body).unwrap()));
+        // A wrong M2 in that layout is still refused.
+        let mut bad = body.clone();
+        bad[20] ^= 1;
+        assert!(!p.server_proof_matches(&parse_rsa1_final(&bad).unwrap()));
+    }
+
+    /// The reply framing a real Mac uses: `u32 2`, `u16 n`, then the message with its `u32` length.
+    fn with_mac_header(msg: &[u8]) -> Vec<u8> {
+        let mut body = vec![0, 0, 0, 2];
+        body.extend_from_slice(&((msg.len() + 4) as u16).to_be_bytes());
+        body.extend_from_slice(&(msg.len() as u32).to_be_bytes());
+        body.extend_from_slice(msg);
+        body
     }
 
     /// SHA-256 of each group's big-endian bytes, computed in Python from the hex in the RFC 5054
