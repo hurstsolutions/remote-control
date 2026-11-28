@@ -137,6 +137,12 @@ impl Framebuffer {
         true
     }
 
+    /// `n` RGBA pixels of one row starting at (x, y); the run must be inside the framebuffer.
+    pub fn row(&self, x: usize, y: usize, n: usize) -> &[u8] {
+        let off = (y * self.w + x) * 4;
+        &self.data[off..off + n * 4]
+    }
+
     /// Copy out a rectangle (must be inside the framebuffer) as tightly packed RGBA.
     pub fn extract(&self, x: usize, y: usize, w: usize, h: usize) -> Vec<u8> {
         let mut out = Vec::with_capacity(w * h * 4);

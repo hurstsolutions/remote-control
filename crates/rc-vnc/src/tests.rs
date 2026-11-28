@@ -162,6 +162,57 @@ async fn vnc_auth_handshake_and_raw_update() {
     task.await.unwrap();
 }
 
+/// A server that resends unchanged pixels (as a Mac does with the whole screen) costs the window
+/// nothing; a change is sent as just the 64x64 blocks it touches.
+#[tokio::test]
+async fn unchanged_blocks_are_not_resent() {
+    let (mut s, mut h, task) = start(config(None, Some("secret")));
+    version(&mut s, b"RFB 003.008\n", b"RFB 003.008\n").await;
+    s.write_all(&[1, 2]).await.unwrap();
+    assert_eq!(read_n(&mut s, 1).await, [2]);
+    let challenge = [9u8; 16];
+    s.write_all(&challenge).await.unwrap();
+    read_n(&mut s, 16).await;
+    s.write_all(&[0, 0, 0, 0]).await.unwrap();
+    let (w, hgt) = (130u16, 70u16);
+    init_phase(&mut s, w, hgt, "Diff").await;
+    assert!(matches!(next_real(&mut h).await, SessionEvent::Connected { .. }));
+
+    let full = |pixels: &[u8]| {
+        let mut m = fbu(1);
+        m.extend(rect(0, 0, w, hgt, decode::ENC_RAW));
+        m.extend_from_slice(pixels);
+        m
+    };
+    let mut pixels = vec![0x40u8; w as usize * hgt as usize * 4];
+    // First update: everything is new, sent as one run per block row (rows 0-63, 64-69).
+    s.write_all(&full(&pixels)).await.unwrap();
+    expect_request(&mut s, true, w, hgt).await;
+    for (y, bh) in [(0u16, 64u16), (64, 6)] {
+        match next_real(&mut h).await {
+            SessionEvent::Frame { x: 0, y: fy, w: fw, h: fh, .. } => assert_eq!((fy, fw, fh), (y, w, bh)),
+            ev => panic!("unexpected {ev:?}"),
+        }
+    }
+    // The same pixels again: nothing is sent.
+    s.write_all(&full(&pixels)).await.unwrap();
+    expect_request(&mut s, true, w, hgt).await;
+    // One pixel changes at (100, 66): only its block (x 64-127, y 64-69) is sent.
+    let off = (66 * w as usize + 100) * 4;
+    pixels[off..off + 4].copy_from_slice(&[0, 0, 255, 0]);
+    s.write_all(&full(&pixels)).await.unwrap();
+    expect_request(&mut s, true, w, hgt).await;
+    match next_real(&mut h).await {
+        SessionEvent::Frame { x: 64, y: 64, w: 64, h: 6, rgba } => {
+            assert_eq!(&rgba[(2 * 64 + 36) * 4..(2 * 64 + 37) * 4], &[255, 0, 0, 255]);
+        }
+        ev => panic!("unexpected {ev:?}"),
+    }
+    h.input.send(SessionInput::Close).unwrap();
+    assert!(expect_closed(&mut h).await.is_none());
+    task.await.unwrap();
+}
+
 #[tokio::test]
 async fn macos_style_ard_auth() {
     let (mut s, mut h, task) = start(config(Some("macuser"), Some("mac pass word")));

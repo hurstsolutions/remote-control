@@ -23,6 +23,9 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Largest Frame event, in pixels (2 MiB of RGBA). Bigger rectangles are sent as bands so a
 /// full 5K update never needs one giant allocation.
 const MAX_FRAME_PIXELS: usize = 512 * 1024;
+/// Side of the blocks compared against what the window already shows. A Mac resends the whole
+/// screen in every update; only blocks that changed are sent on to the window.
+const DIFF_TILE: usize = 64;
 /// Larger clipboard text from the server is dropped (read past, never buffered).
 const MAX_CUT_TEXT: u32 = 1024 * 1024;
 const MAX_CURSOR_SIDE: usize = 2048;
@@ -240,6 +243,7 @@ where
         apple: done.apple,
         cursors: HashMap::new(),
         stats: Stats::new(),
+        shown: Shown::new(init.width as usize, init.height as usize),
     };
 
     if encrypted {
@@ -352,6 +356,39 @@ struct Reader<'a, R> {
     /// Apple cursor cache (encoding 0x450): id -> shape.
     cursors: HashMap<u32, CursorShape>,
     stats: Stats,
+    shown: Shown,
+}
+
+/// A copy of what the window has been sent, to skip blocks a server resends unchanged.
+struct Shown {
+    w: usize,
+    data: Vec<u8>,
+}
+
+impl Shown {
+    /// Alpha 0 never occurs in the framebuffer (always opaque), so every block counts as changed
+    /// until it has been sent once.
+    fn new(w: usize, h: usize) -> Self {
+        Shown { w, data: vec![0; w * h * 4] }
+    }
+
+    /// Compare a block (inside the framebuffer) with what was sent; if it differs, record the
+    /// new contents and return true.
+    fn update(&mut self, fb: &Framebuffer, x: usize, y: usize, w: usize, h: usize) -> bool {
+        let mut changed = false;
+        for row in y..y + h {
+            let off = (row * self.w + x) * 4;
+            let src = fb.row(x, row, w);
+            let dst = &mut self.data[off..off + w * 4];
+            if changed {
+                dst.copy_from_slice(src);
+            } else if dst != src {
+                dst.copy_from_slice(src);
+                changed = true;
+            }
+        }
+        changed
+    }
 }
 
 /// Throughput counters, logged every `STATS_EVERY` so a laggy session's log shows whether time
@@ -361,14 +398,26 @@ struct Stats {
     updates: u64,
     rects: u64,
     pixels: u64,
+    /// Pixels actually sent to the window after skipping unchanged blocks.
+    sent_pixels: u64,
     busy: Duration,
+    /// Part of `busy` spent handing frames to the window.
+    emit: Duration,
 }
 
 const STATS_EVERY: Duration = Duration::from_secs(10);
 
 impl Stats {
     fn new() -> Self {
-        Stats { since: Instant::now(), updates: 0, rects: 0, pixels: 0, busy: Duration::ZERO }
+        Stats {
+            since: Instant::now(),
+            updates: 0,
+            rects: 0,
+            pixels: 0,
+            sent_pixels: 0,
+            busy: Duration::ZERO,
+            emit: Duration::ZERO,
+        }
     }
 
     fn record(&mut self, rects: u32, pixels: u64, busy: Duration, width: usize, height: usize) {
@@ -383,7 +432,9 @@ impl Stats {
                 updates_per_s = format!("{:.1}", self.updates as f64 / secs),
                 rects_per_update = format!("{:.1}", self.rects as f64 / self.updates.max(1) as f64),
                 megapixels_per_s = format!("{:.2}", self.pixels as f64 / secs / 1e6),
-                decoding_busy_pct = format!("{:.0}", 100.0 * self.busy.as_secs_f64() / secs),
+                sent_megapixels_per_s = format!("{:.2}", self.sent_pixels as f64 / secs / 1e6),
+                busy_pct = format!("{:.0}", 100.0 * self.busy.as_secs_f64() / secs),
+                handing_to_window_pct = format!("{:.0}", 100.0 * self.emit.as_secs_f64() / secs),
                 width,
                 height,
                 "VNC throughput"
@@ -439,6 +490,7 @@ impl<R: AsyncRead + Unpin> Reader<'_, R> {
             "remote desktop resized"
         );
         self.fb.resize(w as usize, h as usize)?;
+        self.shown = Shown::new(w as usize, h as usize);
         {
             let mut s = lock(&self.shared);
             s.width = w;
@@ -448,11 +500,38 @@ impl<R: AsyncRead + Unpin> Reader<'_, R> {
         Ok(true)
     }
 
-    /// Emit the (clipped) rectangle from the local framebuffer as one or more Frame events.
+    /// Emit the parts of the (clipped) rectangle that differ from what the window already shows,
+    /// as horizontal runs of changed blocks on a fixed grid.
     async fn emit_rect(&mut self, x: usize, y: usize, w: usize, h: usize) -> Result<()> {
         let Some((x, y, w, h)) = self.fb.clip(x, y, w, h) else {
             return Ok(());
         };
+        let (x_end, y_end) = (x + w, y + h);
+        let mut ty = y - y % DIFF_TILE;
+        while ty < y_end {
+            let (y0, y1) = (ty.max(y), (ty + DIFF_TILE).min(y_end));
+            let mut run: Option<usize> = None;
+            let mut tx = x - x % DIFF_TILE;
+            while tx < x_end {
+                let (x0, x1) = (tx.max(x), (tx + DIFF_TILE).min(x_end));
+                if self.shown.update(&self.fb, x0, y0, x1 - x0, y1 - y0) {
+                    run.get_or_insert(x0);
+                } else if let Some(start) = run.take() {
+                    self.emit_band(start, y0, x0 - start, y1 - y0).await?;
+                }
+                tx += DIFF_TILE;
+            }
+            if let Some(start) = run {
+                self.emit_band(start, y0, x_end - start, y1 - y0).await?;
+            }
+            ty += DIFF_TILE;
+        }
+        Ok(())
+    }
+
+    /// Emit a rectangle (inside the framebuffer) as one or more Frame events.
+    async fn emit_band(&mut self, x: usize, y: usize, w: usize, h: usize) -> Result<()> {
+        let started = Instant::now();
         let band = (MAX_FRAME_PIXELS / w).max(1);
         let mut row = 0;
         while row < h {
@@ -462,6 +541,8 @@ impl<R: AsyncRead + Unpin> Reader<'_, R> {
             emit(self.events, ev).await?;
             row += n;
         }
+        self.stats.sent_pixels += (w * h) as u64;
+        self.stats.emit += started.elapsed();
         Ok(())
     }
 
