@@ -454,10 +454,12 @@ async fn session_messages() {
     assert!(matches!(next_real(&mut h).await, SessionEvent::Cursor(CursorShape::Hidden)));
     expect_request(&mut s, true, 4, 4).await;
 
-    // DesktopSize: Resized, and the next request is a full one for the new size.
+    // DesktopSize: the pipelined incremental request (sent as the update starts, still for the
+    // old size), Resized, then a full request for the new size.
     let mut m = fbu(1);
     m.extend(rect(0, 0, 6, 3, decode::ENC_DESKTOP_SIZE));
     s.write_all(&m).await.unwrap();
+    expect_request(&mut s, true, 4, 4).await;
     assert!(matches!(next_real(&mut h).await, SessionEvent::Resized { width: 6, height: 3 }));
     expect_request(&mut s, false, 6, 3).await;
 
@@ -490,6 +492,7 @@ async fn session_messages() {
     m.extend_from_slice(&[1, 0, 0, 0]);
     m.extend_from_slice(&[0, 0, 0, 9, 0, 0, 0, 0, 0, 10, 0, 12, 0, 0, 0, 0]);
     s.write_all(&m).await.unwrap();
+    expect_request(&mut s, true, 6, 3).await;
     assert!(matches!(next_real(&mut h).await, SessionEvent::Resized { width: 10, height: 12 }));
     expect_request(&mut s, false, 10, 12).await;
 

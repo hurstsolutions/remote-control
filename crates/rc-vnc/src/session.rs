@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
@@ -239,6 +239,7 @@ where
         updates: 0,
         apple: done.apple,
         cursors: HashMap::new(),
+        stats: Stats::new(),
     };
 
     if encrypted {
@@ -350,6 +351,46 @@ struct Reader<'a, R> {
     apple: bool,
     /// Apple cursor cache (encoding 0x450): id -> shape.
     cursors: HashMap<u32, CursorShape>,
+    stats: Stats,
+}
+
+/// Throughput counters, logged every `STATS_EVERY` so a laggy session's log shows whether time
+/// goes to waiting for the server (network or the server itself) or to our decoding.
+struct Stats {
+    since: Instant,
+    updates: u64,
+    rects: u64,
+    pixels: u64,
+    busy: Duration,
+}
+
+const STATS_EVERY: Duration = Duration::from_secs(10);
+
+impl Stats {
+    fn new() -> Self {
+        Stats { since: Instant::now(), updates: 0, rects: 0, pixels: 0, busy: Duration::ZERO }
+    }
+
+    fn record(&mut self, rects: u32, pixels: u64, busy: Duration, width: usize, height: usize) {
+        self.updates += 1;
+        self.rects += rects as u64;
+        self.pixels += pixels;
+        self.busy += busy;
+        let elapsed = self.since.elapsed();
+        if elapsed >= STATS_EVERY {
+            let secs = elapsed.as_secs_f64();
+            debug!(
+                updates_per_s = format!("{:.1}", self.updates as f64 / secs),
+                rects_per_update = format!("{:.1}", self.rects as f64 / self.updates.max(1) as f64),
+                megapixels_per_s = format!("{:.2}", self.pixels as f64 / secs / 1e6),
+                decoding_busy_pct = format!("{:.0}", 100.0 * self.busy.as_secs_f64() / secs),
+                width,
+                height,
+                "VNC throughput"
+            );
+            *self = Stats::new();
+        }
+    }
 }
 
 impl<R: AsyncRead + Unpin> Reader<'_, R> {
@@ -427,6 +468,16 @@ impl<R: AsyncRead + Unpin> Reader<'_, R> {
     async fn framebuffer_update(&mut self) -> Result<()> {
         let _padding = self.rd.read_u8().await?;
         let count = self.rd.read_u16().await?;
+        let started = Instant::now();
+        // Ask for the next update now, before decoding this one, so the server prepares it while
+        // we decode instead of waiting a full round trip per frame. An empty update is answered
+        // after a short pause instead, so a server that replies to every request at once does not
+        // make us spin.
+        let pipelined = count > 0;
+        if pipelined {
+            self.request_update(true);
+        }
+        let mut pixels = 0u64;
         let mut resized = false;
         let mut handled = 0u32;
         trace!(count, "FramebufferUpdate");
@@ -441,6 +492,7 @@ impl<R: AsyncRead + Unpin> Reader<'_, R> {
             }
             trace!(x, y, w, h, enc, "rectangle");
             handled += 1;
+            pixels += (w * h) as u64;
             match enc {
                 decode::ENC_LAST_RECT => break,
                 decode::ENC_DESKTOP_SIZE => resized |= self.resize(w as u16, h as u16).await?,
@@ -503,12 +555,15 @@ impl<R: AsyncRead + Unpin> Reader<'_, R> {
         if self.updates == 1 {
             info!(rectangles = handled, "first framebuffer update received");
         }
-        if handled == 0 {
+        self.stats.record(handled, pixels, started.elapsed(), self.fb.width(), self.fb.height());
+        if resized {
+            // After a resize our copy is blank, so ask for everything.
+            self.request_update(false);
+        } else if !pipelined {
             // An empty update: do not spin if the server answers every request immediately.
             tokio::time::sleep(Duration::from_millis(20)).await;
+            self.request_update(true);
         }
-        // After a resize our copy is blank, so ask for everything.
-        self.request_update(!resized);
         Ok(())
     }
 
